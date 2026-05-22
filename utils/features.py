@@ -8,11 +8,16 @@ class AdvancedFeatureEngine:
         self.feature_cache = {}
     
     def compute_rsi(self, prices, period=14):
-        """Enhanced RSI with smoothing"""
+        """Standard Welles Wilder smoothed RSI matching MT5"""
         delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
+        gain = delta.clip(lower=0)
+        loss = (-delta).clip(lower=0)
+        
+        # Wilder's smoothing uses alpha = 1 / period
+        avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        
+        rs = avg_gain / (avg_loss + 1e-10)
         rsi = 100 - (100 / (1 + rs))
         return rsi.fillna(50)
     
@@ -30,7 +35,8 @@ class AdvancedFeatureEngine:
         tr2 = (high - close.shift()).abs()
         tr3 = (low - close.shift()).abs()
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(period).mean()
+        # Use Wilder's smoothing for ATR to match MT5
+        atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
         # Normalize ATR by price
         atr_pct = atr / close
         return atr, atr_pct
@@ -69,23 +75,37 @@ class AdvancedFeatureEngine:
         return regime
     
     def compute_adx(self, df, period=14):
-        """Average Directional Index"""
+        """Welles Wilder's Standard ADX matching MT5"""
         high, low, close = df['high'], df['low'], df['close']
         
-        plus_dm = high.diff()
-        minus_dm = low.diff().abs()
+        # Up move and down move
+        up_move = high - high.shift(1)
+        down_move = low.shift(1) - low
         
-        plus_dm[plus_dm < minus_dm] = 0
-        minus_dm[minus_dm < plus_dm] = 0
+        # +DM and -DM calculations
+        plus_dm = pd.Series(0.0, index=df.index)
+        minus_dm = pd.Series(0.0, index=df.index)
         
+        # Conditions
+        cond_plus = (up_move > down_move) & (up_move > 0)
+        cond_minus = (down_move > up_move) & (down_move > 0)
+        
+        plus_dm[cond_plus] = up_move[cond_plus]
+        minus_dm[cond_minus] = down_move[cond_minus]
+        
+        # ATR / TR calculation
         tr = self.compute_true_range(df)
-        atr = tr.rolling(period).mean()
+        # Welles Wilder smoothing (exponential moving average with alpha = 1 / period)
+        atr_wilder = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
         
-        plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
-        minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
+        smoothed_plus_dm = plus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        smoothed_minus_dm = minus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
         
-        dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di))
-        adx = dx.rolling(period).mean()
+        plus_di = 100 * (smoothed_plus_dm / (atr_wilder + 1e-10))
+        minus_di = 100 * (smoothed_minus_dm / (atr_wilder + 1e-10))
+        
+        dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10))
+        adx = dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
         return adx
     
     def compute_true_range(self, df):

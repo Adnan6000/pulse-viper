@@ -1,4 +1,4 @@
-# run.py - FIXED VERSION
+# run.py - CORRECTED VERSION
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -7,17 +7,25 @@ import argparse
 import traceback
 
 def main():
-    parser = argparse.ArgumentParser(description='PulseViper Trading Engine')
-    parser.add_argument('--symbols', nargs='+', default=['XAUUSDm', 'EURUSD'],
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8')
+    parser = argparse.ArgumentParser(description='PulseViper Professional Trading Bot')
+    parser.add_argument('--symbols', nargs='+', default=['XAUUSDm'],
                        help='Trading symbols')
     parser.add_argument('--mode', choices=['scalping', 'intraday', 'swing'], 
-                       default='intraday', help='Trading mode')
+                       default='intraday', help='Trading mode')  # Changed default to intraday
     parser.add_argument('--interval', type=int, default=15,
                        help='Analysis interval in seconds')
-    
+    parser.add_argument('--no-dashboard', action='store_true',
+                       help='Disable dashboard')
+    parser.add_argument('--port', type=int, default=8000,
+                       help='Dashboard port')
+
     args = parser.parse_args()
-    
-    print("🐍 PULSE VIPER ULTRA - ENHANCED ENGINE")
+
+    print("🐍 PULSE VIPER - ADVANCED TRADING ENGINE")
     print("=" * 50)
     
     try:
@@ -29,8 +37,16 @@ def main():
         # Use advanced engine
         engine = AdvancedTradingEngine(
             symbols=args.symbols,
-            strategy_mode=args.mode
+            strategy_mode=args.mode,
+            enable_dashboard=not args.no_dashboard,
+            port=args.port
         )
+        
+        print(f"🚀 Starting engine with symbols: {args.symbols}")
+        print(f"🎯 Trading mode: {args.mode}")
+        print(f"⏰ Analysis interval: {args.interval} seconds")
+        print(f"📊 Dashboard: {'ENABLED' if not args.no_dashboard else 'DISABLED'}")
+        print(f"🔌 Port: {args.port}")
         
         engine.run_engine(sleep_seconds=args.interval)
         
@@ -78,14 +94,14 @@ def use_alternative_engine(args):
                             df = pd.DataFrame(rates)
                             price = df.iloc[-1]['close']
                             
-                            # Simple RSI
+                            # Simple RSI calculation
                             closes = df['close']
                             delta = closes.diff()
-                            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-                            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                            gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
+                            loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=1).mean()
                             rs = gain / loss
                             rsi = 100 - (100 / (1 + rs))
-                            current_rsi = rsi.iloc[-1] if not rsi.empty else 50
+                            current_rsi = rsi.iloc[-1] if not rsi.empty and not pd.isna(rsi.iloc[-1]) else 50
                             
                             if current_rsi < 30:
                                 action = "BUY"
@@ -105,12 +121,16 @@ def use_alternative_engine(args):
                     time.sleep(sleep_seconds)
                     
             except KeyboardInterrupt:
-                print("\n🛑 Stopped")
+                print("\n🛑 Engine stopped by user")
+            except Exception as e:
+                print(f"💥 Error in alternative engine: {e}")
             finally:
                 shutdown_mt5()
+                print("🔒 MT5 connection closed")
     
+    # Create and run alternative engine
     engine = AlternativeEngine(args.symbols)
-    engine.run(args.interval)
+    engine.run(args.interval)  # Fixed: removed extra parameter
 
 if __name__ == "__main__":
     main()

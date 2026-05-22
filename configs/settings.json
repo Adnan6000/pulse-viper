@@ -1,0 +1,20 @@
+{
+    "paper_mode": false,
+    "trading_mode": "intraday",
+    "hedging_mode": false,
+    "compounding_mode": false,
+    "risk_percent": 5,
+    "london_session_enabled": false,
+    "ny_session_enabled": false,
+    "break_even_enabled": true,
+    "trailing_stop_enabled": true,
+    "self_learning_filter": true,
+    "news_filter_enabled": true,
+    "max_spread_points": 450,
+    "min_rr_ratio": 2.5,
+    "max_daily_trades": 10,
+    "smc_swing_window": 3,
+    "smc_lookback_sweep": 15,
+    "smc_lookback_mss": 15,
+    "smc_fvg_lookback": 5
+}
