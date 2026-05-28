@@ -23,6 +23,7 @@ from utils.settings_manager import settings_manager
 from utils.volume_analyzer import VolumeAnalyzer
 from utils.sentiment_analyzer import sentiment_analyzer
 from strategies.fib_retest import FibRetestStrategy
+from strategies.crt_tbs import CrtTbsStrategy
 from dashboard.web_dashboard import WebDashboardServer
 
 class AdvancedTradingEngine:
@@ -511,20 +512,40 @@ class AdvancedTradingEngine:
             sentiment_payload['pwh'] = self.pwh_cache.get(symbol, np.nan)
             sentiment_payload['pwl'] = self.pwl_cache.get(symbol, np.nan)
             
+            # Get active strategy
+            active_strategy = settings_manager.get("active_strategy", "fib_retest")
+            
+            fib_action, fib_regime, fib_sl, fib_tp, fib_metadata = None, "sideway", 0.0, 0.0, {}
+            crt_action, crt_regime, crt_sl, crt_tp, crt_metadata = None, "sideway", 0.0, 0.0, {}
+            
             # Evaluate Fibonacci / Price Action Confluence Strategy
-            fib_action, fib_regime, fib_sl, fib_tp, fib_metadata = FibRetestStrategy.evaluate_retest(
-                df_context=df_context,
-                current_price=tick.bid,
-                atr=latest_ltf['atr'],
-                volume_cache=self.volume_cache,
-                sentiment_cache=sentiment_payload,
-                htf_bias=latest_htf['active_bias'],
-                df_ltf=df_ltf
-            )
+            if active_strategy in ["fib_retest", "both"]:
+                fib_action, fib_regime, fib_sl, fib_tp, fib_metadata = FibRetestStrategy.evaluate_retest(
+                    df_context=df_context,
+                    current_price=tick.bid,
+                    atr=latest_ltf['atr'],
+                    volume_cache=self.volume_cache,
+                    sentiment_cache=sentiment_payload,
+                    htf_bias=latest_htf['active_bias'],
+                    df_ltf=df_ltf
+                )
+                
+            # Evaluate Candle Range Theory (CRT) + Turtle Body Soup (TBS) Strategy
+            if active_strategy in ["crt_tbs", "both"]:
+                crt_action, crt_regime, crt_sl, crt_tp, crt_metadata = CrtTbsStrategy.evaluate_crt_tbs(
+                    df_context=df_context,
+                    current_price=tick.bid,
+                    atr=latest_ltf['atr'],
+                    volume_cache=self.volume_cache,
+                    sentiment_cache=sentiment_payload,
+                    htf_bias=latest_htf['active_bias'],
+                    df_ltf=df_ltf
+                )
             
             # Update pattern learner's market regimes state (upper case)
+            active_regime = crt_regime if active_strategy == "crt_tbs" else fib_regime
             self.pattern_learner.market_regimes[symbol] = {
-                'regime': fib_regime.upper(),
+                'regime': active_regime.upper(),
                 'timestamp': str(pd.Timestamp.now()),
                 'volatility': latest_ltf['volatility'],
                 'atr_pct': latest_ltf['atr_pct']
@@ -554,6 +575,11 @@ class AdvancedTradingEngine:
                 'fib_sl': fib_sl,
                 'fib_tp': fib_tp,
                 'fib_metadata': fib_metadata,
+                'crt_action': crt_action,
+                'crt_regime': crt_regime,
+                'crt_sl': crt_sl,
+                'crt_tp': crt_tp,
+                'crt_metadata': crt_metadata,
                 'df_ltf': df_ltf,
                 'features': {
                     'active_bias': latest_htf['active_bias'],
@@ -654,91 +680,108 @@ class AdvancedTradingEngine:
                 has_same_direction = any(p.symbol == symbol and p.action == action for p in self.trade_manager.positions.values())
                 return not has_same_direction
 
-        # --- BULLISH ENTRY MODEL (Sharp Turn BUY - Relaxed) ---
-        is_bullish_setup = (h1_bias >= 0) and (m15_sweep == 1 or m5_mss == 1)
+        # Get active strategy setting
+        active_strategy = settings_manager.get("active_strategy", "fib_retest")
         
-        # --- BEARISH ENTRY MODEL (Sharp Turn SELL - Relaxed) ---
-        is_bearish_setup = (h1_bias <= 0) and (m15_sweep == -1 or m5_mss == -1)
-        
-        # Throttled logging to avoid log pollution
-        import time
-        current_time = time.time()
-        
-        if not hasattr(self, '_last_block_log_time'):
-            self._last_block_log_time = {}
-        last_block_log = self._last_block_log_time.get(symbol, 0)
-        should_log_block = (current_time - last_block_log >= 60.0)
-
-        last_log = getattr(self, '_last_eval_log_time', {})
-        if current_time - last_log.get(symbol, 0) >= 10.0:
-            self.logger.info(
-                f"📊 {symbol} Eval | bias={h1_bias} sweep={m15_sweep} mss={m5_mss} fvg={fvg_class} | bull={is_bullish_setup} bear={is_bearish_setup}"
-            )
-            last_log[symbol] = current_time
-            self._last_eval_log_time = last_log
-
-        # Premium/Discount check using support and resistance boundaries
-        range_mid = 0.5 * (analysis['support'] + analysis['resistance'])
-        if is_bullish_setup and can_trade_direction("BUY") and analysis['support'] > 0 and analysis['resistance'] > 0:
-            if bid > range_mid:
-                if should_log_block:
-                    self.logger.warning(f"🚫 BUY setup blocked: price ({bid:.2f}) is in Premium zone (above range mid: {range_mid:.2f})")
-                    self._last_block_log_time[symbol] = current_time
-                is_bullish_setup = False
-
-        if is_bearish_setup and can_trade_direction("SELL") and analysis['support'] > 0 and analysis['resistance'] > 0:
-            if ask < range_mid:
-                if should_log_block:
-                    self.logger.warning(f"🚫 SELL setup blocked: price ({ask:.2f}) is in Discount zone (below range mid: {range_mid:.2f})")
-                    self._last_block_log_time[symbol] = current_time
-                is_bearish_setup = False
-
-        if is_bullish_setup and can_trade_direction("BUY"):
-            entry_price = ask
+        # Priority 1: CRT + TBS Strategy
+        if active_strategy in ["crt_tbs", "both"]:
+            crt_action = analysis.get('crt_action')
+            if crt_action in ["BUY", "SELL"] and can_trade_direction(crt_action):
+                crt_sl = analysis.get('crt_sl', 0.0)
+                crt_tp = analysis.get('crt_tp', 0.0)
+                if crt_sl > 0.0 and crt_tp > 0.0:
+                    self.logger.info(f"🐢 Candle Range Theory (CRT) + Turtle Body Soup (TBS) setup identified on {symbol} | Action: {crt_action} | SL: {crt_sl:.2f}, TP: {crt_tp:.2f}")
+                    return crt_action, crt_sl, crt_tp, "CRT_TBS"
+                    
+        # Priority 2: Legacy SMC + Fib Retest Strategy
+        if active_strategy in ["fib_retest", "both"]:
+            # --- BULLISH ENTRY MODEL (Sharp Turn BUY - Relaxed) ---
+            is_bullish_setup = (h1_bias >= 0) and (m15_sweep == 1 or m5_mss == 1)
             
-            # SL: placed below the recent LTF support swing low
-            sl_price = analysis['support'] - (0.2 * atr)  # small buffer
-            sl_price = min(sl_price, entry_price - (1.5 * atr))  # minimum SL distance
+            # --- BEARISH ENTRY MODEL (Sharp Turn SELL - Relaxed) ---
+            is_bearish_setup = (h1_bias <= 0) and (m15_sweep == -1 or m5_mss == -1)
             
-            # TP: Target opposing resistance liquidity with dynamic RR
-            tp_price = entry_price + (rr_ratio * (entry_price - sl_price))
+            # Throttled logging to avoid log pollution
+            import time
+            current_time = time.time()
             
-            # Ensure TP is aligned with major liquidity resistance
-            if analysis['resistance'] > entry_price:
-                tp_price = max(tp_price, analysis['resistance'])
+            if not hasattr(self, '_last_block_log_time'):
+                self._last_block_log_time = {}
+            last_block_log = self._last_block_log_time.get(symbol, 0)
+            should_log_block = (current_time - last_block_log >= 60.0)
+    
+            last_log = getattr(self, '_last_eval_log_time', {})
+            if current_time - last_log.get(symbol, 0) >= 10.0:
+                self.logger.info(
+                    f"📊 {symbol} Eval | bias={h1_bias} sweep={m15_sweep} mss={m5_mss} fvg={fvg_class} | bull={is_bullish_setup} bear={is_bearish_setup}"
+                )
+                last_log[symbol] = current_time
+                self._last_eval_log_time = last_log
+    
+            # Premium/Discount check using support and resistance boundaries
+            range_mid = 0.5 * (analysis['support'] + analysis['resistance'])
+            if is_bullish_setup and can_trade_direction("BUY") and analysis['support'] > 0 and analysis['resistance'] > 0:
+                if bid > range_mid:
+                    if should_log_block:
+                        self.logger.warning(f"🚫 BUY setup blocked: price ({bid:.2f}) is in Premium zone (above range mid: {range_mid:.2f})")
+                        self._last_block_log_time[symbol] = current_time
+                    is_bullish_setup = False
+    
+            if is_bearish_setup and can_trade_direction("SELL") and analysis['support'] > 0 and analysis['resistance'] > 0:
+                if ask < range_mid:
+                    if should_log_block:
+                        self.logger.warning(f"🚫 SELL setup blocked: price ({ask:.2f}) is in Discount zone (below range mid: {range_mid:.2f})")
+                        self._last_block_log_time[symbol] = current_time
+                    is_bearish_setup = False
+    
+            if is_bullish_setup and can_trade_direction("BUY"):
+                entry_price = ask
                 
-            self.logger.info(f"🟢 BUY SMC setup identified on {symbol} | MSS: 1, Sweep: 1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
-            return "BUY", sl_price, tp_price, "SMC"
-
-        if is_bearish_setup and can_trade_direction("SELL"):
-            entry_price = bid
-            
-            # SL: placed above the recent LTF resistance swing high
-            sl_price = analysis['resistance'] + (0.2 * atr)
-            sl_price = max(sl_price, entry_price + (1.5 * atr))
-            
-            # TP: Target opposing support liquidity with dynamic RR
-            tp_price = entry_price - (rr_ratio * (sl_price - entry_price))
-            
-            if analysis['support'] < entry_price:
-                tp_price = min(tp_price, analysis['support'])
+                # SL: placed below the recent LTF support swing low
+                sl_price = analysis['support'] - (0.2 * atr)  # small buffer
+                sl_price = min(sl_price, entry_price - (1.5 * atr))  # minimum SL distance
                 
-            self.logger.info(f"🔴 SELL SMC setup identified on {symbol} | MSS: -1, Sweep: -1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
-            return "SELL", sl_price, tp_price, "SMC"
-
-        # --- FALLBACK FIBONACCI RETEST STRATEGY ---
-        fib_action = analysis.get('fib_action')
-        if fib_action in ["BUY", "SELL"] and can_trade_direction(fib_action):
-            entry_price = ask if fib_action == "BUY" else bid
-            fib_sl = analysis.get('fib_sl', 0.0)
-            fib_tp = analysis.get('fib_tp', 0.0)
-            
-            if fib_sl > 0.0 and fib_tp > 0.0:
-                if should_log_block:
-                    self.logger.info(f"📐 Price Action confluence setup identified on {symbol} | Action: {fib_action} | SL: {fib_sl:.2f}, TP: {fib_tp:.2f}")
-                    self._last_block_log_time[symbol] = current_time
-                return fib_action, fib_sl, fib_tp, "FIB"
-
+                # TP: Target opposing resistance liquidity with dynamic RR
+                tp_price = entry_price + (rr_ratio * (entry_price - sl_price))
+                
+                # Ensure TP is aligned with major liquidity resistance
+                if analysis['resistance'] > entry_price:
+                    tp_price = max(tp_price, analysis['resistance'])
+                    
+                self.logger.info(f"🟢 BUY SMC setup identified on {symbol} | MSS: 1, Sweep: 1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
+                return "BUY", sl_price, tp_price, "SMC"
+    
+            if is_bearish_setup and can_trade_direction("SELL"):
+                entry_price = bid
+                
+                # SL: placed above the recent LTF resistance swing high
+                sl_price = analysis['resistance'] + (0.2 * atr)
+                sl_price = max(sl_price, entry_price + (1.5 * atr))
+                
+                # TP: Target opposing support liquidity with dynamic RR
+                tp_price = entry_price - (rr_ratio * (sl_price - entry_price))
+                
+                if analysis['support'] < entry_price:
+                    tp_price = min(tp_price, analysis['support'])
+                    
+                self.logger.info(f"🔴 SELL SMC setup identified on {symbol} | MSS: -1, Sweep: -1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
+                return "SELL", sl_price, tp_price, "SMC"
+    
+            # --- FALLBACK FIBONACCI RETEST STRATEGY ---
+            fib_action = analysis.get('fib_action')
+            if fib_action in ["BUY", "SELL"] and can_trade_direction(fib_action):
+                entry_price = ask if fib_action == "BUY" else bid
+                fib_sl = analysis.get('fib_sl', 0.0)
+                fib_tp = analysis.get('fib_tp', 0.0)
+                
+                if fib_sl > 0.0 and fib_tp > 0.0:
+                    import time
+                    current_time = time.time()
+                    if should_log_block:
+                        self.logger.info(f"📐 Price Action confluence setup identified on {symbol} | Action: {fib_action} | SL: {fib_sl:.2f}, TP: {fib_tp:.2f}")
+                        self._last_block_log_time[symbol] = current_time
+                    return fib_action, fib_sl, fib_tp, "FIB"
+                    
         return None
 
     def execute_and_record_trade(self, symbol: str, action: str, sl: float, tp: float, analysis: Dict):
