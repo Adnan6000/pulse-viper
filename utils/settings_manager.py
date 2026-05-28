@@ -16,7 +16,8 @@ DEFAULT_SETTINGS = {
     "self_learning_filter": True,
     "news_filter_enabled": True,
     "max_spread_points": 20,  # Default for Exness Standard, adapted dynamically
-    "min_rr_ratio": 2.0
+    "min_rr_ratio": 2.0,
+    "auto_trade_enabled": True
 }
 
 class SettingsManager:

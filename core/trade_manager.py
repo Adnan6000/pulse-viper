@@ -32,6 +32,7 @@ class TradePosition:
         self.sibling_id = None
         self.is_tp1_target = False
         self.is_tp2_target = False
+        self.moved_to_be = False
 
 class BaseTradeManager:
     def __init__(self, config):
@@ -113,8 +114,13 @@ class BaseTradeManager:
                 profile = symbol_manager.get_broker_profile(symbol)
                 is_cent = profile.get("is_cent_account", False)
                 min_risk = 300.0 if is_cent else 3.0
+                
+                # Low capital safety check: cap min_risk at 10% of total capital
+                if min_risk > capital * 0.10:
+                    min_risk = capital * 0.10
+                    self.logger.info(f"Low capital ({capital:.2f}) detected. Capping min risk to {min_risk:.2f}.")
+                    
                 if risk_amount < min_risk:
-                    self.logger.info(f"Capital risk of {risk_amount:.2f} is below the minimum allowed risk of {min_risk:.2f}. Forcing risk to {min_risk:.2f}.")
                     risk_amount = min_risk
             except Exception as e:
                 self.logger.error(f"Error checking broker profile for minimum risk: {e}")
@@ -123,7 +129,7 @@ class BaseTradeManager:
             price_distance = abs(entry_price - sl_price)
             if price_distance == 0:
                 return symbol_info.volume_min if symbol_info else 0.01
-
+ 
             # Calculate sl in points
             sl_points = price_distance / symbol_info.point
             
@@ -143,8 +149,20 @@ class BaseTradeManager:
             lots = round(raw_lots / vol_step) * vol_step
             min_allowed = max(0.01, vol_min)
             lots = max(min_allowed, min(vol_max, lots))
+            lots = round(lots, 2)
             
-            return round(lots, 2)
+            # Capital margin safety check
+            try:
+                # Calculate margin required for this position size
+                margin_req = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, symbol, lots, entry_price)
+                if margin_req is not None:
+                    if margin_req > capital * 0.95:
+                        self.logger.warning(f"❌ Blocked trade: Required margin ({margin_req:.2f}) exceeds 95% of capital ({capital:.2f})")
+                        return 0.0
+            except Exception as margin_err:
+                self.logger.error(f"Error checking margin requirements: {margin_err}")
+                
+            return lots
         except Exception as e:
             self.logger.error(f"Error calculating lot size: {e}")
             return 0.01
@@ -183,7 +201,10 @@ class PaperTradeManager(BaseTradeManager):
         volume_min = symbol_info.volume_min if symbol_info else 0.01
         
         lot_size = self.calculate_lot_size(symbol, sl_price, entry_price)
-        
+        if lot_size <= 0.0:
+            self.logger.warning(f"🚫 Virtual trade blocked: Calculated lot size is 0.0 (possibly due to capital constraints)")
+            return None
+            
         # Check if we can split
         if lot_size >= 2 * volume_step:
             vol1 = round((lot_size / 2.0) / volume_step) * volume_step
@@ -274,29 +295,46 @@ class PaperTradeManager(BaseTradeManager):
             # Track max profit in points for break-even/trailing logic
             pos.max_profit_points = max(pos.max_profit_points, pnl_points)
 
-            # Time-based break-even movement (after 30 seconds if in profit)
-            elapsed_seconds = (datetime.now() - pos.timestamp).total_seconds() if pos.timestamp else 0
-            if break_even_enabled and elapsed_seconds >= 30.0 and pos.sl != pos.entry_price:
+            # --- BREAK-EVEN CHECK ---
+            moved_to_be = False
+            is_sl_at_or_better = (pos.sl >= pos.entry_price) if pos.action == "BUY" else (pos.sl <= pos.entry_price and pos.sl != 0)
+            if break_even_enabled and not pos.moved_to_be and not is_sl_at_or_better:
+                # 1. Time-based BE (30 seconds in profit)
+                elapsed_seconds = (datetime.now() - pos.entry_time).total_seconds() if pos.entry_time else 0
                 is_favorable = (current_price > pos.entry_price) if pos.action == "BUY" else (current_price < pos.entry_price)
-                if is_favorable:
+                if elapsed_seconds >= 30.0 and is_favorable:
                     pos.sl = pos.entry_price
+                    moved_to_be = True
+                    pos.moved_to_be = True
                     self.logger.info(f"Simulated position #{pos.id} moved to Break-Even (30 seconds elapsed and in profit)")
-            
-            # Sibling closed BE movement
-            if pos.sibling_id and pos.sibling_id not in self.positions:
-                if pos.sl != pos.entry_price:
+                
+                # 2. Distance-based BE (profit >= initial SL distance)
+                if not moved_to_be and pos.initial_sl_dist > 0:
+                    sl_distance_pts = pos.initial_sl_dist / symbol_info.point
+                    if pos.max_profit_points >= sl_distance_pts:
+                        pos.sl = pos.entry_price
+                        moved_to_be = True
+                        pos.moved_to_be = True
+                        self.logger.info(f"Simulated position #{pos.id} moved to Break-Even (SL set to entry due to profit distance)")
+                
+                # 3. Sibling closed BE
+                if not moved_to_be and pos.sibling_id and pos.sibling_id not in self.positions:
                     pos.sl = pos.entry_price
+                    moved_to_be = True
+                    pos.moved_to_be = True
                     self.logger.info(f"Simulated position #{pos.id} moved to Break-Even (sibling #{pos.sibling_id} closed)")
-            
-            # Single position BE movement on TP1 hit
-            elif not pos.sibling_id and pos.tp1 and pos.sl != pos.entry_price:
-                reached_tp1 = (current_price >= pos.tp1) if pos.action == "BUY" else (current_price <= pos.tp1)
-                if reached_tp1:
-                    pos.sl = pos.entry_price
-                    self.logger.info(f"Simulated single position #{pos.id} moved to Break-Even (reached TP1)")
-            
-            # Apply Trailing Stop or Break-Even logic
-            elif trailing_stop_enabled and pos.initial_sl_dist > 0:
+                
+                # 4. TP1 hit BE
+                if not moved_to_be and not pos.sibling_id and pos.tp1:
+                    reached_tp1 = (current_price >= pos.tp1) if pos.action == "BUY" else (current_price <= pos.tp1)
+                    if reached_tp1:
+                        pos.sl = pos.entry_price
+                        moved_to_be = True
+                        pos.moved_to_be = True
+                        self.logger.info(f"Simulated single position #{pos.id} moved to Break-Even (reached TP1)")
+
+            # --- TRAILING STOP CHECK ---
+            if trailing_stop_enabled and pos.initial_sl_dist > 0 and not moved_to_be:
                 if pos.action == "BUY":
                     new_sl = round(current_price - pos.initial_sl_dist, symbol_info.digits)
                     if new_sl > pos.sl:
@@ -307,11 +345,6 @@ class PaperTradeManager(BaseTradeManager):
                     if pos.sl == 0 or new_sl < pos.sl:
                         pos.sl = new_sl
                         self.logger.info(f"Simulated position #{pos.id} trailed SL to {new_sl:.2f}")
-            elif break_even_enabled and pos.sl != 0 and pos.sl != pos.entry_price:
-                sl_distance_pts = pos.initial_sl_dist / symbol_info.point
-                if pos.max_profit_points >= sl_distance_pts:
-                    pos.sl = pos.entry_price
-                    self.logger.info(f"Simulated position #{pos.id} moved to Break-Even (SL set to entry)")
                 
             # Check SL/TP hit
             if pos.action == "BUY":
@@ -432,7 +465,10 @@ class LiveTradeManager(BaseTradeManager):
         volume_min = symbol_info.volume_min
         
         lot_size = self.calculate_lot_size(symbol, sl_price, entry_price)
-        
+        if lot_size <= 0.0:
+            self.logger.warning(f"🚫 Live trade blocked: Calculated lot size is 0.0 (possibly due to capital constraints)")
+            return None
+            
         if lot_size >= 2 * volume_step:
             vol1 = round((lot_size / 2.0) / volume_step) * volume_step
             vol1 = round(vol1, 2)
@@ -633,7 +669,7 @@ class LiveTradeManager(BaseTradeManager):
             if ticket not in self.positions:
                 # Re-attach missing tracking
                 action_str = "BUY" if mt5_pos.type == mt5.POSITION_TYPE_BUY else "SELL"
-                self.positions[ticket] = TradePosition(
+                pos = TradePosition(
                     ticket_id=ticket,
                     symbol=symbol,
                     action=action_str,
@@ -644,6 +680,10 @@ class LiveTradeManager(BaseTradeManager):
                     timestamp=datetime.fromtimestamp(mt5_pos.time),
                     magic=mt5_pos.magic
                 )
+                is_at_or_better = (pos.sl >= pos.entry_price) if pos.action == "BUY" else (pos.sl <= pos.entry_price and pos.sl != 0)
+                if is_at_or_better:
+                    pos.moved_to_be = True
+                self.positions[ticket] = pos
 
         # Pass 2: Recover sibling links for unlinked positions
         unlinked = [pos for pos in self.positions.values() if pos.symbol == symbol and pos.sibling_id is None]
@@ -694,44 +734,38 @@ class LiveTradeManager(BaseTradeManager):
         for mt5_pos in mt5_positions:
             if mt5_pos.magic != self.magic_number:
                 continue
-                
             ticket = mt5_pos.ticket
             pos = self.positions[ticket]
             pos.pnl = mt5_pos.profit
             pos.sl = mt5_pos.sl
             pos.tp = mt5_pos.tp
             
+            # Sync persistent break-even state if MT5 SL has been updated to break-even or better
+            is_at_or_better = (pos.sl >= pos.entry_price) if pos.action == "BUY" else (pos.sl <= pos.entry_price and pos.sl != 0)
+            if is_at_or_better:
+                pos.moved_to_be = True
+            
             # Apply dynamic risk adjustments (Break-Even and Trailing Stop)
             current_price = bid if pos.action == "BUY" else ask
             pnl_points = (current_price - pos.entry_price) / symbol_info.point if pos.action == "BUY" else (pos.entry_price - current_price) / symbol_info.point
             
             pos.max_profit_points = max(pos.max_profit_points, pnl_points)
-
-            # Time-based break-even movement (after 30 seconds if in profit)
-            elapsed_seconds = (datetime.now() - pos.timestamp).total_seconds() if pos.timestamp else 0
-            if break_even_enabled and elapsed_seconds >= 30.0 and pos.sl != pos.entry_price:
-                is_favorable = (current_price > pos.entry_price) if pos.action == "BUY" else (current_price < pos.entry_price)
-                if is_favorable:
-                    request = {
-                        "action": mt5.TRADE_ACTION_SLTP,
-                        "position": ticket,
-                        "sl": pos.entry_price,
-                        "tp": pos.tp
-                    }
-                    res = mt5.order_send(request)
-                    if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                        pos.sl = pos.entry_price
-                        self.logger.info(f"✅ Position #{ticket} moved to Break-Even on MT5 (30 seconds elapsed and in profit)")
-                    else:
-                        self.logger.error(f"Failed to move position #{ticket} to Break-Even: {res.comment if res else 'None'}")
-                    continue
+ 
+            # Time-based break-even movement handled below
             
-            # Sibling check for BE movement
-            if pos.sibling_id and pos.sibling_id not in self.positions:
-                if pos.sl != pos.entry_price:
-                    # Filter to avoid "Invalid stops" when price is on the wrong side
-                    is_favorable = (current_price > pos.entry_price) if pos.action == "BUY" else (current_price < pos.entry_price)
-                    if is_favorable:
+            # --- BREAK-EVEN CHECK (LIVE) ---
+            moved_to_be = False
+            is_sl_at_or_better = (pos.sl >= pos.entry_price) if pos.action == "BUY" else (pos.sl <= pos.entry_price and pos.sl != 0)
+            if break_even_enabled and not pos.moved_to_be and not is_sl_at_or_better:
+                # Filter to avoid "Invalid stops" when price is on the wrong side
+                is_favorable = (current_price > pos.entry_price) if pos.action == "BUY" else (current_price < pos.entry_price)
+                
+                if is_favorable:
+                    # 1. Time-based or Distance-based BE
+                    time_open_sec = (datetime.now() - pos.entry_time).total_seconds() if pos.entry_time else 0
+                    is_time_be = (time_open_sec >= 30)
+                    is_dist_be = (pos.initial_sl_dist > 0 and pos.max_profit_points >= (pos.initial_sl_dist / symbol_info.point))
+                    if is_time_be or is_dist_be:
                         request = {
                             "action": mt5.TRADE_ACTION_SLTP,
                             "position": ticket,
@@ -741,31 +775,50 @@ class LiveTradeManager(BaseTradeManager):
                         res = mt5.order_send(request)
                         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
                             pos.sl = pos.entry_price
+                            moved_to_be = True
+                            pos.moved_to_be = True
+                            self.logger.info(f"✅ Position #{ticket} moved to Break-Even on MT5")
+                        else:
+                            self.logger.error(f"Failed to move position #{ticket} to Break-Even: {res.comment if res else 'None'}")
+                    
+                    # 2. Sibling closed BE
+                    if not moved_to_be and pos.sibling_id and pos.sibling_id not in self.positions:
+                        request = {
+                            "action": mt5.TRADE_ACTION_SLTP,
+                            "position": ticket,
+                            "sl": pos.entry_price,
+                            "tp": pos.tp
+                        }
+                        res = mt5.order_send(request)
+                        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                            pos.sl = pos.entry_price
+                            moved_to_be = True
+                            pos.moved_to_be = True
                             self.logger.info(f"✅ Live Position #{ticket} moved to Break-Even (sibling #{pos.sibling_id} closed)")
                         else:
                             self.logger.error(f"Failed to move Live Position #{ticket} to Break-Even: {res.comment if res else 'None'}")
-            
-            # Single position BE movement on TP1 hit
-            elif not pos.sibling_id and pos.tp1 and pos.sl != pos.entry_price:
-                reached_tp1 = (current_price >= pos.tp1) if pos.action == "BUY" else (current_price <= pos.tp1)
-                if reached_tp1:
-                    is_favorable = (current_price > pos.entry_price) if pos.action == "BUY" else (current_price < pos.entry_price)
-                    if is_favorable:
-                        request = {
-                            "action": mt5.TRADE_ACTION_SLTP,
-                            "position": ticket,
-                            "sl": pos.entry_price,
-                            "tp": pos.tp
-                        }
-                        res = mt5.order_send(request)
-                        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                            pos.sl = pos.entry_price
-                            self.logger.info(f"✅ Single Live Position #{ticket} moved to Break-Even after hitting TP1")
-                        else:
-                            self.logger.error(f"Failed to move Single Live Position #{ticket} to Break-Even: {res.comment if res else 'None'}")
-                        
-            # Trailing Stop
-            elif trailing_stop_enabled and pos.initial_sl_dist > 0:
+                    
+                    # 3. TP1 reached BE
+                    if not moved_to_be and not pos.sibling_id and pos.tp1:
+                        reached_tp1 = (current_price >= pos.tp1) if pos.action == "BUY" else (current_price <= pos.tp1)
+                        if reached_tp1:
+                            request = {
+                                "action": mt5.TRADE_ACTION_SLTP,
+                                "position": ticket,
+                                "sl": pos.entry_price,
+                                "tp": pos.tp
+                            }
+                            res = mt5.order_send(request)
+                            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                                pos.sl = pos.entry_price
+                                moved_to_be = True
+                                pos.moved_to_be = True
+                                self.logger.info(f"✅ Single Live Position #{ticket} moved to Break-Even after hitting TP1")
+                            else:
+                                self.logger.error(f"Failed to move Single Live Position #{ticket} to Break-Even: {res.comment if res else 'None'}")
+
+            # --- TRAILING STOP CHECK (LIVE) ---
+            if trailing_stop_enabled and pos.initial_sl_dist > 0 and not moved_to_be:
                 if pos.action == "BUY":
                     new_sl = round(current_price - pos.initial_sl_dist, symbol_info.digits)
                     if new_sl > pos.sl:
@@ -796,23 +849,6 @@ class LiveTradeManager(BaseTradeManager):
                             self.logger.info(f"✅ Position #{ticket} trailed SL to {new_sl:.2f} on MT5")
                         else:
                             self.logger.error(f"Failed to trail position #{ticket} SL: {res.comment if res else 'None'}")
-            elif break_even_enabled and pos.sl != 0 and pos.sl != pos.entry_price:
-                sl_distance_pts = pos.initial_sl_dist / symbol_info.point
-                if pos.max_profit_points >= sl_distance_pts:
-                    is_favorable = (current_price > pos.entry_price) if pos.action == "BUY" else (current_price < pos.entry_price)
-                    if is_favorable:
-                        request = {
-                            "action": mt5.TRADE_ACTION_SLTP,
-                            "position": ticket,
-                            "sl": pos.entry_price,
-                            "tp": pos.tp
-                        }
-                        res = mt5.order_send(request)
-                        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                            pos.sl = pos.entry_price
-                            self.logger.info(f"✅ Position #{ticket} moved to Break-Even on MT5")
-                        else:
-                            self.logger.error(f"Failed to move position #{ticket} to Break-Even: {res.comment if res else 'None'}")
 
     def close_position(self, pos_id: int, close_price: float, reason: str) -> Optional[TradePosition]:
         """Close position manually"""

@@ -47,6 +47,7 @@ class AdvancedTradingEngine:
         self.connected = False
         self.cycle_count = 0
         self.market_state = {}
+        self.analyzed_trades = {}
         
         # Initialize MT5 Connection
         self._initialize_connection()
@@ -57,6 +58,9 @@ class AdvancedTradingEngine:
         else:
             self.symbols = self._validate_symbols(symbols)
 
+        if self.symbols:
+            settings_manager.set("active_symbol", self.symbols[0])
+
         # Initialize both Trade Managers (Dynamic property will resolve active one based on settings)
         self.paper_trade_manager = PaperTradeManager(self.config)
         self.live_trade_manager = LiveTradeManager(self.config)
@@ -64,6 +68,8 @@ class AdvancedTradingEngine:
 
         # Sniper pullback and fast 1s loop caches
         self.last_candle_times = {}
+        self.last_entry_candle = {}
+        self.last_close_candle = {}
         self.last_analysis_times = {}
         self.cached_analysis = {}
         self.pending_setups = {}
@@ -162,22 +168,73 @@ class AdvancedTradingEngine:
             self.logger.error(f"Reconnection health check failed: {e}")
 
     def _auto_detect_symbols(self) -> List[str]:
-        """Automatically find working symbols. Prioritizes Gold."""
-        available_symbols = [s.name for s in mt5.symbols_get()]
-        
-        # Gold checks
-        for sym in ['GOLD', 'XAUUSDm', 'XAUUSD']:
-            if sym in available_symbols:
-                mt5.symbol_select(sym, True)
-                return [sym]
+        """Automatically find working symbols. Prioritizes Gold matching the account type."""
+        try:
+            available_symbols = [s.name for s in mt5.symbols_get()]
+            if not available_symbols:
+                return ['EURUSD']
                 
-        # Fallback to major currency pairs
-        for sym in ['EURUSD', 'GBPUSD', 'USDJPY']:
-            if sym in available_symbols:
-                mt5.symbol_select(sym, True)
-                return [sym]
+            account = mt5.account_info()
+            currency = account.currency if account else "USD"
+            server = account.server.upper() if account else ""
+            is_cent = (currency == "USC") or ("CENT" in server)
+            
+            # Find all available gold symbols
+            gold_symbols = [s for s in available_symbols if 'XAUUSD' in s.upper() or 'GOLD' in s.upper()]
+            
+            if gold_symbols:
+                # If cent account, prioritize those ending in c or .c
+                if is_cent:
+                    cent_golds = [g for g in gold_symbols if g.endswith('c') or g.endswith('.c')]
+                    if cent_golds:
+                        mt5.symbol_select(cent_golds[0], True)
+                        return [cent_golds[0]]
                 
-        return ['EURUSD']  # Ultimate fallback
+                # Otherwise, try mini, standard, and other preferences
+                pref_order = ['XAUUSDm', 'GOLD', 'XAUUSD']
+                for pref in pref_order:
+                    if pref in gold_symbols:
+                        mt5.symbol_select(pref, True)
+                        return [pref]
+                
+                # Fallback to first gold symbol
+                mt5.symbol_select(gold_symbols[0], True)
+                return [gold_symbols[0]]
+                
+            # If no gold, search major forex pairs
+            major_bases = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF']
+            forex_symbols = []
+            for s in available_symbols:
+                for base in major_bases:
+                    if base in s.upper():
+                        forex_symbols.append(s)
+            
+            if forex_symbols:
+                # Sort and prioritize cent forex pairs if cent account
+                if is_cent:
+                    cent_forex = [f for f in forex_symbols if f.endswith('c') or f.endswith('.c')]
+                    if cent_forex:
+                        mt5.symbol_select(cent_forex[0], True)
+                        return [cent_forex[0]]
+                        
+                # Preference standard majors
+                for pref in major_bases:
+                    # check if exact matches exist
+                    if pref in forex_symbols:
+                        mt5.symbol_select(pref, True)
+                        return [pref]
+                    # check if mini matches exist
+                    if f"{pref}m" in forex_symbols:
+                        mt5.symbol_select(f"{pref}m", True)
+                        return [f"{pref}m"]
+                
+                mt5.symbol_select(forex_symbols[0], True)
+                return [forex_symbols[0]]
+                
+            return ['EURUSD']
+        except Exception as e:
+            self.logger.error(f"Error in auto-detecting symbols: {e}")
+            return ['EURUSD']
 
     def _validate_symbols(self, symbols: List[str]) -> List[str]:
         """Validate that requested symbols are available on broker"""
@@ -268,9 +325,10 @@ class AdvancedTradingEngine:
                 return None
                 
             # 2. Compute SMC indicators on all timeframes
-            htf_smc = SMCIndicators.compute_smc_features(df_htf)
-            context_smc = SMCIndicators.compute_smc_features(df_context)
-            ltf_smc = SMCIndicators.compute_smc_features(df_ltf)
+            swing_window = settings_manager.get("smc_swing_window", 3)
+            htf_smc = SMCIndicators.compute_smc_features(df_htf, window=swing_window)
+            context_smc = SMCIndicators.compute_smc_features(df_context, window=swing_window)
+            ltf_smc = SMCIndicators.compute_smc_features(df_ltf, window=swing_window)
             
             latest_htf = htf_smc.iloc[-1]
             latest_context = context_smc.iloc[-1]
@@ -335,8 +393,28 @@ class AdvancedTradingEngine:
                 tf_ltf: df_ltf
             }
             
-            _temp_sentiment = dict(self.sentiment_cache)  # start with last-known values
+            # Expiration-based sentiment cache to prevent blocking MT5 calls
+            current_time = time.time()
+            if not hasattr(self, 'sentiment_cache_expiry'):
+                self.sentiment_cache_expiry = {}
+                
+            tf_expirations = {
+                'd1': 3600,   # 1 hour
+                'h4': 1800,   # 30 mins
+                'h1': 600,    # 10 mins
+                'm30': 300,   # 5 mins
+                'm15': 60,    # 1 min
+                'm5': 30,     # 30 secs
+                'm1': 15      # 15 secs
+            }
+            
+            _temp_sentiment = dict(self.sentiment_cache)
+            sentiment_changed = False
             for tf_name, tf_const in tfs.items():
+                cache_key = f"{symbol}_{tf_name}"
+                if cache_key in self.sentiment_cache_expiry and current_time < self.sentiment_cache_expiry[cache_key]:
+                    continue
+                    
                 if tf_const in mode_tfs:
                     df_tf = mode_tfs[tf_const]
                 else:
@@ -344,51 +422,104 @@ class AdvancedTradingEngine:
                 
                 if df_tf is not None and len(df_tf) >= 50:
                     _temp_sentiment[tf_name] = sentiment_analyzer.calculate_technical_sentiment(df_tf)
+                    self.sentiment_cache_expiry[cache_key] = current_time + tf_expirations.get(tf_name, 300)
+                    sentiment_changed = True
                 else:
-                    _temp_sentiment[tf_name] = self.sentiment_cache.get(tf_name, 0.0)  # keep last value
-            self.sentiment_cache = _temp_sentiment  # atomic swap
-            try:
-                import os
-                import json
-                cache_path = os.path.join("configs", "sentiment_cache.json")
-                with open(cache_path, "w") as f:
-                    json.dump(self.sentiment_cache, f)
-            except Exception as e:
-                pass
+                    _temp_sentiment[tf_name] = self.sentiment_cache.get(tf_name, 0.0)
+                    
+            if sentiment_changed:
+                self.sentiment_cache = _temp_sentiment
+                try:
+                    import os
+                    import json
+                    cache_path = os.path.join("configs", "sentiment_cache.json")
+                    with open(cache_path, "w") as f:
+                        json.dump(self.sentiment_cache, f)
+                except Exception as e:
+                    pass
 
-            # Calculate and cache volume metrics
-            rvol_series = VolumeAnalyzer.calculate_rvol(df_ltf, period=20)
-            buy_press_series, sell_press_series = VolumeAnalyzer.calculate_buying_selling_pressure(df_ltf)
-            
-            latest_rvol = float(rvol_series.iloc[-1])
-            latest_buy_press = float(buy_press_series.iloc[-1])
-            latest_sell_press = float(sell_press_series.iloc[-1])
-            
-            total_press = latest_buy_press + latest_sell_press
-            if total_press > 0:
-                buy_pct = (latest_buy_press / total_press) * 100.0
-                sell_pct = (latest_sell_press / total_press) * 100.0
-            else:
-                buy_pct = 50.0
-                sell_pct = 50.0
+            # Dynamic caching of daily/weekly levels to reduce MT5 calls
+            if not hasattr(self, '_last_daily_levels_time'):
+                self._last_daily_levels_time = {}
+            if not hasattr(self, 'pdh_cache'):
+                self.pdh_cache = {}
+                self.pdl_cache = {}
+                self.pwh_cache = {}
+                self.pwl_cache = {}
                 
-            vp_profile = VolumeAnalyzer.calculate_volume_profile(df_ltf, lookback=100, bins=20)
-            
-            self.volume_cache = {
-                "rvol": latest_rvol,
-                "buy_pressure": buy_pct,
-                "sell_pressure": sell_pct,
-                "profile": vp_profile
-            }
+            last_lvl_time = self._last_daily_levels_time.get(symbol, 0)
+            if current_time - last_lvl_time >= 900 or symbol not in self.pdh_cache:
+                try:
+                    rates_d1 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, 2)
+                    if rates_d1 is not None and len(rates_d1) >= 2:
+                        self.pdh_cache[symbol] = float(rates_d1[-2]['high'])
+                        self.pdl_cache[symbol] = float(rates_d1[-2]['low'])
+                    else:
+                        self.pdh_cache[symbol] = np.nan
+                        self.pdl_cache[symbol] = np.nan
+                        
+                    rates_w1 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_W1, 0, 2)
+                    if rates_w1 is not None and len(rates_w1) >= 2:
+                        self.pwh_cache[symbol] = float(rates_w1[-2]['high'])
+                        self.pwl_cache[symbol] = float(rates_w1[-2]['low'])
+                    else:
+                        self.pwh_cache[symbol] = np.nan
+                        self.pwl_cache[symbol] = np.nan
+                        
+                    self._last_daily_levels_time[symbol] = current_time
+                except Exception as ex:
+                    self.logger.warning(f"Failed to fetch daily levels for cache: {ex}")
+
+            # Calculate and cache volume metrics at most once per 10 seconds to optimize CPU
+            if not hasattr(self, '_last_volume_calc_time'):
+                self._last_volume_calc_time = {}
+            if not hasattr(self, 'volume_cache'):
+                self.volume_cache = {"rvol": 1.0, "buy_pressure": 50.0, "sell_pressure": 50.0, "profile": {}}
+                
+            last_vol_time = self._last_volume_calc_time.get(symbol, 0)
+            if current_time - last_vol_time >= 10.0 or not self.volume_cache or "rvol" not in self.volume_cache:
+                latest_rvol = VolumeAnalyzer.calculate_rvol_latest(df_ltf, period=20)
+                latest_buy_press, latest_sell_press = VolumeAnalyzer.calculate_buying_selling_pressure_latest(df_ltf)
+                
+                total_press = latest_buy_press + latest_sell_press
+                if total_press > 0:
+                    buy_pct = (latest_buy_press / total_press) * 100.0
+                    sell_pct = (latest_sell_press / total_press) * 100.0
+                else:
+                    buy_pct = 50.0
+                    sell_pct = 50.0
+                    
+                vp_profile = VolumeAnalyzer.calculate_volume_profile(df_ltf, lookback=100, bins=20)
+                
+                self.volume_cache = {
+                    "rvol": latest_rvol,
+                    "buy_pressure": buy_pct,
+                    "sell_pressure": sell_pct,
+                    "profile": vp_profile
+                }
+                self._last_volume_calc_time[symbol] = current_time
 
             # Current bid/ask
             tick = mt5.symbol_info_tick(symbol)
             if not tick:
                 return None
                 
-            # Evaluate Fibonacci Retest Strategy
+            # Inject daily/weekly levels into the sentiment payload
+            sentiment_payload = dict(self.sentiment_cache)
+            sentiment_payload['pdh'] = self.pdh_cache.get(symbol, np.nan)
+            sentiment_payload['pdl'] = self.pdl_cache.get(symbol, np.nan)
+            sentiment_payload['pwh'] = self.pwh_cache.get(symbol, np.nan)
+            sentiment_payload['pwl'] = self.pwl_cache.get(symbol, np.nan)
+            
+            # Evaluate Fibonacci / Price Action Confluence Strategy
             fib_action, fib_regime, fib_sl, fib_tp, fib_metadata = FibRetestStrategy.evaluate_retest(
-                df_context, tick.bid, latest_ltf['atr']
+                df_context=df_context,
+                current_price=tick.bid,
+                atr=latest_ltf['atr'],
+                volume_cache=self.volume_cache,
+                sentiment_cache=sentiment_payload,
+                htf_bias=latest_htf['active_bias'],
+                df_ltf=df_ltf
             )
             
             # Update pattern learner's market regimes state (upper case)
@@ -423,6 +554,7 @@ class AdvancedTradingEngine:
                 'fib_sl': fib_sl,
                 'fib_tp': fib_tp,
                 'fib_metadata': fib_metadata,
+                'df_ltf': df_ltf,
                 'features': {
                     'active_bias': latest_htf['active_bias'],
                     'liq_sweep_type': sweep_type,
@@ -473,6 +605,15 @@ class AdvancedTradingEngine:
         Returns: Tuple (Action "BUY"/"SELL", StopLoss, TakeProfit, SetupType "SMC"/"FIB") or None
         """
         symbol = analysis['symbol']
+        
+        # Rule 0: Cooldown check (prevent double-entry on the same candle)
+        current_candle = self.last_candle_times.get(symbol, 0)
+        if current_candle > 0:
+            if current_candle == self.last_entry_candle.get(symbol, 0):
+                return None
+            if current_candle == self.last_close_candle.get(symbol, 0):
+                return None
+                
         bid = analysis['bid']
         ask = analysis['ask']
         atr = analysis['atr']
@@ -500,16 +641,10 @@ class AdvancedTradingEngine:
         # Allow override from settings
         rr_ratio = settings_manager.get("min_rr_ratio", rr_ratio)
 
-        # Get AI signal confidence/adjustment
-        ai_signal = self.pattern_learner.get_trading_signal(symbol, analysis['features'])
+        # Get AI signal confidence/adjustment for logs only
+        ai_signal = self.pattern_learner.get_trading_signal(symbol, analysis['features'], df_ltf=analysis.get('df_ltf'))
         confidence = ai_signal.get('confidence', 0.5)
         adjustment = ai_signal.get('adjustment', 0.0)
-        
-        # Check if AI confidence warrants a TP boost
-        ai_boost = False
-        if adjustment > 0.0 or confidence >= 0.6:
-            rr_ratio *= 1.5
-            ai_boost = True
 
         # Position checking helper
         def can_trade_direction(action: str) -> bool:
@@ -519,15 +654,21 @@ class AdvancedTradingEngine:
                 has_same_direction = any(p.symbol == symbol and p.action == action for p in self.trade_manager.positions.values())
                 return not has_same_direction
 
-        # --- BULLISH ENTRY MODEL (Sharp Turn BUY) ---
-        is_bullish_setup = (h1_bias == 1) and (m15_sweep == 1) and (m5_mss == 1)
+        # --- BULLISH ENTRY MODEL (Sharp Turn BUY - Relaxed) ---
+        is_bullish_setup = (h1_bias >= 0) and (m15_sweep == 1 or m5_mss == 1)
         
-        # --- BEARISH ENTRY MODEL (Sharp Turn SELL) ---
-        is_bearish_setup = (h1_bias == -1) and (m15_sweep == -1) and (m5_mss == -1)
-
+        # --- BEARISH ENTRY MODEL (Sharp Turn SELL - Relaxed) ---
+        is_bearish_setup = (h1_bias <= 0) and (m15_sweep == -1 or m5_mss == -1)
+        
         # Throttled logging to avoid log pollution
         import time
         current_time = time.time()
+        
+        if not hasattr(self, '_last_block_log_time'):
+            self._last_block_log_time = {}
+        last_block_log = self._last_block_log_time.get(symbol, 0)
+        should_log_block = (current_time - last_block_log >= 60.0)
+
         last_log = getattr(self, '_last_eval_log_time', {})
         if current_time - last_log.get(symbol, 0) >= 10.0:
             self.logger.info(
@@ -535,6 +676,22 @@ class AdvancedTradingEngine:
             )
             last_log[symbol] = current_time
             self._last_eval_log_time = last_log
+
+        # Premium/Discount check using support and resistance boundaries
+        range_mid = 0.5 * (analysis['support'] + analysis['resistance'])
+        if is_bullish_setup and can_trade_direction("BUY") and analysis['support'] > 0 and analysis['resistance'] > 0:
+            if bid > range_mid:
+                if should_log_block:
+                    self.logger.warning(f"🚫 BUY setup blocked: price ({bid:.2f}) is in Premium zone (above range mid: {range_mid:.2f})")
+                    self._last_block_log_time[symbol] = current_time
+                is_bullish_setup = False
+
+        if is_bearish_setup and can_trade_direction("SELL") and analysis['support'] > 0 and analysis['resistance'] > 0:
+            if ask < range_mid:
+                if should_log_block:
+                    self.logger.warning(f"🚫 SELL setup blocked: price ({ask:.2f}) is in Discount zone (below range mid: {range_mid:.2f})")
+                    self._last_block_log_time[symbol] = current_time
+                is_bearish_setup = False
 
         if is_bullish_setup and can_trade_direction("BUY"):
             entry_price = ask
@@ -550,8 +707,6 @@ class AdvancedTradingEngine:
             if analysis['resistance'] > entry_price:
                 tp_price = max(tp_price, analysis['resistance'])
                 
-            if ai_boost:
-                self.logger.info(f"🧠 High AI confidence (adj={adjustment:.2f}, conf={confidence:.2f}). SMC TP scaled 1.5x, new RR: {rr_ratio:.2f}")
             self.logger.info(f"🟢 BUY SMC setup identified on {symbol} | MSS: 1, Sweep: 1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
             return "BUY", sl_price, tp_price, "SMC"
 
@@ -568,8 +723,6 @@ class AdvancedTradingEngine:
             if analysis['support'] < entry_price:
                 tp_price = min(tp_price, analysis['support'])
                 
-            if ai_boost:
-                self.logger.info(f"🧠 High AI confidence (adj={adjustment:.2f}, conf={confidence:.2f}). SMC TP scaled 1.5x, new RR: {rr_ratio:.2f}")
             self.logger.info(f"🔴 SELL SMC setup identified on {symbol} | MSS: -1, Sweep: -1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
             return "SELL", sl_price, tp_price, "SMC"
 
@@ -581,16 +734,9 @@ class AdvancedTradingEngine:
             fib_tp = analysis.get('fib_tp', 0.0)
             
             if fib_sl > 0.0 and fib_tp > 0.0:
-                # Apply dynamic RR scaling to TP distance if AI has high confidence
-                if ai_boost:
-                    tp_dist = abs(entry_price - fib_tp)
-                    if fib_action == "BUY":
-                        fib_tp = entry_price + (tp_dist * 1.5)
-                    else:
-                        fib_tp = entry_price - (tp_dist * 1.5)
-                    self.logger.info(f"🧠 High AI confidence (adj={adjustment:.2f}, conf={confidence:.2f}). Fibonacci TP scaled 1.5x, new TP: {fib_tp:.2f}")
-
-                self.logger.info(f"📐 Fibonacci Retest fallback setup identified on {symbol} | Action: {fib_action} | SL: {fib_sl:.2f}, TP: {fib_tp:.2f}")
+                if should_log_block:
+                    self.logger.info(f"📐 Price Action confluence setup identified on {symbol} | Action: {fib_action} | SL: {fib_sl:.2f}, TP: {fib_tp:.2f}")
+                    self._last_block_log_time[symbol] = current_time
                 return fib_action, fib_sl, fib_tp, "FIB"
 
         return None
@@ -603,6 +749,11 @@ class AdvancedTradingEngine:
         spread = (tick.ask - tick.bid) / symbol_info.point
         
         max_spread = settings_manager.get("max_spread_points", self.config.MAX_SPREAD_POINTS)
+        if "BTC" in symbol or "ETH" in symbol:
+            from utils.symbol_manager import symbol_manager
+            profile = symbol_manager.get_broker_profile(symbol)
+            max_spread = max(max_spread, profile.get("max_spread_points", 5000))
+            
         if spread > max_spread:
             self.logger.warning(f"Trade blocked on {symbol} due to high spread: {spread:.1f} points (Limit: {max_spread})")
             self.skipped_stats['high_spread'] = self.skipped_stats.get('high_spread', 0) + 1
@@ -610,6 +761,23 @@ class AdvancedTradingEngine:
             
         entry_price = tick.ask if action == "BUY" else tick.bid
         
+        # Check if Auto Trade is enabled
+        auto_trade = settings_manager.get("auto_trade_enabled", True)
+        if not auto_trade:
+            self.logger.info(f"🔍 [ANALYSIS ONLY] Auto Trade is OFF. Recording setup on {symbol}: {action} entry @ {entry_price:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
+            self.analyzed_trades[symbol] = {
+                "entry": entry_price,
+                "sl": sl,
+                "tp": tp,
+                "action": action,
+                "time": time.time(),
+                "entry_features": analysis.get('features', {})
+            }
+            # Record entry candle to prevent double-entry cooldown
+            current_candle = self.last_candle_times.get(symbol, 0)
+            self.last_entry_candle[symbol] = current_candle
+            return
+            
         # Open trade via trade manager
         pos = self.trade_manager.open_position(
             symbol=symbol,
@@ -619,6 +787,10 @@ class AdvancedTradingEngine:
             tp_price=tp
         )
         
+        # Record the entry candle timestamp to prevent double-entry (do this regardless of success to avoid immediate retry spam)
+        current_candle = self.last_candle_times.get(symbol, 0)
+        self.last_entry_candle[symbol] = current_candle
+        
         if pos:
             # Store initial entry features in positions for outcome learning
             pos.entry_features = analysis['features']
@@ -627,6 +799,10 @@ class AdvancedTradingEngine:
         """Learn from closed positions and update the self-learning DB + trade journal"""
         while len(self.trade_manager.closed_positions) > 0:
             pos = self.trade_manager.closed_positions.pop(0)
+            
+            # Record the candle timestamp when this trade closed to implement cooldown
+            current_candle = self.last_candle_times.get(pos.symbol, 0)
+            self.last_close_candle[pos.symbol] = current_candle
             
             # Record in engine performance history
             trade_rec = {
@@ -736,10 +912,44 @@ class AdvancedTradingEngine:
             analysis = self.cached_analysis.get(symbol)
             if not analysis:
                 return {}
-            setup = self.evaluate_entry_rules(analysis)
+            
             tick = mt5.symbol_info_tick(symbol)
             bid = tick.bid if tick else 0.0
             ask = tick.ask if tick else 0.0
+            
+            # Run AI prediction unconditionally to get patterns and cluster regime
+            ai_signal = self.pattern_learner.get_trading_signal(symbol, analysis.get('features', {}), df_ltf=analysis.get('df_ltf'))
+            
+            detected_patterns = ai_signal.get('detected_patterns', [])
+            if not detected_patterns:
+                # Construct structural regime description based on current market structure
+                fib_regime = analysis.get('fib_regime', 'sideway').upper()
+                h1_bias = analysis.get('h1_bias', 0)
+                m15_sweep = analysis.get('m15_sweep_type', 0)
+                m5_mss = analysis.get('m5_mss_signal', 0)
+                fvg_class = str(analysis.get('m5_fvg_class', 'none')).upper()
+                
+                # Check for specific regimes
+                if m15_sweep == 1 and m5_mss == 1:
+                    detected_patterns = ["BULLISH REVERSAL SWEEP"]
+                elif m15_sweep == -1 and m5_mss == -1:
+                    detected_patterns = ["BEARISH REVERSAL SWEEP"]
+                elif m5_mss == 1:
+                    detected_patterns = ["BULLISH STRUCTURE SHIFT"]
+                elif m5_mss == -1:
+                    detected_patterns = ["BEARISH STRUCTURE SHIFT"]
+                elif m15_sweep == 1:
+                    detected_patterns = ["BULLISH LIQUIDITY SWEEP"]
+                elif m15_sweep == -1:
+                    detected_patterns = ["BEARISH LIQUIDITY SWEEP"]
+                elif fvg_class == "DFVG":
+                    detected_patterns = ["BULLISH FVG ENTRY SCAN"]
+                elif fvg_class == "PFVG":
+                    detected_patterns = ["BEARISH FVG ENTRY SCAN"]
+                else:
+                    bias_str = "BULLISH" if h1_bias > 0 else ("BEARISH" if h1_bias < 0 else "NEUTRAL")
+                    detected_patterns = [f"{bias_str} {fib_regime} REGIME"]
+            
             result = {
                 'symbol': symbol,
                 'bid': bid,
@@ -751,12 +961,16 @@ class AdvancedTradingEngine:
                 'sl': None,
                 'tp': None,
                 'confidence': 0.0,
-                'setup_type': None
+                'setup_type': None,
+                'detected_patterns': detected_patterns,
+                'cluster_id': int(ai_signal.get('cluster_id', 0)),
+                'training_stats': self.pattern_learner.training_stats.get(symbol, {})
             }
+            
+            setup = self.evaluate_entry_rules(analysis)
             if setup:
                 action, sl, tp, setup_type = setup
                 entry = ask if action == 'BUY' else bid
-                ai_signal = self.pattern_learner.get_trading_signal(symbol, analysis.get('features', {}))
                 result.update({
                     'setup': f'{action} LIMIT',
                     'action': action,
@@ -857,8 +1071,11 @@ class AdvancedTradingEngine:
 
 
 
-    def run_engine(self, sleep_seconds=1):
-        """Main real-time trading loop (1-second update cycle)"""
+    def run_engine(self, sleep_seconds=15):
+        """Main real-time trading loop (decoupled fast 0.5s cycle with throttled analysis)"""
+        self.analysis_interval = float(sleep_seconds)
+        loop_sleep = 0.5  # 500ms cycle for instant position updates and pullback checks
+        
         if self.dashboard:
             self.dashboard.start()
 
@@ -874,21 +1091,16 @@ class AdvancedTradingEngine:
         def _startup_training():
             try:
                 for symbol in self.symbols[:1]:
-                    # Only train if pattern DB has < 20 patterns
-                    total_patterns = sum(len(v) for v in self.pattern_learner.patterns.values())
-                    if total_patterns < 20:
-                        self.logger.info(f"🧠 Sparse pattern DB ({total_patterns} patterns). Running startup yearly training on {symbol}...")
+                    # Train on startup to make sure the AI is fully trained on latest price action
+                    symbol_patterns = len(self.pattern_learner.patterns.get(f"{symbol}_winning", [])) + \
+                                      len(self.pattern_learner.patterns.get(f"{symbol}_losing", []))
+                    if symbol_patterns < 200:
+                        self.logger.info(f"🧠 Pattern DB has {symbol_patterns} patterns for {symbol} (Sparse < 200). Running startup visual & ML historical training on {symbol}...")
                         self.training_in_progress = True
-                        # Fetch a year of data on proper TFs
-                        df_h1 = fetch_ohlcv(symbol, mt5.TIMEFRAME_H1, n=10000)   # expanded
-                        df_m5 = fetch_ohlcv(symbol, mt5.TIMEFRAME_M5, n=40000)  # expanded
-                        df_m1 = fetch_ohlcv(symbol, mt5.TIMEFRAME_M1, n=20000)  # expanded
-                        if df_h1 is not None and df_m5 is not None and df_m1 is not None:
-                            self.logger.info(f"📊 Startup training data: H1={len(df_h1)}, M5={len(df_m5)}, M1={len(df_m1)} bars")
-                            self.pattern_learner.train_on_history(symbol, df_h1, df_m5, df_m1)
+                        self.trigger_historical_training()
                         self.training_in_progress = False
                     else:
-                        self.logger.info(f"🧠 Pattern DB has {total_patterns} patterns. Skipping startup yearly training.")
+                        self.logger.info(f"🧠 Pattern DB has {symbol_patterns} patterns for {symbol}. Skipping startup yearly training.")
                     
                     # Run initial backtest / self-optimization every startup
                     trading_mode = settings_manager.get('trading_mode', 'scalping')
@@ -910,9 +1122,24 @@ class AdvancedTradingEngine:
                 
                 if not self.connected:
                     self.logger.warning("MT5 Disconnected. Waiting for recovery...")
-                    time.sleep(sleep_seconds)
+                    time.sleep(5)
                     continue
                     
+                # Check for dynamic active symbol changes from settings
+                active_symbol = settings_manager.get("active_symbol")
+                if active_symbol and len(self.symbols) > 0 and self.symbols[0] != active_symbol:
+                    self.logger.info(f"🔄 Symbol change requested: switching active symbol from {self.symbols[0]} to {active_symbol}")
+                    validated_symbols = self._validate_symbols([active_symbol])
+                    if validated_symbols:
+                        self.symbols = validated_symbols
+                        self.cached_analysis.clear()
+                        self.pending_setups.clear()
+                        self.last_candle_times.clear()
+                        self.last_entry_candle.clear()
+                        self.last_close_candle.clear()
+                        self.last_analysis_times.clear()
+                        self._broker_profile_set = False
+
                 # Process active signals and tracking
                 for symbol in self.symbols:
                     tick = mt5.symbol_info_tick(symbol)
@@ -921,6 +1148,40 @@ class AdvancedTradingEngine:
                         
                     # Update positions first (check SL/TP)
                     self.trade_manager.update_positions(symbol, tick.bid, tick.ask)
+                    
+                    # Monitor and update virtual/analyzed trades if Auto Trade is OFF
+                    if symbol in self.analyzed_trades:
+                        at = self.analyzed_trades[symbol]
+                        bid = tick.bid
+                        action = at["action"]
+                        sl = at["sl"]
+                        tp = at["tp"]
+                        
+                        closed = False
+                        reason = ""
+                        if action == "BUY":
+                            if bid <= sl:
+                                closed = True
+                                reason = "SL"
+                            elif bid >= tp:
+                                closed = True
+                                reason = "TP"
+                        elif action == "SELL":
+                            if bid >= sl:
+                                closed = True
+                                reason = "SL"
+                            elif bid <= tp:
+                                closed = True
+                                reason = "TP"
+                                
+                        if closed:
+                            self.logger.info(f"🔍 [ANALYSIS ONLY] Setup closed on {symbol} due to {reason} | PnL points: {bid - at['entry'] if action == 'BUY' else at['entry'] - bid:.2f}")
+                            # Record close candle cooldown to prevent instant re-entry
+                            current_candle = self.last_candle_times.get(symbol, 0)
+                            self.last_close_candle[symbol] = current_candle
+                            self.analyzed_trades.pop(symbol)
+                    
+                    # Volume Disaster Check: Early exit safety check removed per user feedback to prevent wicks/volume traps.
                     
                     # 1. Check pending sniper setup pullback entry first
                     if symbol in self.pending_setups:
@@ -992,9 +1253,9 @@ class AdvancedTradingEngine:
                             new_candle = True
                             self.last_candle_times[symbol] = candle_time
                             
-                    # Run full analysis if it is a new candle, or every 2s (for real-time dashboard updates), or if no cache exists
+                    # Run full analysis if it is a new candle, or every analysis_interval, or if no cache exists
                     time_since_last_analysis = current_time - self.last_analysis_times.get(symbol, 0)
-                    if new_candle or time_since_last_analysis >= 2.0 or symbol not in self.cached_analysis:
+                    if new_candle or time_since_last_analysis >= self.analysis_interval or symbol not in self.cached_analysis:
                         analysis = self.run_multi_timeframe_analysis(symbol)
                         if analysis:
                             self.cached_analysis[symbol] = analysis
@@ -1022,24 +1283,37 @@ class AdvancedTradingEngine:
                         if setup:
                             action, sl, tp, setup_type = setup
                             
+                            # Check news/AI block log throttling
+                            if not hasattr(self, '_last_block_log_time'):
+                                self._last_block_log_time = {}
+                            last_block_log = self._last_block_log_time.get(symbol, 0)
+                            should_log_block = (current_time - last_block_log >= 60.0)
+
                             # Apply news sentiment filter if enabled
                             if settings_manager.get("news_filter_enabled", True):
                                 news_state = sentiment_analyzer.get_news_state()
                                 news_score = news_state.get("score", 0.0)
                                 if action == "BUY" and news_score < -0.4:
-                                    self.logger.warning(f"🚫 BUY trade blocked by News Sentiment Filter (Score: {news_score:.2f})")
+                                    if should_log_block:
+                                        self.logger.warning(f"🚫 BUY trade blocked by News Sentiment Filter (Score: {news_score:.2f})")
+                                        self._last_block_log_time[symbol] = current_time
                                     self.skipped_stats['news_filter'] = self.skipped_stats.get('news_filter', 0) + 1
                                     continue
                                 elif action == "SELL" and news_score > 0.4:
-                                    self.logger.warning(f"🚫 SELL trade blocked by News Sentiment Filter (Score: {news_score:.2f})")
+                                    if should_log_block:
+                                        self.logger.warning(f"🚫 SELL trade blocked by News Sentiment Filter (Score: {news_score:.2f})")
+                                        self._last_block_log_time[symbol] = current_time
                                     self.skipped_stats['news_filter'] = self.skipped_stats.get('news_filter', 0) + 1
                                     continue
                                     
                             # Apply pattern learner AI check if enabled
                             if settings_manager.get("self_learning_filter", True):
-                                ai_signal = self.pattern_learner.get_trading_signal(symbol, analysis['features'])
-                                if ai_signal['adjustment'] < -0.3:
-                                    self.logger.warning(f"⚠️ Warning: AI Pattern Learner flagged this trade setup with low confidence (Adjustment: {ai_signal['adjustment']}), but proceeding per warning-only configuration.")
+                                ai_signal = self.pattern_learner.get_trading_signal(symbol, analysis['features'], df_ltf=analysis.get('df_ltf'))
+                                if ai_signal['adjustment'] < -0.1:
+                                    if should_log_block:
+                                        self.logger.warning(f"🚫 Trade blocked by AI Pattern Learner (Low confidence, adjustment: {ai_signal['adjustment']:.2f})")
+                                        self._last_block_log_time[symbol] = current_time
+                                    continue
                                     
                             if setup_type == "FIB":
                                 self.logger.info(f"🎯 FIBONACCI entry triggered immediately on {symbol}! Action: {action} @ {tick.ask if action == 'BUY' else tick.bid:.2f}")
@@ -1080,7 +1354,7 @@ class AdvancedTradingEngine:
                 # Measure latency of loop execution
                 self.market_state['latency_ms'] = (time.time() - start_time) * 1000.0
                 
-                time.sleep(sleep_seconds)
+                time.sleep(loop_sleep)
                 
         except KeyboardInterrupt:
             self.logger.info("🛑 Engine stopped by user request.")

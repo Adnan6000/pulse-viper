@@ -1,9 +1,9 @@
 {
     "paper_mode": false,
-    "trading_mode": "intraday",
+    "trading_mode": "scalping",
     "hedging_mode": false,
     "compounding_mode": false,
-    "risk_percent": 5,
+    "risk_percent": 1,
     "london_session_enabled": false,
     "ny_session_enabled": false,
     "break_even_enabled": true,
@@ -11,10 +11,18 @@
     "self_learning_filter": true,
     "news_filter_enabled": true,
     "max_spread_points": 450,
-    "min_rr_ratio": 2.5,
+    "min_rr_ratio": 2.0,
+    "auto_trade_enabled": true,
     "max_daily_trades": 10,
-    "smc_swing_window": 3,
+    "smc_swing_window": 2,
     "smc_lookback_sweep": 15,
-    "smc_lookback_mss": 15,
-    "smc_fvg_lookback": 5
+    "smc_lookback_mss": 8,
+    "smc_fvg_lookback": 5,
+    "active_symbol": "XAUUSDm",
+    "disabled_setups": [
+        "CONTINUATION",
+        "MSS_ONLY",
+        "SWEEP_ONLY",
+        "SHARP_TURN"
+    ]
 }

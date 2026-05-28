@@ -48,16 +48,26 @@ class SymbolManager:
     
     def get_major_pairs(self) -> List[str]:
         """Get list of major forex pairs"""
-        major_pairs = [
+        major_bases = [
             'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF',
             'AUDUSD', 'USDCAD', 'NZDUSD'
         ]
-        return [p for p in major_pairs if p in self.available_symbols]
+        found = []
+        for s in self.available_symbols:
+            for base in major_bases:
+                if base in s.upper():
+                    found.append(s)
+        return list(set(found))
     
     def get_commodities(self) -> List[str]:
         """Get list of commodities"""
         commodities = ['XAUUSD', 'XAUUSDm', 'XAUUSDc', 'GOLD', 'XAGUSD', 'XPTUSD', 'XPDUSD']
-        return [c for c in commodities if c in self.available_symbols]
+        found = [c for c in commodities if c in self.available_symbols]
+        for s in self.available_symbols:
+            s_upper = s.upper()
+            if ('XAUUSD' in s_upper or 'GOLD' in s_upper) and s not in found:
+                found.append(s)
+        return found
     
     def auto_detect_trading_symbols(self, max_symbols=5) -> List[str]:
         """Automatically detect best symbols to trade"""
@@ -114,7 +124,7 @@ class SymbolManager:
             # Detect Exness
             if "EXNESS" in company or "EXNESS" in server:
                 profile["broker"] = "EXNESS"
-                if symbol.endswith("c") or "CENT" in server or (account and account.currency == "USC"):
+                if symbol.endswith("c") or symbol.endswith(".c") or "CENT" in server or (account and account.currency == "USC"):
                     profile["account_type"] = "CENT"
                     profile["is_cent_account"] = True
                     usd_limit = 5.0  # Relaxed to 5.0 USD spread limit for Gold/Forex cent
@@ -133,16 +143,28 @@ class SymbolManager:
                 if symbol == "GOLD":
                     profile["broker"] = "XM"
                     usd_limit = 5.0
-                elif symbol == "XAUUSDc":
+                elif symbol.endswith("c") or symbol.endswith(".c"):
                     profile["broker"] = "EXNESS"
                     profile["account_type"] = "CENT"
                     profile["is_cent_account"] = True
                     usd_limit = 5.0
-                elif symbol == "XAUUSDm":
+                elif symbol.endswith("m"):
                     profile["broker"] = "EXNESS"
                     usd_limit = 4.5
+                elif "BTC" in symbol:
+                    profile["broker"] = "EXNESS"
+                    usd_limit = 50.0  # $50.00 spread limit for BTC
+                elif "ETH" in symbol:
+                    profile["broker"] = "EXNESS"
+                    usd_limit = 5.0   # $5.00 spread limit for ETH
                 else:
                     usd_limit = 2.0
+
+            # Crypto specific overrides
+            if "BTC" in symbol:
+                usd_limit = 50.0
+            elif "ETH" in symbol:
+                usd_limit = 5.0
             
             if symbol_info and symbol_info.point > 0:
                 profile["max_spread_points"] = int(round(usd_limit / symbol_info.point))
