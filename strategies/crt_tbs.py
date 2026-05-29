@@ -71,7 +71,7 @@ class CrtTbsStrategy:
 
             # 4. Evaluate triggers with filters
             # BUY trigger execution
-            if tbs_buy_trigger and htf_bias >= 0:
+            if tbs_buy_trigger and htf_bias == 1:
                 # Chasing protection: current price must not have moved too far above crt_low
                 chase_limit = crt_low + (0.5 * atr)
                 if current_price <= chase_limit:
@@ -97,7 +97,7 @@ class CrtTbsStrategy:
                     cls.logger.debug(f"🐢 BUY TBS skipped: Chasing protection (price {current_price:.2f} > limit {chase_limit:.2f})")
                     
             # SELL trigger execution
-            if tbs_sell_trigger and htf_bias <= 0:
+            if tbs_sell_trigger and htf_bias == -1:
                 # Chasing protection: current price must not have moved too far below crt_high
                 chase_limit = crt_high - (0.5 * atr)
                 if current_price >= chase_limit:

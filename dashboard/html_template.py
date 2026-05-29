@@ -1119,6 +1119,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             <span>Market Regime</span>
                             <span id="pred-regime">—</span>
                         </div>
+                        <div class="pred-row">
+                            <span>Active Sessions</span>
+                            <span id="pred-sessions">—</span>
+                        </div>
+                        <div class="pred-row" style="flex-direction:column; align-items:flex-start; gap:4px; border-top: 1px solid rgba(255,255,255,0.05); padding-top:6px; margin-top:4px;">
+                            <span>Timeframe Alignment Status</span>
+                            <div style="display:flex; gap:8px; width:100%; margin-top:2px;">
+                                <div style="flex:1; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); border-radius:6px; padding:6px; text-align:center;">
+                                    <div style="font-size:9px; color:var(--text-muted);">HTF (H1)</div>
+                                    <div id="align-htf" style="font-size:10px; font-weight:800; margin-top:2px;">—</div>
+                                </div>
+                                <div style="flex:1; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); border-radius:6px; padding:6px; text-align:center;">
+                                    <div style="font-size:9px; color:var(--text-muted);">CTX (M5)</div>
+                                    <div id="align-ctx" style="font-size:10px; font-weight:800; margin-top:2px;">—</div>
+                                </div>
+                                <div style="flex:1; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); border-radius:6px; padding:6px; text-align:center;">
+                                    <div style="font-size:9px; color:var(--text-muted);">LTF (M1)</div>
+                                    <div id="align-ltf" style="font-size:10px; font-weight:800; margin-top:2px;">—</div>
+                                </div>
+                            </div>
+                        </div>
                         <div class="pred-row" style="flex-direction:column; align-items:flex-start; gap:4px; border-top: 1px solid rgba(255,255,255,0.05); padding-top:6px; margin-top:4px;">
                             <span>AI Training Diagnostics</span>
                             <span id="pred-train-stats" style="color:var(--color-green); font-size:10px; font-weight:700; word-break:break-all; text-align:left;">—</span>
@@ -2211,6 +2232,52 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('pred-tp').innerText = pred.tp ? pred.tp.toFixed(5) : '--';
                 document.getElementById('pred-lots').innerText = pred.lots ? pred.lots.toFixed(2) : '0.01';
                 document.getElementById('pred-confidence').innerText = pred.confidence ? `${pred.confidence}%` : '—';
+
+                // Active Sessions
+                const sessions = pred.active_sessions || [];
+                document.getElementById('pred-sessions').innerHTML = sessions.length > 0
+                    ? sessions.map(s => `<span style="background: rgba(0, 168, 255, 0.15); border: 1px solid rgba(0, 168, 255, 0.3); border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 700; color: var(--color-blue); margin-right: 4px;">${s}</span>`).join('')
+                    : '<span style="color:var(--text-muted);">NONE</span>';
+
+                // Timeframe Alignment
+                const h1Bias = pred.h1_bias !== undefined ? pred.h1_bias : 0;
+                const htfEl = document.getElementById('align-htf');
+                if (h1Bias > 0) {
+                    htfEl.innerText = 'BULLISH 🟢';
+                    htfEl.style.color = 'var(--color-green)';
+                } else if (h1Bias < 0) {
+                    htfEl.innerText = 'BEARISH 🔴';
+                    htfEl.style.color = 'var(--color-red)';
+                } else {
+                    htfEl.innerText = 'NEUTRAL ⚪';
+                    htfEl.style.color = 'var(--text-muted)';
+                }
+
+                const ctxSweep = pred.m15_sweep_type !== undefined ? pred.m15_sweep_type : 0;
+                const ctxEl = document.getElementById('align-ctx');
+                if (ctxSweep > 0) {
+                    ctxEl.innerText = 'SWEEP (BULL) 🟡';
+                    ctxEl.style.color = '#ffd32a';
+                } else if (ctxSweep < 0) {
+                    ctxEl.innerText = 'SWEEP (BEAR) 🟡';
+                    ctxEl.style.color = '#ffd32a';
+                } else {
+                    ctxEl.innerText = 'STABLE ⚪';
+                    ctxEl.style.color = 'var(--text-muted)';
+                }
+
+                const ltfMss = pred.m5_mss_signal !== undefined ? pred.m5_mss_signal : 0;
+                const ltfEl = document.getElementById('align-ltf');
+                if (ltfMss > 0) {
+                    ltfEl.innerText = 'MSS (BULL) 🟢';
+                    ltfEl.style.color = 'var(--color-green)';
+                } else if (ltfMss < 0) {
+                    ltfEl.innerText = 'MSS (BEAR) 🔴';
+                    ltfEl.style.color = 'var(--color-red)';
+                } else {
+                    ltfEl.innerText = 'SCANNING 🔍';
+                    ltfEl.style.color = 'var(--color-blue)';
+                }
 
                 // Skip logs
                 const skipped = data.skipped_stats || {};

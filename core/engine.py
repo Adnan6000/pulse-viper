@@ -22,7 +22,6 @@ from core.backtester import AdaptiveBacktester
 from utils.settings_manager import settings_manager
 from utils.volume_analyzer import VolumeAnalyzer
 from utils.sentiment_analyzer import sentiment_analyzer
-from strategies.fib_retest import FibRetestStrategy
 from strategies.crt_tbs import CrtTbsStrategy
 from dashboard.web_dashboard import WebDashboardServer
 
@@ -513,23 +512,13 @@ class AdvancedTradingEngine:
             sentiment_payload['pwl'] = self.pwl_cache.get(symbol, np.nan)
             
             # Get active strategy
-            active_strategy = settings_manager.get("active_strategy", "fib_retest")
+            active_strategy = settings_manager.get("active_strategy", "both")
+            if active_strategy == "fib_retest":
+                active_strategy = "both"
             
             fib_action, fib_regime, fib_sl, fib_tp, fib_metadata = None, "sideway", 0.0, 0.0, {}
             crt_action, crt_regime, crt_sl, crt_tp, crt_metadata = None, "sideway", 0.0, 0.0, {}
             
-            # Evaluate Fibonacci / Price Action Confluence Strategy
-            if active_strategy in ["fib_retest", "both"]:
-                fib_action, fib_regime, fib_sl, fib_tp, fib_metadata = FibRetestStrategy.evaluate_retest(
-                    df_context=df_context,
-                    current_price=tick.bid,
-                    atr=latest_ltf['atr'],
-                    volume_cache=self.volume_cache,
-                    sentiment_cache=sentiment_payload,
-                    htf_bias=latest_htf['active_bias'],
-                    df_ltf=df_ltf
-                )
-                
             # Evaluate Candle Range Theory (CRT) + Turtle Body Soup (TBS) Strategy
             if active_strategy in ["crt_tbs", "both"]:
                 crt_action, crt_regime, crt_sl, crt_tp, crt_metadata = CrtTbsStrategy.evaluate_crt_tbs(
@@ -543,7 +532,7 @@ class AdvancedTradingEngine:
                 )
             
             # Update pattern learner's market regimes state (upper case)
-            active_regime = crt_regime if active_strategy == "crt_tbs" else fib_regime
+            active_regime = crt_regime if active_strategy == "crt_tbs" else ("bullish" if latest_htf['active_bias'] == 1 else ("bearish" if latest_htf['active_bias'] == -1 else "sideway"))
             self.pattern_learner.market_regimes[symbol] = {
                 'regime': active_regime.upper(),
                 'timestamp': str(pd.Timestamp.now()),
@@ -681,106 +670,112 @@ class AdvancedTradingEngine:
                 return not has_same_direction
 
         # Get active strategy setting
-        active_strategy = settings_manager.get("active_strategy", "fib_retest")
+        active_strategy = settings_manager.get("active_strategy", "both")
+        if active_strategy == "fib_retest":
+            active_strategy = "both"
+            
+        disabled_setups = settings_manager.get("disabled_setups", [])
         
         # Priority 1: CRT + TBS Strategy
         if active_strategy in ["crt_tbs", "both"]:
-            crt_action = analysis.get('crt_action')
-            if crt_action in ["BUY", "SELL"] and can_trade_direction(crt_action):
-                crt_sl = analysis.get('crt_sl', 0.0)
-                crt_tp = analysis.get('crt_tp', 0.0)
-                if crt_sl > 0.0 and crt_tp > 0.0:
-                    self.logger.info(f"🐢 Candle Range Theory (CRT) + Turtle Body Soup (TBS) setup identified on {symbol} | Action: {crt_action} | SL: {crt_sl:.2f}, TP: {crt_tp:.2f}")
-                    return crt_action, crt_sl, crt_tp, "CRT_TBS"
+            if "CRT_TBS" not in disabled_setups:
+                crt_action = analysis.get('crt_action')
+                if crt_action in ["BUY", "SELL"] and can_trade_direction(crt_action):
+                    crt_sl = analysis.get('crt_sl', 0.0)
+                    crt_tp = analysis.get('crt_tp', 0.0)
+                    if crt_sl > 0.0 and crt_tp > 0.0:
+                        self.logger.info(f"🐢 Candle Range Theory (CRT) + Turtle Body Soup (TBS) setup identified on {symbol} | Action: {crt_action} | SL: {crt_sl:.2f}, TP: {crt_tp:.2f}")
+                        return crt_action, crt_sl, crt_tp, "CRT_TBS"
                     
-        # Priority 2: Legacy SMC + Fib Retest Strategy
-        if active_strategy in ["fib_retest", "both"]:
-            # --- BULLISH ENTRY MODEL (Sharp Turn BUY - Relaxed) ---
-            is_bullish_setup = (h1_bias >= 0) and (m15_sweep == 1 or m5_mss == 1)
-            
-            # --- BEARISH ENTRY MODEL (Sharp Turn SELL - Relaxed) ---
-            is_bearish_setup = (h1_bias <= 0) and (m15_sweep == -1 or m5_mss == -1)
-            
-            # Throttled logging to avoid log pollution
-            import time
-            current_time = time.time()
-            
-            if not hasattr(self, '_last_block_log_time'):
-                self._last_block_log_time = {}
-            last_block_log = self._last_block_log_time.get(symbol, 0)
-            should_log_block = (current_time - last_block_log >= 60.0)
-    
-            last_log = getattr(self, '_last_eval_log_time', {})
-            if current_time - last_log.get(symbol, 0) >= 10.0:
-                self.logger.info(
-                    f"📊 {symbol} Eval | bias={h1_bias} sweep={m15_sweep} mss={m5_mss} fvg={fvg_class} | bull={is_bullish_setup} bear={is_bearish_setup}"
-                )
-                last_log[symbol] = current_time
-                self._last_eval_log_time = last_log
-    
-            # Premium/Discount check using support and resistance boundaries
-            range_mid = 0.5 * (analysis['support'] + analysis['resistance'])
-            if is_bullish_setup and can_trade_direction("BUY") and analysis['support'] > 0 and analysis['resistance'] > 0:
-                if bid > range_mid:
-                    if should_log_block:
-                        self.logger.warning(f"🚫 BUY setup blocked: price ({bid:.2f}) is in Premium zone (above range mid: {range_mid:.2f})")
-                        self._last_block_log_time[symbol] = current_time
-                    is_bullish_setup = False
-    
-            if is_bearish_setup and can_trade_direction("SELL") and analysis['support'] > 0 and analysis['resistance'] > 0:
-                if ask < range_mid:
-                    if should_log_block:
-                        self.logger.warning(f"🚫 SELL setup blocked: price ({ask:.2f}) is in Discount zone (below range mid: {range_mid:.2f})")
-                        self._last_block_log_time[symbol] = current_time
-                    is_bearish_setup = False
-    
-            if is_bullish_setup and can_trade_direction("BUY"):
-                entry_price = ask
+        # Priority 2: SMC Strategy
+        if active_strategy in ["smc", "both"]:
+            # Setup classification before entry
+            had_sweep = (m15_sweep != 0)
+            had_mss = (m5_mss != 0)
+            if had_sweep and had_mss:
+                setup_type = "SHARP_TURN"
+            elif had_mss:
+                setup_type = "MSS_ONLY"
+            elif had_sweep:
+                setup_type = "SWEEP_ONLY"
+            else:
+                setup_type = "CONTINUATION"
                 
-                # SL: placed below the recent LTF support swing low
-                sl_price = analysis['support'] - (0.2 * atr)  # small buffer
-                sl_price = min(sl_price, entry_price - (1.5 * atr))  # minimum SL distance
+            # Block disabled setups
+            if setup_type in disabled_setups:
+                pass
+            else:
+                # --- BULLISH ENTRY MODEL (Strict Trend Alignment) ---
+                is_bullish_setup = (h1_bias == 1) and (m15_sweep == 1 or m5_mss == 1)
                 
-                # TP: Target opposing resistance liquidity with dynamic RR
-                tp_price = entry_price + (rr_ratio * (entry_price - sl_price))
+                # --- BEARISH ENTRY MODEL (Strict Trend Alignment) ---
+                is_bearish_setup = (h1_bias == -1) and (m15_sweep == -1 or m5_mss == -1)
                 
-                # Ensure TP is aligned with major liquidity resistance
-                if analysis['resistance'] > entry_price:
-                    tp_price = max(tp_price, analysis['resistance'])
+                # Throttled logging to avoid log pollution
+                import time
+                current_time = time.time()
+                
+                if not hasattr(self, '_last_block_log_time'):
+                    self._last_block_log_time = {}
+                last_block_log = self._last_block_log_time.get(symbol, 0)
+                should_log_block = (current_time - last_block_log >= 60.0)
+        
+                last_log = getattr(self, '_last_eval_log_time', {})
+                if current_time - last_log.get(symbol, 0) >= 10.0:
+                    self.logger.info(
+                        f"📊 {symbol} Eval | bias={h1_bias} sweep={m15_sweep} mss={m5_mss} fvg={fvg_class} | bull={is_bullish_setup} bear={is_bearish_setup}"
+                    )
+                    last_log[symbol] = current_time
+                    self._last_eval_log_time = last_log
+        
+                # Premium/Discount check using support and resistance boundaries
+                range_mid = 0.5 * (analysis['support'] + analysis['resistance'])
+                if is_bullish_setup and can_trade_direction("BUY") and analysis['support'] > 0 and analysis['resistance'] > 0:
+                    if bid > range_mid:
+                        if should_log_block:
+                            self.logger.warning(f"🚫 BUY setup blocked: price ({bid:.2f}) is in Premium zone (above range mid: {range_mid:.2f})")
+                            self._last_block_log_time[symbol] = current_time
+                        is_bullish_setup = False
+        
+                if is_bearish_setup and can_trade_direction("SELL") and analysis['support'] > 0 and analysis['resistance'] > 0:
+                    if ask < range_mid:
+                        if should_log_block:
+                            self.logger.warning(f"🚫 SELL setup blocked: price ({ask:.2f}) is in Discount zone (below range mid: {range_mid:.2f})")
+                            self._last_block_log_time[symbol] = current_time
+                        is_bearish_setup = False
+        
+                if is_bullish_setup and can_trade_direction("BUY"):
+                    entry_price = ask
                     
-                self.logger.info(f"🟢 BUY SMC setup identified on {symbol} | MSS: 1, Sweep: 1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
-                return "BUY", sl_price, tp_price, "SMC"
-    
-            if is_bearish_setup and can_trade_direction("SELL"):
-                entry_price = bid
-                
-                # SL: placed above the recent LTF resistance swing high
-                sl_price = analysis['resistance'] + (0.2 * atr)
-                sl_price = max(sl_price, entry_price + (1.5 * atr))
-                
-                # TP: Target opposing support liquidity with dynamic RR
-                tp_price = entry_price - (rr_ratio * (sl_price - entry_price))
-                
-                if analysis['support'] < entry_price:
-                    tp_price = min(tp_price, analysis['support'])
+                    # SL: placed below the recent LTF support swing low
+                    sl_price = analysis['support'] - (0.2 * atr)  # small buffer
+                    sl_price = min(sl_price, entry_price - (1.5 * atr))  # minimum SL distance
                     
-                self.logger.info(f"🔴 SELL SMC setup identified on {symbol} | MSS: -1, Sweep: -1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
-                return "SELL", sl_price, tp_price, "SMC"
-    
-            # --- FALLBACK FIBONACCI RETEST STRATEGY ---
-            fib_action = analysis.get('fib_action')
-            if fib_action in ["BUY", "SELL"] and can_trade_direction(fib_action):
-                entry_price = ask if fib_action == "BUY" else bid
-                fib_sl = analysis.get('fib_sl', 0.0)
-                fib_tp = analysis.get('fib_tp', 0.0)
-                
-                if fib_sl > 0.0 and fib_tp > 0.0:
-                    import time
-                    current_time = time.time()
-                    if should_log_block:
-                        self.logger.info(f"📐 Price Action confluence setup identified on {symbol} | Action: {fib_action} | SL: {fib_sl:.2f}, TP: {fib_tp:.2f}")
-                        self._last_block_log_time[symbol] = current_time
-                    return fib_action, fib_sl, fib_tp, "FIB"
+                    # TP: Target opposing resistance liquidity with dynamic RR
+                    tp_price = entry_price + (rr_ratio * (entry_price - sl_price))
+                    
+                    # Ensure TP is aligned with major liquidity resistance
+                    if analysis['resistance'] > entry_price:
+                        tp_price = max(tp_price, analysis['resistance'])
+                        
+                    self.logger.info(f"🟢 BUY SMC setup identified on {symbol} | MSS: 1, Sweep: 1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
+                    return "BUY", sl_price, tp_price, setup_type
+        
+                if is_bearish_setup and can_trade_direction("SELL"):
+                    entry_price = bid
+                    
+                    # SL: placed above the recent LTF resistance swing high
+                    sl_price = analysis['resistance'] + (0.2 * atr)
+                    sl_price = max(sl_price, entry_price + (1.5 * atr))
+                    
+                    # TP: Target opposing support liquidity with dynamic RR
+                    tp_price = entry_price - (rr_ratio * (sl_price - entry_price))
+                    
+                    if analysis['support'] < entry_price:
+                        tp_price = min(tp_price, analysis['support'])
+                        
+                    self.logger.info(f"🔴 SELL SMC setup identified on {symbol} | MSS: -1, Sweep: -1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
+                    return "SELL", sl_price, tp_price, setup_type
                     
         return None
 
@@ -1007,7 +1002,12 @@ class AdvancedTradingEngine:
                 'setup_type': None,
                 'detected_patterns': detected_patterns,
                 'cluster_id': int(ai_signal.get('cluster_id', 0)),
-                'training_stats': self.pattern_learner.training_stats.get(symbol, {})
+                'training_stats': self.pattern_learner.training_stats.get(symbol, {}),
+                'h1_bias': int(analysis.get('h1_bias', 0)),
+                'm15_sweep_type': int(analysis.get('m15_sweep_type', 0)),
+                'm5_mss_signal': int(analysis.get('m5_mss_signal', 0)),
+                'crt_low': float(analysis.get('crt_low', 0.0)) if 'crt_low' in analysis else 0.0,
+                'crt_high': float(analysis.get('crt_high', 0.0)) if 'crt_high' in analysis else 0.0
             }
             
             setup = self.evaluate_entry_rules(analysis)
@@ -1263,15 +1263,27 @@ class AdvancedTradingEngine:
                             else:
                                 # Pullback entry trigger check
                                 triggered = False
-                                if action == "BUY":
-                                    if tick.ask <= pending['fvg_top']:
-                                        triggered = True
-                                elif action == "SELL":
-                                    if tick.bid >= pending['fvg_bottom']:
-                                        triggered = True
+                                setup_t = pending.get('setup_type', 'SMC')
+                                if setup_t == 'CRT_TBS':
+                                    if action == "BUY":
+                                        if tick.ask <= pending['crt_low']:
+                                            triggered = True
+                                    elif action == "SELL":
+                                        if tick.bid >= pending['crt_high']:
+                                            triggered = True
+                                else: # SMC setup
+                                    if action == "BUY":
+                                        if tick.ask <= pending['fvg_top']:
+                                            triggered = True
+                                    elif action == "SELL":
+                                        if tick.bid >= pending['fvg_bottom']:
+                                            triggered = True
                                         
                                 if triggered:
-                                    self.logger.info(f"🎯 SNIPER pullback entry triggered on {symbol}! Action: {action} @ {tick.ask if action == 'BUY' else tick.bid:.2f} | FVG boundary hit")
+                                    if setup_t == 'CRT_TBS':
+                                        self.logger.info(f"🎯 CRT+TBS pullback entry triggered on {symbol}! Action: {action} @ {tick.ask if action == 'BUY' else tick.bid:.2f} | CRT range boundary hit")
+                                    else:
+                                        self.logger.info(f"🎯 SNIPER pullback entry triggered on {symbol}! Action: {action} @ {tick.ask if action == 'BUY' else tick.bid:.2f} | FVG boundary hit")
                                     self.execute_and_record_trade(symbol, action, sl, tp, pending['analysis'])
                                     self.pending_setups.pop(symbol)
                     
@@ -1352,16 +1364,42 @@ class AdvancedTradingEngine:
                             # Apply pattern learner AI check if enabled
                             if settings_manager.get("self_learning_filter", True):
                                 ai_signal = self.pattern_learner.get_trading_signal(symbol, analysis['features'], df_ltf=analysis.get('df_ltf'))
-                                if ai_signal['adjustment'] < -0.1:
+                                confidence = ai_signal.get('confidence', 0.5)
+                                adjustment = ai_signal.get('adjustment', 0.0)
+                                if confidence < 0.55 or adjustment < 0.0:
                                     if should_log_block:
-                                        self.logger.warning(f"🚫 Trade blocked by AI Pattern Learner (Low confidence, adjustment: {ai_signal['adjustment']:.2f})")
+                                        self.logger.warning(f"🚫 Trade blocked by AI Pattern Learner (Low confidence: {confidence:.2f}, adjustment: {adjustment:.2f})")
                                         self._last_block_log_time[symbol] = current_time
                                     continue
                                     
-                            if setup_type == "FIB":
-                                self.logger.info(f"🎯 FIBONACCI entry triggered immediately on {symbol}! Action: {action} @ {tick.ask if action == 'BUY' else tick.bid:.2f}")
-                                self.execute_and_record_trade(symbol, action, sl, tp, analysis)
-                            else: # SMC setup
+                            if setup_type == "CRT_TBS":
+                                # Save to pending setup with CRT range limits as exact reversal levels
+                                crt_low = analysis.get('crt_low')
+                                crt_high = analysis.get('crt_high')
+                                
+                                if crt_low is None or np.isnan(crt_low):
+                                    crt_low = tick.ask
+                                if crt_high is None or np.isnan(crt_high):
+                                    crt_high = tick.bid
+                                    
+                                self.pending_setups[symbol] = {
+                                    'action': action,
+                                    'crt_low': crt_low,
+                                    'crt_high': crt_high,
+                                    'sl': sl,
+                                    'tp': tp,
+                                    'analysis': analysis,
+                                    'candle_time': candle_time,
+                                    'setup_type': 'CRT_TBS'
+                                }
+                                self.logger.info(f"⏳ Pending CRT+TBS {action} setup saved for {symbol}. Wait pullback to range boundary... (Level: {crt_low if action == 'BUY' else crt_high:.2f})")
+                                
+                                # Immediately check if current price already satisfies the pullback
+                                if (action == "BUY" and tick.ask <= crt_low) or (action == "SELL" and tick.bid >= crt_high):
+                                    self.logger.info(f"🎯 CRT+TBS entry triggered immediately on {symbol}! Action: {action} @ {tick.ask if action == 'BUY' else tick.bid:.2f}")
+                                    self.execute_and_record_trade(symbol, action, sl, tp, analysis)
+                                    self.pending_setups.pop(symbol)
+                            else: # SMC setup (SHARP_TURN, MSS_ONLY, SWEEP_ONLY, CONTINUATION)
                                 # Save to pending setup with FVG boundary limits
                                 fvg_top = analysis.get('m5_fvg_top')
                                 fvg_bottom = analysis.get('m5_fvg_bottom')
@@ -1378,9 +1416,10 @@ class AdvancedTradingEngine:
                                     'sl': sl,
                                     'tp': tp,
                                     'analysis': analysis,
-                                    'candle_time': candle_time
+                                    'candle_time': candle_time,
+                                    'setup_type': 'SMC'
                                 }
-                                self.logger.info(f"⏳ Pending sniper {action} setup saved for {symbol}. Wait pullback... (FVG limits: {fvg_bottom:.2f} - {fvg_top:.2f})")
+                                self.logger.info(f"⏳ Pending sniper {action} setup saved for {symbol}. Wait pullback to FVG limits... (FVG: {fvg_bottom:.2f} - {fvg_top:.2f})")
                                 
                                 # Immediately check if current price already satisfies the pullback
                                 if (action == "BUY" and tick.ask <= fvg_top) or (action == "SELL" and tick.bid >= fvg_bottom):

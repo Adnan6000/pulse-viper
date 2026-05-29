@@ -19,7 +19,7 @@
     "smc_lookback_mss": 8,
     "smc_fvg_lookback": 5,
     "active_symbol": "XAUUSDm",
-    "active_strategy": "fib_retest",
+    "active_strategy": "both",
     "disabled_setups": [
         "CONTINUATION",
         "MSS_ONLY",
