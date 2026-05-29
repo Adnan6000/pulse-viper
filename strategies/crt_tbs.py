@@ -108,7 +108,31 @@ class CrtTbsStrategy:
                         m5_sweep_confirmed = True
                         break
 
-            # ── 4. TBS wick trigger on M1 ─────────────────────────────────────────
+            # ── 4. Volume Spread Analysis (VSA) & Volume Bias gates ──────────────
+            from utils.volume_analyzer import VolumeAnalyzer
+            active_vsa_patterns = []
+            
+            # Detect on M1
+            if df_m1 is not None and 'atr' in df_m1.columns:
+                active_vsa_patterns += VolumeAnalyzer.detect_vsa_signals(df_m1, df_m1['atr'], lookback=5)
+            # Detect on M5
+            if df_m5 is not None and 'atr' in df_m5.columns:
+                active_vsa_patterns += VolumeAnalyzer.detect_vsa_signals(df_m5, df_m5['atr'], lookback=5)
+
+            vsa_filter_enabled = settings_manager.get("vsa_filter_enabled", True)
+            vsa_buy_confirmed = True
+            vsa_sell_confirmed = True
+            
+            if vsa_filter_enabled:
+                has_bull_vsa = any(s['pattern'] in ['SPRING', 'STOPPING_VOLUME', 'NO_SUPPLY', 'SELLING_CLIMAX'] for s in active_vsa_patterns)
+                buy_press = volume_cache.get("buy_pressure", 50.0) if volume_cache else 50.0
+                vsa_buy_confirmed = has_bull_vsa or (buy_press >= 55.0)
+                
+                has_bear_vsa = any(s['pattern'] in ['UPTHRUST', 'NO_DEMAND', 'BUYING_CLIMAX'] for s in active_vsa_patterns)
+                sell_press = volume_cache.get("sell_pressure", 50.0) if volume_cache else 50.0
+                vsa_sell_confirmed = has_bear_vsa or (sell_press >= 55.0)
+
+            # ── 5. TBS wick trigger on M1 ─────────────────────────────────────────
             # Check the last 3 closed M1 candles for a TBS wick
             tbs_buy_trigger = False
             tbs_sell_trigger = False
@@ -139,81 +163,89 @@ class CrtTbsStrategy:
                     else:
                         highest_sweep_high = max(highest_sweep_high, candle['high'])
 
-            # ── 5. BUY setup ─────────────────────────────────────────────────────
+            # ── 6. BUY setup ─────────────────────────────────────────────────────
             if tbs_buy_trigger and htf_bias == 1:
-                # Chase guard: current price must not be too far above entry zone
-                chase_limit = crt_low + (0.6 * atr)
-                if current_price <= chase_limit:
-                    # SL: below the lowest M1 sweep wick with buffer
-                    sl_price = min(lowest_sweep_low, crt_low) - (0.15 * atr)
-                    sl_price = min(sl_price, current_price - (1.5 * atr))
-
-                    # TP: target opposite H1 liquidity (crt_high) or RR-based
-                    tp_rr = current_price + (rr_ratio * (current_price - sl_price))
-                    tp_price = max(tp_rr, crt_high) if crt_high > current_price else tp_rr
-
-                    # If H1 structure provides a better target, use it
-                    if df_h1 is not None and len(df_h1) >= 10:
-                        h1_recent_high = float(df_h1.iloc[-10:]['high'].max())
-                        if h1_recent_high > current_price:
-                            tp_price = max(tp_price, h1_recent_high)
-
-                    metadata = {
-                        "strategy": "CRT_TBS",
-                        "crt_high": crt_high,
-                        "crt_low": crt_low,
-                        "lowest_sweep_low": float(lowest_sweep_low) if not np.isnan(lowest_sweep_low) else crt_low,
-                        "trigger": "TBS_BUY",
-                        "m5_sweep_confirmed": m5_sweep_confirmed,
-                        "htf_bias": htf_bias,
-                        "crt_source": "H1" if (df_h1 is not None and len(df_h1) >= 5) else "M15"
-                    }
-                    cls.logger.info(
-                        f"🐢 BUY TBS ({'✅M5' if m5_sweep_confirmed else '⚠️noM5'}) | "
-                        f"HTF={'BULL'} CRT_Low={crt_low:.2f} Entry={current_price:.2f} "
-                        f"SL={sl_price:.2f} TP={tp_price:.2f}"
-                    )
-                    return "BUY", "bullish", sl_price, tp_price, metadata
+                if not vsa_buy_confirmed:
+                    cls.logger.info("🐢 BUY TBS skipped: VSA / Volume Bias confirmation failed (no VSA pattern or weak buying pressure)")
                 else:
-                    cls.logger.debug(f"🐢 BUY TBS skipped: chase guard (price={current_price:.2f} > limit={chase_limit:.2f})")
+                    # Chase guard: current price must not be too far above entry zone
+                    chase_limit = crt_low + (0.6 * atr)
+                    if current_price <= chase_limit:
+                        # SL: below the lowest M1 sweep wick with buffer
+                        sl_price = min(lowest_sweep_low, crt_low) - (0.15 * atr)
+                        sl_price = min(sl_price, current_price - (1.5 * atr))
 
-            # ── 6. SELL setup ────────────────────────────────────────────────────
+                        # TP: target opposite H1 liquidity (crt_high) or RR-based
+                        tp_rr = current_price + (rr_ratio * (current_price - sl_price))
+                        tp_price = max(tp_rr, crt_high) if crt_high > current_price else tp_rr
+
+                        # If H1 structure provides a better target, use it
+                        if df_h1 is not None and len(df_h1) >= 10:
+                            h1_recent_high = float(df_h1.iloc[-10:]['high'].max())
+                            if h1_recent_high > current_price:
+                                tp_price = max(tp_price, h1_recent_high)
+
+                        metadata = {
+                            "strategy": "CRT_TBS",
+                            "crt_high": crt_high,
+                            "crt_low": crt_low,
+                            "lowest_sweep_low": float(lowest_sweep_low) if not np.isnan(lowest_sweep_low) else crt_low,
+                            "trigger": "TBS_BUY",
+                            "m5_sweep_confirmed": m5_sweep_confirmed,
+                            "htf_bias": htf_bias,
+                            "crt_source": "H1" if (df_h1 is not None and len(df_h1) >= 5) else "M15",
+                            "vsa_patterns": [s['pattern'] for s in active_vsa_patterns]
+                        }
+                        cls.logger.info(
+                            f"🐢 BUY TBS ({'✅M5' if m5_sweep_confirmed else '⚠️noM5'}) | "
+                            f"HTF={'BULL'} CRT_Low={crt_low:.2f} Entry={current_price:.2f} "
+                            f"SL={sl_price:.2f} TP={tp_price:.2f} | VSA={metadata['vsa_patterns']}"
+                        )
+                        return "BUY", "bullish", sl_price, tp_price, metadata
+                    else:
+                        cls.logger.debug(f"🐢 BUY TBS skipped: chase guard (price={current_price:.2f} > limit={chase_limit:.2f})")
+
+            # ── 7. SELL setup ────────────────────────────────────────────────────
             if tbs_sell_trigger and htf_bias == -1:
-                # Chase guard
-                chase_limit = crt_high - (0.6 * atr)
-                if current_price >= chase_limit:
-                    # SL: above the highest M1 sweep wick
-                    sl_price = max(highest_sweep_high, crt_high) + (0.15 * atr)
-                    sl_price = max(sl_price, current_price + (1.5 * atr))
-
-                    # TP: target crt_low or RR-based
-                    tp_rr = current_price - (rr_ratio * (sl_price - current_price))
-                    tp_price = min(tp_rr, crt_low) if crt_low < current_price else tp_rr
-
-                    # If H1 structure provides a better target, use it
-                    if df_h1 is not None and len(df_h1) >= 10:
-                        h1_recent_low = float(df_h1.iloc[-10:]['low'].min())
-                        if h1_recent_low < current_price:
-                            tp_price = min(tp_price, h1_recent_low)
-
-                    metadata = {
-                        "strategy": "CRT_TBS",
-                        "crt_high": crt_high,
-                        "crt_low": crt_low,
-                        "highest_sweep_high": float(highest_sweep_high) if not np.isnan(highest_sweep_high) else crt_high,
-                        "trigger": "TBS_SELL",
-                        "m5_sweep_confirmed": m5_sweep_confirmed,
-                        "htf_bias": htf_bias,
-                        "crt_source": "H1" if (df_h1 is not None and len(df_h1) >= 5) else "M15"
-                    }
-                    cls.logger.info(
-                        f"🐢 SELL TBS ({'✅M5' if m5_sweep_confirmed else '⚠️noM5'}) | "
-                        f"HTF={'BEAR'} CRT_High={crt_high:.2f} Entry={current_price:.2f} "
-                        f"SL={sl_price:.2f} TP={tp_price:.2f}"
-                    )
-                    return "SELL", "bearish", sl_price, tp_price, metadata
+                if not vsa_sell_confirmed:
+                    cls.logger.info("🐢 SELL TBS skipped: VSA / Volume Bias confirmation failed (no VSA pattern or weak selling pressure)")
                 else:
-                    cls.logger.debug(f"🐢 SELL TBS skipped: chase guard (price={current_price:.2f} < limit={chase_limit:.2f})")
+                    # Chase guard
+                    chase_limit = crt_high - (0.6 * atr)
+                    if current_price >= chase_limit:
+                        # SL: above the highest M1 sweep wick
+                        sl_price = max(highest_sweep_high, crt_high) + (0.15 * atr)
+                        sl_price = max(sl_price, current_price + (1.5 * atr))
+
+                        # TP: target crt_low or RR-based
+                        tp_rr = current_price - (rr_ratio * (sl_price - current_price))
+                        tp_price = min(tp_rr, crt_low) if crt_low < current_price else tp_rr
+
+                        # If H1 structure provides a better target, use it
+                        if df_h1 is not None and len(df_h1) >= 10:
+                            h1_recent_low = float(df_h1.iloc[-10:]['low'].min())
+                            if h1_recent_low < current_price:
+                                tp_price = min(tp_price, h1_recent_low)
+
+                        metadata = {
+                            "strategy": "CRT_TBS",
+                            "crt_high": crt_high,
+                            "crt_low": crt_low,
+                            "highest_sweep_high": float(highest_sweep_high) if not np.isnan(highest_sweep_high) else crt_high,
+                            "trigger": "TBS_SELL",
+                            "m5_sweep_confirmed": m5_sweep_confirmed,
+                            "htf_bias": htf_bias,
+                            "crt_source": "H1" if (df_h1 is not None and len(df_h1) >= 5) else "M15",
+                            "vsa_patterns": [s['pattern'] for s in active_vsa_patterns]
+                        }
+                        cls.logger.info(
+                            f"🐢 SELL TBS ({'✅M5' if m5_sweep_confirmed else '⚠️noM5'}) | "
+                            f"HTF={'BEAR'} CRT_High={crt_high:.2f} Entry={current_price:.2f} "
+                            f"SL={sl_price:.2f} TP={tp_price:.2f} | VSA={metadata['vsa_patterns']}"
+                        )
+                        return "SELL", "bearish", sl_price, tp_price, metadata
+                    else:
+                        cls.logger.debug(f"🐢 SELL TBS skipped: chase guard (price={current_price:.2f} < limit={chase_limit:.2f})")
 
             return None, "sideway", 0.0, 0.0, {}
 

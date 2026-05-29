@@ -295,6 +295,29 @@ class ChartPatternDetector:
                     'level': (crt_ref_high + crt_ref_low) / 2 if crt_manip else None
                 }
 
+            # ── VSA PATTERNS (using detect_vsa_signals) ──────────────────────
+            from utils.volume_analyzer import VolumeAnalyzer
+            vsa_signals = []
+            if df_m1 is not None and 'atr' in df_m1.columns:
+                vsa_signals += VolumeAnalyzer.detect_vsa_signals(df_m1, df_m1['atr'], lookback=5)
+            if df_m5 is not None and 'atr' in df_m5.columns:
+                vsa_signals += VolumeAnalyzer.detect_vsa_signals(df_m5, df_m5['atr'], lookback=5)
+                
+            vsa_patterns_list = [
+                'VSA_SPRING', 'VSA_UPTHRUST', 'VSA_STOPPING_VOLUME',
+                'VSA_NO_SUPPLY', 'VSA_NO_DEMAND', 'VSA_BUYING_CLIMAX', 'VSA_SELLING_CLIMAX'
+            ]
+            for pat in vsa_patterns_list:
+                results[pat] = {'detected': False, 'confidence': 0.0, 'level': None}
+                
+            for sig in vsa_signals:
+                pat_name = f"VSA_{sig['pattern']}"
+                results[pat_name] = {
+                    'detected': True,
+                    'confidence': sig['confidence'],
+                    'level': sig['price']
+                }
+
         except Exception as e:
             pass  # Fail silently — pattern detection is advisory only
 
@@ -309,9 +332,11 @@ class ChartPatternDetector:
         - Directional bias ('bullish', 'bearish', None)
         """
         bull_patterns = {'ORDER_BLOCK_BULL', 'FVG_BULL', 'LIQUIDITY_SWEEP_LOW',
-                         'MSS_BULLISH', 'DISPLACEMENT_BULL'}
+                         'MSS_BULLISH', 'DISPLACEMENT_BULL',
+                         'VSA_SPRING', 'VSA_STOPPING_VOLUME', 'VSA_NO_SUPPLY', 'VSA_SELLING_CLIMAX'}
         bear_patterns = {'ORDER_BLOCK_BEAR', 'FVG_BEAR', 'LIQUIDITY_SWEEP_HIGH',
-                         'MSS_BEARISH', 'DISPLACEMENT_BEAR'}
+                         'MSS_BEARISH', 'DISPLACEMENT_BEAR',
+                         'VSA_UPTHRUST', 'VSA_NO_DEMAND', 'VSA_BUYING_CLIMAX'}
 
         found = [k for k, v in detected.items() if v.get('detected')]
         if not found:

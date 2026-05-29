@@ -157,3 +157,154 @@ class VolumeAnalyzer:
             "min_price": float(min_price),
             "max_price": float(max_price)
         }
+
+    @staticmethod
+    def detect_vsa_signals(df: pd.DataFrame, atr_series: pd.Series, lookback: int = 5) -> list:
+        """
+        Detect key VSA patterns on the recent candles.
+        Returns a list of dicts with detected signals, e.g. [{"pattern": "SPRING", "index": -2, "direction": 1, "confidence": 0.85}, ...]
+        """
+        signals = []
+        n = len(df)
+        if n < lookback + 20:
+            return signals
+
+        # We look at the last 'lookback' completed candles (excluding the current uncompleted candle at -1)
+        # Completed candles indexes: -lookback-1 to -2
+        for idx in range(-lookback - 1, -1):
+            if idx >= 0 or idx < -n:
+                continue
+            
+            try:
+                # Current candle (at index)
+                c = df.iloc[idx]
+                high = float(c['high'])
+                low = float(c['low'])
+                close = float(c['close'])
+                open_p = float(c['open'])
+                vol = float(c.get('volume', c.get('tick_volume', 1.0)))
+                
+                # Candle spread (range)
+                spread = high - low
+                if spread == 0:
+                    spread = 1e-9
+                    
+                # ATR for scale
+                atr = float(atr_series.iloc[idx]) if idx < len(atr_series) else 1.0
+                if np.isnan(atr) or atr == 0:
+                    atr = 1.0
+                
+                # Average volume of the last 20 candles before this index
+                start_vol_idx = max(0, n + idx - 20)
+                end_vol_idx = n + idx
+                vol_col = 'volume' if 'volume' in df.columns else 'tick_volume'
+                prev_vols = df[vol_col].values[start_vol_idx:end_vol_idx]
+                avg_vol = float(np.mean(prev_vols)) if len(prev_vols) > 0 else 1.0
+                if avg_vol == 0:
+                    avg_vol = 1e-9
+                rvol = vol / avg_vol
+                
+                # Close position in percent (0 = low, 1 = high)
+                close_pos = (close - low) / spread
+                
+                # Bullish or Bearish candle
+                is_bullish = close >= open_p
+                
+                # 1. SPRING (Bullish reversal)
+                # Close in top 35%, sweeps low, volume either high or low
+                if close_pos >= 0.65 and (rvol > 1.3 or rvol < 0.8):
+                    prev_lows = df['low'].values[max(0, n + idx - 5):n + idx]
+                    if len(prev_lows) > 0 and low < np.min(prev_lows):
+                        signals.append({
+                            "pattern": "SPRING",
+                            "index": idx,
+                            "direction": 1,
+                            "confidence": 0.85 if rvol > 1.3 else 0.75,
+                            "rvol": rvol,
+                            "price": close
+                        })
+                        continue
+
+                # 2. UPTHRUST (Bearish reversal)
+                # Close in bottom 35%, sweeps high, volume high or low
+                if close_pos <= 0.35 and (rvol > 1.3 or rvol < 0.8):
+                    prev_highs = df['high'].values[max(0, n + idx - 5):n + idx]
+                    if len(prev_highs) > 0 and high > np.max(prev_highs):
+                        signals.append({
+                            "pattern": "UPTHRUST",
+                            "index": idx,
+                            "direction": -1,
+                            "confidence": 0.85 if rvol > 1.3 else 0.75,
+                            "rvol": rvol,
+                            "price": close
+                        })
+                        continue
+
+                # 3. STOPPING VOLUME (Bullish reversal)
+                # Wide spread down candle, closes off low (top 50%), very high volume
+                if not is_bullish and spread > 1.2 * atr and close_pos >= 0.45 and rvol > 1.5:
+                    signals.append({
+                        "pattern": "STOPPING_VOLUME",
+                        "index": idx,
+                        "direction": 1,
+                        "confidence": 0.80,
+                        "rvol": rvol,
+                        "price": close
+                    })
+                    continue
+
+                # 4. NO SUPPLY (Bullish test)
+                # Narrow spread down candle, closes in lower half, below average volume
+                if not is_bullish and spread < 0.8 * atr and close_pos <= 0.50 and rvol < 0.8:
+                    signals.append({
+                        "pattern": "NO_SUPPLY",
+                        "index": idx,
+                        "direction": 1,
+                        "confidence": 0.75,
+                        "rvol": rvol,
+                        "price": close
+                    })
+                    continue
+
+                # 5. NO DEMAND (Bearish test)
+                # Narrow spread up candle, closes in upper half, below average volume
+                if is_bullish and spread < 0.8 * atr and close_pos >= 0.50 and rvol < 0.8:
+                    signals.append({
+                        "pattern": "NO_DEMAND",
+                        "index": idx,
+                        "direction": -1,
+                        "confidence": 0.75,
+                        "rvol": rvol,
+                        "price": close
+                    })
+                    continue
+
+                # 6. BUYING CLIMAX (Bearish exhaustion)
+                # Wide spread up candle, closes off high (lower 50%), extremely high volume
+                if is_bullish and spread > 1.5 * atr and close_pos <= 0.50 and rvol > 2.0:
+                    signals.append({
+                        "pattern": "BUYING_CLIMAX",
+                        "index": idx,
+                        "direction": -1,
+                        "confidence": 0.80,
+                        "rvol": rvol,
+                        "price": close
+                    })
+                    continue
+
+                # 7. SELLING CLIMAX (Bullish exhaustion)
+                # Wide spread down candle, closes off low (upper 50%), extremely high volume
+                if not is_bullish and spread > 1.5 * atr and close_pos >= 0.50 and rvol > 2.0:
+                    signals.append({
+                        "pattern": "SELLING_CLIMAX",
+                        "index": idx,
+                        "direction": 1,
+                        "confidence": 0.80,
+                        "rvol": rvol,
+                        "price": close
+                    })
+                    continue
+            except Exception:
+                pass
+                
+        return signals

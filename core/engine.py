@@ -459,13 +459,23 @@ class AdvancedTradingEngine:
             def bias_label(b):
                 return "BULLISH" if b == 1 else ("BEARISH" if b == -1 else "NEUTRAL")
 
+            # Detect VSA signals on M1 and M5 for dashboard labels
+            from utils.volume_analyzer import VolumeAnalyzer
+            vsa_m1 = VolumeAnalyzer.detect_vsa_signals(df_m1, df_m1['atr'], lookback=3) if df_m1 is not None and 'atr' in df_m1.columns else []
+            vsa_m5 = VolumeAnalyzer.detect_vsa_signals(df_m5, df_m5['atr'], lookback=3) if df_m5 is not None and 'atr' in df_m5.columns else []
+            
+            def get_vsa_label(vsa_list, default_lbl):
+                if vsa_list:
+                    return vsa_list[0]['pattern']
+                return default_lbl
+
             tf_alignment = {
                 'D1':  {'bias': d1_bias,  'label': bias_label(d1_bias)},
                 'H4':  {'bias': h4_bias,  'label': bias_label(h4_bias)},
                 'H1':  {'bias': h1_bias,  'label': bias_label(h1_bias)},
                 'M15': {'bias': m15_bias, 'label': 'SWEEP↑' if sweep_type == 1 else ('SWEEP↓' if sweep_type == -1 else bias_label(m15_bias))},
-                'M5':  {'bias': m5_bias,  'label': 'MSS↑' if mss_signal == 1 else ('MSS↓' if mss_signal == -1 else bias_label(m5_bias))},
-                'M1':  {'bias': m1_bias,  'label': 'TBS✅' if mss_signal != 0 and sweep_type != 0 else bias_label(m1_bias)},
+                'M5':  {'bias': m5_bias,  'label': get_vsa_label(vsa_m5, 'MSS↑' if mss_signal == 1 else ('MSS↓' if mss_signal == -1 else bias_label(m5_bias)))},
+                'M1':  {'bias': m1_bias,  'label': get_vsa_label(vsa_m1, 'TBS✅' if mss_signal != 0 and sweep_type != 0 else bias_label(m1_bias))},
                 'htf_bias': htf_bias,
                 'aligned': (htf_bias != 0 and sweep_type != 0 and mss_signal != 0 and
                            htf_bias == (1 if sweep_type > 0 else -1) and
@@ -1098,6 +1108,17 @@ class AdvancedTradingEngine:
             crt_low = crt_meta.get('crt_low', analysis.get('crt_low', 0.0))
             crt_high = crt_meta.get('crt_high', analysis.get('crt_high', 0.0))
 
+            # Get VSA patterns for status API
+            from utils.volume_analyzer import VolumeAnalyzer
+            vsa_patterns = []
+            df_m1 = analysis.get('df_ltf')  # M1
+            df_m5 = analysis.get('df_m5')
+            if df_m1 is not None and 'atr' in df_m1.columns:
+                vsa_patterns += [s['pattern'] for s in VolumeAnalyzer.detect_vsa_signals(df_m1, df_m1['atr'], lookback=3)]
+            if df_m5 is not None and 'atr' in df_m5.columns:
+                vsa_patterns += [s['pattern'] for s in VolumeAnalyzer.detect_vsa_signals(df_m5, df_m5['atr'], lookback=3)]
+            vsa_patterns = list(set(vsa_patterns))
+
             # Get 6-TF alignment from analysis (set by run_multi_timeframe_analysis)
             tf_alignment = analysis.get('tf_alignment', getattr(self, '_last_tf_alignment', {}))
 
@@ -1114,6 +1135,7 @@ class AdvancedTradingEngine:
                 'confidence': 0.0,
                 'setup_type': None,
                 'detected_patterns': detected_patterns,
+                'vsa_patterns': vsa_patterns,
                 'smc_patterns': smc_patterns,
                 'smc_confidence': ai_signal.get('smc_confidence', 0.0),
                 'cluster_id': int(ai_signal.get('cluster_id', 0)),

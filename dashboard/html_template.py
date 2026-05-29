@@ -1143,6 +1143,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             <span>Active Sessions</span>
                             <span id="pred-sessions">—</span>
                         </div>
+                        <div class="pred-row">
+                            <span>VSA Patterns</span>
+                            <span id="pred-vsa" style="font-weight:700; color:var(--text-muted);">—</span>
+                        </div>
                         <div class="pred-row" style="flex-direction:column; align-items:flex-start; gap:6px; border-top: 1px solid rgba(255,255,255,0.05); padding-top:6px; margin-top:4px;">
                             <div style="display:flex; align-items:center; justify-content:space-between; width:100%;">
                                 <span>6-TF Cascade</span>
@@ -2337,6 +2341,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     : '<span style="color:var(--text-muted);">NO SESSION</span>';
                 document.getElementById('pred-sessions').innerHTML = sessionHTML;
 
+                // Update VSA Patterns in sidebar
+                const vsaPatterns = pred.vsa_patterns || [];
+                const vsaEl = document.getElementById('pred-vsa');
+                if (vsaEl) {
+                    if (vsaPatterns.length > 0) {
+                        vsaEl.innerHTML = vsaPatterns.map(p => {
+                            const isBullish = ['SPRING', 'STOPPING_VOLUME', 'NO_SUPPLY', 'SELLING_CLIMAX'].includes(p);
+                            const color = isBullish ? '#a855f7' : '#ec4899';
+                            return `<span style="background: rgba(${isBullish?'168,85,247':'236,72,153'}, 0.15); border: 1px solid rgba(${isBullish?'168,85,247':'236,72,153'}, 0.4); border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 700; color: ${color}; text-shadow: 0 0 6px ${color}; margin-right: 4px; display: inline-block; margin-bottom: 2px;">${p}</span>`;
+                        }).join('');
+                    } else {
+                        vsaEl.innerHTML = '<span style="color:var(--text-muted); font-size: 11px;">NONE</span>';
+                    }
+                }
+
                 const headerSessionsEl = document.getElementById('header-sessions');
                 if (headerSessionsEl) {
                     headerSessionsEl.innerHTML = sessions.length > 0
@@ -2353,7 +2372,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     return 'NEUTRAL';
                 };
                 const biasColor = (b, lbl) => {
-                    if (lbl && (lbl.includes('SWEEP') || lbl.includes('MSS') || lbl.includes('TBS'))) return '#ffd32a';
+                    if (lbl) {
+                        if (lbl.includes('SPRING') || lbl.includes('NO_SUPPLY') || lbl.includes('STOPPING') || lbl.includes('SELLING_CLIMAX')) {
+                            return '#a855f7'; // Purple for bullish VSA
+                        }
+                        if (lbl.includes('UPTHRUST') || lbl.includes('NO_DEMAND') || lbl.includes('BUYING_CLIMAX')) {
+                            return '#ec4899'; // Pink/Magenta for bearish VSA
+                        }
+                        if (lbl.includes('SWEEP') || lbl.includes('MSS') || lbl.includes('TBS')) {
+                            return '#ffd32a'; // Yellow for SMC execution
+                        }
+                    }
                     if (b > 0) return 'var(--color-green)';
                     if (b < 0) return 'var(--color-red)';
                     return 'var(--text-muted)';
