@@ -1,6 +1,6 @@
 {
     "paper_mode": false,
-    "trading_mode": "swing",
+    "trading_mode": "intraday",
     "hedging_mode": false,
     "compounding_mode": false,
     "risk_percent": 1,

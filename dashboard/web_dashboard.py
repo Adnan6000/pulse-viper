@@ -73,7 +73,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 
                 # Fetch levels and active trades
                 analysis = self.engine.cached_analysis.get(symbol, {})
-                fib_meta = analysis.get("fib_metadata", {})
                 
                 pdh = self.engine.pdh_cache.get(symbol, None)
                 pdl = self.engine.pdl_cache.get(symbol, None)
@@ -94,9 +93,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "ob_bottom": ob_meta.get("ob_bottom"),
                     "ob_direction": ob_meta.get("ob_direction"),
                     # Volume Profile
-                    "poc": fib_meta.get("poc"),
-                    "val": fib_meta.get("val"),
-                    "vah": fib_meta.get("vah"),
+                    "poc": self.engine.volume_cache.get("profile", {}).get("poc_price"),
+                    "val": None,
+                    "vah": None,
                     "pdh": pdh,
                     "pdl": pdl,
                     "pwh": pwh,

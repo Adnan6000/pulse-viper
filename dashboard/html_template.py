@@ -836,6 +836,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </header>
 
+        <!-- Session Banner Row with UTC and Local Clocks -->
+        <div class="session-banner-row" style="display: flex; align-items: center; justify-content: space-between; background: var(--glass-bg); border: 1px solid var(--glass-border); padding: 8px 16px; border-radius: 12px; margin-bottom: 12px; flex-wrap: wrap; gap: 12px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Active Sessions:</span>
+                <div id="header-sessions" style="display: flex; gap: 6px; align-items: center;">
+                    <span style="color: var(--text-muted); font-size: 11px;">Loading sessions...</span>
+                </div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 16px;">
+                <div style="display: flex; align-items: center; gap: 6px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); padding: 4px 10px; border-radius: 6px;">
+                    <span style="font-size: 10px; font-weight: 700; color: var(--text-muted);">LOCAL:</span>
+                    <span id="local-clock" style="font-family: 'Outfit', sans-serif; font-size: 11px; font-weight: 700; color: var(--color-blue); text-shadow: 0 0 6px rgba(59,130,246,0.3);">--:--:--</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 6px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); padding: 4px 10px; border-radius: 6px;">
+                    <span style="font-size: 10px; font-weight: 700; color: var(--text-muted);">UTC:</span>
+                    <span id="utc-clock" style="font-family: 'Outfit', sans-serif; font-size: 11px; font-weight: 700; color: var(--color-green); text-shadow: 0 0 6px rgba(16,185,129,0.3);">--:--:--</span>
+                </div>
+            </div>
+        </div>
+
         <!-- Ticker Ribbons Row -->
         <div class="tickers-container">
             <div class="ticker-row caution-ticker">
@@ -1661,6 +1681,44 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     for (let j = 0; j < this.height - 25; j += 40) {
                         this.ctx.beginPath(); this.ctx.moveTo(0, j); this.ctx.lineTo(this.width - 70, j); this.ctx.stroke();
                     }
+                    // Draw CRT and OB zones in the background
+                    if (this.levels) {
+                        const drawWidth = this.width - 70;
+                        
+                        // 1. CRT Zone Shaded Box
+                        if (this.levels.crt_high && this.levels.crt_low) {
+                            const crtHighY = this.priceToPixelY(this.levels.crt_high, minPrice, maxPrice);
+                            const crtLowY = this.priceToPixelY(this.levels.crt_low, minPrice, maxPrice);
+                            this.ctx.save();
+                            this.ctx.fillStyle = 'rgba(168, 85, 247, 0.08)'; // Glassy purple
+                            this.ctx.strokeStyle = 'rgba(168, 85, 247, 0.35)'; // Dotted purple border
+                            this.ctx.lineWidth = 1;
+                            this.ctx.setLineDash([4, 4]);
+                            const yStart = Math.min(crtHighY, crtLowY);
+                            const height = Math.abs(crtHighY - crtLowY);
+                            this.ctx.fillRect(0, yStart, drawWidth, height);
+                            this.ctx.strokeRect(0, yStart, drawWidth, height);
+                            this.ctx.restore();
+                        }
+                        
+                        // 2. Order Block Zone Shaded Box
+                        if (this.levels.ob_top && this.levels.ob_bottom) {
+                            const obTopY = this.priceToPixelY(this.levels.ob_top, minPrice, maxPrice);
+                            const obBottomY = this.priceToPixelY(this.levels.ob_bottom, minPrice, maxPrice);
+                            const isBullish = this.levels.ob_direction === 'bullish';
+                            this.ctx.save();
+                            // Greenish for bullish OB, Reddish for bearish OB
+                            this.ctx.fillStyle = isBullish ? 'rgba(0, 240, 118, 0.06)' : 'rgba(255, 51, 102, 0.06)';
+                            this.ctx.strokeStyle = isBullish ? 'rgba(0, 240, 118, 0.25)' : 'rgba(255, 51, 102, 0.25)';
+                            this.ctx.lineWidth = 1;
+                            this.ctx.setLineDash([4, 4]);
+                            const yStart = Math.min(obTopY, obBottomY);
+                            const height = Math.abs(obTopY - obBottomY);
+                            this.ctx.fillRect(0, yStart, drawWidth, height);
+                            this.ctx.strokeRect(0, yStart, drawWidth, height);
+                            this.ctx.restore();
+                        }
+                    }
                     
                     // Draw candles
                     for (let i = startIndex; i < this.candles.length; i++) {
@@ -2016,6 +2074,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 apiInput.value = apiBase;
             }
 
+            function updateClocks() {
+                const now = new Date();
+                const pad = (n) => String(n).padStart(2, '0');
+                
+                // Local clock
+                const localStr = pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+                const localEl = document.getElementById('local-clock');
+                if (localEl) localEl.innerText = localStr;
+                
+                // UTC clock
+                const utcStr = pad(now.getUTCHours()) + ':' + pad(now.getUTCMinutes()) + ':' + pad(now.getUTCSeconds());
+                const utcEl = document.getElementById('utc-clock');
+                if (utcEl) utcEl.innerText = utcStr;
+            }
+            updateClocks();
+            setInterval(updateClocks, 1000);
+
             fetchChartData();
             setInterval(fetchStatus, 1500);
             setInterval(fetchChartData, 5000);
@@ -2257,9 +2332,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     'London': '#3b82f6',
                     'New York': '#10b981'
                 };
-                document.getElementById('pred-sessions').innerHTML = sessions.length > 0
+                const sessionHTML = sessions.length > 0
                     ? sessions.map(s => `<span style="background: rgba(${s==='Sydney'?'168,85,247':s==='Asian'?'245,158,11':s==='London'?'59,130,246':'16,185,129'}, 0.18); border: 1px solid rgba(${s==='Sydney'?'168,85,247':s==='Asian'?'245,158,11':s==='London'?'59,130,246':'16,185,129'}, 0.5); border-radius: 5px; padding: 3px 9px; font-size: 11px; font-weight: 700; color: ${sessionColors[s]||'var(--color-blue)'}; margin-right: 5px; text-shadow: 0 0 6px currentColor;">${s}</span>`).join('')
                     : '<span style="color:var(--text-muted);">NO SESSION</span>';
+                document.getElementById('pred-sessions').innerHTML = sessionHTML;
+
+                const headerSessionsEl = document.getElementById('header-sessions');
+                if (headerSessionsEl) {
+                    headerSessionsEl.innerHTML = sessions.length > 0
+                        ? sessions.map(s => `<span style="background: rgba(${s==='Sydney'?'168,85,247':s==='Asian'?'245,158,11':s==='London'?'59,130,246':'16,185,129'}, 0.18); border: 1px solid rgba(${s==='Sydney'?'168,85,247':s==='Asian'?'245,158,11':s==='London'?'59,130,246':'16,185,129'}, 0.5); border-radius: 5px; padding: 4px 10px; font-size: 11px; font-weight: 700; color: ${sessionColors[s]||'var(--color-blue)'}; text-shadow: 0 0 6px currentColor; display: inline-block;">${s}</span>`).join('')
+                        : '<span style="color:var(--text-muted); font-size: 11px; font-weight: 600;">NO ACTIVE SESSIONS</span>';
+                }
 
                 // ── 6-TF Cascade Alignment Panel ─────────────────────────────
                 const tfAlign = pred.tf_alignment || data.tf_alignment || {};
