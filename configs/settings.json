@@ -1,6 +1,6 @@
 {
     "paper_mode": false,
-    "trading_mode": "scalping",
+    "trading_mode": "swing",
     "hedging_mode": false,
     "compounding_mode": false,
     "risk_percent": 1,
