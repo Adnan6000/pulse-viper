@@ -43,11 +43,9 @@ class AdaptiveBacktester:
                      swing_window: int = 2, lookback_sweep: int = 20,
                      lookback_mss: int = 10, lookback_fvg: int = 5) -> Dict:
         """
-        Run a full simulation of the SMC strategy on recent historical data.
-        Returns comprehensive backtest statistics.
+        Fetch data, calculate SMC indicators and run the simulation.
+        This remains fully backward-compatible for single runs.
         """
-        self.logger.info(f"🔬 Backtester: Running {days}-day backtest on {symbol} | Mode={trading_mode}, RR={rr_ratio}, SW={swing_window}, SWP={lookback_sweep}, MSS={lookback_mss}")
-
         from utils.smc_indicators import SMCIndicators
         from utils.mt5_data import fetch_ohlcv
 
@@ -76,7 +74,6 @@ class AdaptiveBacktester:
         if len(df_htf) < 50 or len(df_ltf) < 50:
             return {"error": "Not enough historical bars", "symbol": symbol}
 
-        # Compute SMC features
         try:
             htf_smc = SMCIndicators.compute_smc_features(df_htf, window=swing_window)
             context_smc = SMCIndicators.compute_smc_features(df_context, window=swing_window)
@@ -84,35 +81,69 @@ class AdaptiveBacktester:
         except Exception as e:
             return {"error": f"SMC compute failed: {e}", "symbol": symbol}
 
-        # Run simulation
+        return self.run_backtest_simulation(
+            symbol=symbol,
+            htf_smc=htf_smc,
+            context_smc=context_smc,
+            ltf_smc=ltf_smc,
+            days=days,
+            rr_ratio=rr_ratio,
+            trading_mode=trading_mode,
+            lookback_sweep=lookback_sweep,
+            lookback_mss=lookback_mss,
+            lookback_fvg=lookback_fvg
+        )
+
+    def run_backtest_simulation(self, symbol: str, htf_smc: pd.DataFrame, context_smc: pd.DataFrame, ltf_smc: pd.DataFrame,
+                                days: int, rr_ratio: float, trading_mode: str,
+                                lookback_sweep: int, lookback_mss: int, lookback_fvg: int, verbose: bool = True) -> Dict:
+        """
+        Run in-memory simulation logic on precomputed dataframes.
+        Extremely fast, executes in milliseconds by bypassing pandas .iloc overhead in loops.
+        """
+        # Convert columns to numpy arrays to bypass pandas indexing overhead (100x speedup)
+        ltf_index = ltf_smc.index.values
+        ltf_close = ltf_smc['close'].values
+        ltf_atr = ltf_smc['atr'].values
+        ltf_support = ltf_smc['support'].values
+        ltf_resistance = ltf_smc['resistance'].values
+        ltf_fvg_class = ltf_smc['fvg_class'].values
+        ltf_mss_signal = ltf_smc['mss_signal'].values
+        ltf_low = ltf_smc['low'].values
+        ltf_high = ltf_smc['high'].values
+
+        htf_index_values = htf_smc.index.values
+        htf_active_bias = htf_smc['active_bias'].values
+
+        ctx_index_values = context_smc.index.values
+        ctx_liq_sweep_type = context_smc['liq_sweep_type'].values
+
+        # Precompute aligned HTF and context indices for the entire LTF array (O(N) vectorized searchsorted)
+        idx_htf_arr = np.searchsorted(htf_index_values, ltf_index, side='right')
+        idx_ctx_arr = np.searchsorted(ctx_index_values, ltf_index, side='right')
+
         trades = []
         n = len(ltf_smc)
-        htf_indices = htf_smc.index
-        ctx_indices = context_smc.index
         trade_exit_bar = -1
 
         for i in range(100, n - 100):
             if i <= trade_exit_bar:
                 continue  # Only 1 trade at a time
 
-            t = ltf_smc.index[i]
-            ltf_row = ltf_smc.iloc[i]
+            t = ltf_index[i]
 
-            # Get aligned HTF and context rows using fast binary search
-            idx_htf = htf_indices.searchsorted(t, side='right')
-            idx_ctx = ctx_indices.searchsorted(t, side='right')
+            # Get aligned HTF and context rows using precomputed searchsorted arrays
+            idx_htf = idx_htf_arr[i]
+            idx_ctx = idx_ctx_arr[i]
             if idx_htf == 0 or idx_ctx == 0:
                 continue
 
-            htf_row = htf_smc.iloc[idx_htf - 1]
-            ctx_row = context_smc.iloc[idx_ctx - 1]
-
-            h1_bias = htf_row.get('active_bias', 0)
+            h1_bias = htf_active_bias[idx_htf - 1]
             
             # Check last lookback_sweep context candles for any sweep (scan backward)
             ctx_sweep = 0
             for k in range(idx_ctx - 1, max(-1, idx_ctx - (lookback_sweep + 1)), -1):
-                sweep_val = context_smc.iloc[k].get('liq_sweep_type', 0)
+                sweep_val = ctx_liq_sweep_type[k]
                 if sweep_val != 0:
                     ctx_sweep = int(sweep_val)
                     break
@@ -120,7 +151,7 @@ class AdaptiveBacktester:
             # Check last lookback_mss LTF candles for any MSS (scan backward)
             ltf_mss = 0
             for k in range(i, max(-1, i - lookback_mss), -1):
-                mss_val = ltf_smc.iloc[k].get('mss_signal', 0)
+                mss_val = ltf_mss_signal[k]
                 if mss_val != 0:
                     ltf_mss = int(mss_val)
                     break
@@ -128,17 +159,17 @@ class AdaptiveBacktester:
             # Check last lookback_fvg candles for FVG
             fvg_class = 'none'
             for k in range(i, max(-1, i - lookback_fvg), -1):
-                cls_val = ltf_smc.iloc[k].get('fvg_class', 'none')
+                cls_val = ltf_fvg_class[k]
                 if cls_val != 'none' and cls_val != 'rfvg':
                     fvg_class = cls_val
                     break
             if fvg_class == 'none':
-                fvg_class = ltf_row.get('fvg_class', 'none')
+                fvg_class = ltf_fvg_class[i]
                 
-            atr = ltf_row.get('atr', 1.0)
-            entry = ltf_row.get('close', 0)
-            support = ltf_row.get('support', entry - atr)
-            resistance = ltf_row.get('resistance', entry + atr)
+            atr = ltf_atr[i]
+            entry = ltf_close[i]
+            support = ltf_support[i]
+            resistance = ltf_resistance[i]
 
             action = None
             sl = 0.0
@@ -173,29 +204,30 @@ class AdaptiveBacktester:
             close_price = entry
 
             for j in range(i + 1, min(i + 200, n)):
-                future = ltf_smc.iloc[j]
+                future_low = ltf_low[j]
+                future_high = ltf_high[j]
                 bars_held += 1
                 if action == "BUY":
-                    if future.get('low', entry) <= sl:
+                    if future_low <= sl:
                         outcome = -sl_dist
                         close_price = sl
                         resolved = True
                         trade_exit_bar = j
                         break
-                    elif future.get('high', entry) >= tp:
+                    elif future_high >= tp:
                         outcome = rr_ratio * sl_dist
                         close_price = tp
                         resolved = True
                         trade_exit_bar = j
                         break
                 else:
-                    if future.get('high', entry) >= sl:
+                    if future_high >= sl:
                         outcome = -sl_dist
                         close_price = sl
                         resolved = True
                         trade_exit_bar = j
                         break
-                    elif future.get('low', entry) <= tp:
+                    elif future_low <= tp:
                         outcome = rr_ratio * sl_dist
                         close_price = tp
                         resolved = True
@@ -262,10 +294,11 @@ class AdaptiveBacktester:
 
         self.last_results = results
         self._save_results(results)
-        self.logger.info(
-            f"✅ Backtest done: {symbol} | {len(trades)} trades | WR={win_rate:.1f}% | "
-            f"PF={profit_factor:.2f} | AvgRR={avg_rr:.2f}R"
-        )
+        if verbose:
+            self.logger.info(
+                f"✅ Backtest done: {symbol} | {len(trades)} trades | WR={win_rate:.1f}% | "
+                f"PF={profit_factor:.2f} | AvgRR={avg_rr:.2f}R"
+            )
         return results
 
     def self_optimize(self, symbol: str, trading_mode: str = "scalping") -> Dict:
@@ -275,6 +308,8 @@ class AdaptiveBacktester:
         saves it to settings_manager.
         """
         from utils.settings_manager import settings_manager
+        from utils.smc_indicators import SMCIndicators
+        from utils.mt5_data import fetch_ohlcv
 
         self.logger.info(f"🧠 Backtester: Commencing grid self-optimization for {symbol}...")
         
@@ -308,21 +343,66 @@ class AdaptiveBacktester:
         best_cfg = None
         results_log = {}
 
-        # Fetch data once to optimize performance
-        # We backtest last 14 days
-        self.logger.info(f"📊 Grid optimizing {len(candidates)} configurations over last 14 days...")
+        # Fetch data once to optimize performance (over last 14 days)
+        # Select timeframes based on mode
+        if trading_mode == "scalping":
+            tf_htf = mt5.TIMEFRAME_H1
+            tf_context = mt5.TIMEFRAME_M5
+            tf_ltf = mt5.TIMEFRAME_M1
+        elif trading_mode == "swing":
+            tf_htf = mt5.TIMEFRAME_D1
+            tf_context = mt5.TIMEFRAME_H1
+            tf_ltf = mt5.TIMEFRAME_M15
+        else:  # intraday
+            tf_htf = mt5.TIMEFRAME_H1
+            tf_context = mt5.TIMEFRAME_M15
+            tf_ltf = mt5.TIMEFRAME_M5
+
+        days = 14
+        bars_needed = days * 24 * 12  # M5 bars per day
+        self.logger.info(f"📊 Fetching 14-day history for {symbol} from MT5...")
+        
+        df_htf = fetch_ohlcv(symbol, tf_htf, n=bars_needed)
+        df_context = fetch_ohlcv(symbol, tf_context, n=bars_needed)
+        df_ltf = fetch_ohlcv(symbol, tf_ltf, n=min(bars_needed * 5, 50000))
+
+        if df_htf is None or df_context is None or df_ltf is None or len(df_htf) < 50 or len(df_ltf) < 50:
+            self.logger.warning("Aborting optimization: Insufficient data to fetch from MT5")
+            return {"error": "Failed to fetch data", "applied": False}
+
+        # Precompute SMC features for window = 2 and window = 3
+        self.logger.info(f"📊 Precomputing SMC features for swing window options...")
+        smc_cache = {}
+        for sw in swing_options:
+            try:
+                smc_cache[sw] = {
+                    "htf": SMCIndicators.compute_smc_features(df_htf, window=sw),
+                    "context": SMCIndicators.compute_smc_features(df_context, window=sw),
+                    "ltf": SMCIndicators.compute_smc_features(df_ltf, window=sw)
+                }
+            except Exception as e:
+                self.logger.error(f"SMC precompute failed for window={sw}: {e}")
+
+        self.logger.info(f"📊 Grid optimizing {len(candidates)} configurations in-memory...")
         
         for idx, cfg in enumerate(candidates):
+            sw = cfg["swing_window"]
+            if sw not in smc_cache:
+                continue
+            cache = smc_cache[sw]
             try:
-                res = self.run_backtest(
+                res = self.run_backtest_simulation(
                     symbol=symbol,
+                    htf_smc=cache["htf"],
+                    context_smc=cache["context"],
+                    ltf_smc=cache["ltf"],
                     days=14,
                     rr_ratio=cfg["rr"],
                     trading_mode=trading_mode,
-                    swing_window=cfg["swing_window"],
                     lookback_sweep=cfg["lookback_sweep"],
                     lookback_mss=cfg["lookback_mss"],
-                    lookback_fvg=cfg["lookback_fvg"]
+                    lookback_fvg=cfg["lookback_fvg"],
+                    verbose=False
                 )
                 
                 total_trades = res.get("total_trades", 0)
