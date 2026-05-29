@@ -119,6 +119,217 @@ class NaiveBayesClassifier:
         e1 = np.exp(posteriors[1] - max_val)
         return float(e1 / (e0 + e1 + 1e-9))
 
+
+class ChartPatternDetector:
+    """
+    Institutional SMC Chart Pattern Detector.
+    Detects patterns from M1/M5/H1 dataframes and returns confidence scores.
+
+    Patterns detected:
+      ORDER_BLOCK      — Last bearish/bullish candle before a strong impulsive move
+      FVG              — Fair Value Gap (imbalance between candle[-2].high and candle[0].low)
+      BREAKER_BLOCK    — Previously broken OB that flipped to opposite polarity
+      LIQUIDITY_SWEEP  — Wick beyond prior swing H/L with body close back inside
+      MSS              — Market Structure Shift: first close beyond internal swing
+      DISPLACEMENT     — Series of 3+ strong directional closes
+      INDUCEMENT       — Small false break before real reversal move
+      CRT_MANIPULATION — Candle that sweeps both high AND low within the range then closes inside
+    """
+
+    @staticmethod
+    def detect(df_m1: pd.DataFrame,
+               df_m5: Optional[pd.DataFrame] = None,
+               df_h1: Optional[pd.DataFrame] = None,
+               window: int = 5) -> Dict:
+        """
+        Detect all SMC patterns across available timeframes.
+        Returns dict: {pattern_name: {'detected': bool, 'confidence': float, 'level': float|None}}
+        """
+        results = {}
+
+        def _score(conditions: list) -> float:
+            """Return normalized confidence from a list of bool conditions."""
+            if not conditions:
+                return 0.0
+            return round(sum(conditions) / len(conditions), 3)
+
+        try:
+            # ── ORDER BLOCK (H1 preferred, fallback M5) ────────────────────────
+            ob_df = df_h1 if (df_h1 is not None and len(df_h1) >= 10) else df_m5
+            if ob_df is not None and len(ob_df) >= 10:
+                closes = ob_df['close'].values
+                opens = ob_df['open'].values
+                highs = ob_df['high'].values
+                lows = ob_df['low'].values
+                # OB: last bearish candle (close<open) before 3 bullish candles
+                ob_bull_level = None
+                ob_bear_level = None
+                for i in range(len(closes) - 4, max(0, len(closes) - 15), -1):
+                    # Bullish OB: bearish candle[i] → 3 bullish candles after
+                    if closes[i] < opens[i]:
+                        subsequent = closes[i+1:i+4] if i+4 <= len(closes) else closes[i+1:]
+                        if len(subsequent) >= 2 and all(subsequent > opens[i+1:i+1+len(subsequent)]):
+                            ob_bull_level = highs[i]
+                            break
+                    # Bearish OB: bullish candle[i] → 3 bearish candles after
+                    if closes[i] > opens[i]:
+                        subsequent = closes[i+1:i+4] if i+4 <= len(closes) else closes[i+1:]
+                        if len(subsequent) >= 2 and all(subsequent < opens[i+1:i+1+len(subsequent)]):
+                            ob_bear_level = lows[i]
+                            break
+                results['ORDER_BLOCK_BULL'] = {
+                    'detected': ob_bull_level is not None,
+                    'confidence': 0.80 if ob_bull_level is not None else 0.0,
+                    'level': ob_bull_level
+                }
+                results['ORDER_BLOCK_BEAR'] = {
+                    'detected': ob_bear_level is not None,
+                    'confidence': 0.80 if ob_bear_level is not None else 0.0,
+                    'level': ob_bear_level
+                }
+
+            # ── FVG (M1-level for precision) ──────────────────────────────────
+            if df_m1 is not None and len(df_m1) >= 5:
+                highs_m1 = df_m1['high'].values
+                lows_m1 = df_m1['low'].values
+                fvg_bull = None
+                fvg_bear = None
+                for i in range(len(highs_m1) - 3, max(0, len(highs_m1) - 20), -1):
+                    # Bullish FVG: candle[i-1].high < candle[i+1].low
+                    if i + 1 < len(highs_m1) and highs_m1[i-1] < lows_m1[i+1]:
+                        fvg_bull = (highs_m1[i-1] + lows_m1[i+1]) / 2
+                        break
+                for i in range(len(lows_m1) - 3, max(0, len(lows_m1) - 20), -1):
+                    # Bearish FVG: candle[i-1].low > candle[i+1].high
+                    if i + 1 < len(lows_m1) and lows_m1[i-1] > highs_m1[i+1]:
+                        fvg_bear = (lows_m1[i-1] + highs_m1[i+1]) / 2
+                        break
+                results['FVG_BULL'] = {
+                    'detected': fvg_bull is not None,
+                    'confidence': 0.75 if fvg_bull is not None else 0.0,
+                    'level': fvg_bull
+                }
+                results['FVG_BEAR'] = {
+                    'detected': fvg_bear is not None,
+                    'confidence': 0.75 if fvg_bear is not None else 0.0,
+                    'level': fvg_bear
+                }
+
+            # ── LIQUIDITY SWEEP (M1) ──────────────────────────────────────────
+            if df_m1 is not None and len(df_m1) >= 10:
+                m1_h = df_m1['high'].values
+                m1_l = df_m1['low'].values
+                m1_c = df_m1['close'].values
+                # Find prior swing high/low over last window bars
+                lookback = min(window + 5, len(m1_h) - 3)
+                prior_high = max(m1_h[-lookback:-3])
+                prior_low = min(m1_l[-lookback:-3])
+                last_high = m1_h[-2]
+                last_low = m1_l[-2]
+                last_close = m1_c[-2]
+                sweep_high = last_high > prior_high and last_close < prior_high
+                sweep_low = last_low < prior_low and last_close > prior_low
+                results['LIQUIDITY_SWEEP_HIGH'] = {
+                    'detected': sweep_high,
+                    'confidence': _score([sweep_high, last_high > prior_high * 1.001]),
+                    'level': prior_high if sweep_high else None
+                }
+                results['LIQUIDITY_SWEEP_LOW'] = {
+                    'detected': sweep_low,
+                    'confidence': _score([sweep_low, last_low < prior_low * 0.999]),
+                    'level': prior_low if sweep_low else None
+                }
+
+            # ── MSS (Market Structure Shift) on M1 ───────────────────────────
+            if df_m1 is not None and len(df_m1) >= 15:
+                m1_c = df_m1['close'].values
+                m1_h = df_m1['high'].values
+                m1_l = df_m1['low'].values
+                # Internal swing high broken by close above it = bullish MSS
+                internal_swing_high = max(m1_h[-12:-4])
+                internal_swing_low = min(m1_l[-12:-4])
+                last_c = m1_c[-2]
+                mss_bull = last_c > internal_swing_high
+                mss_bear = last_c < internal_swing_low
+                results['MSS_BULLISH'] = {
+                    'detected': mss_bull,
+                    'confidence': 0.72 if mss_bull else 0.0,
+                    'level': internal_swing_high if mss_bull else None
+                }
+                results['MSS_BEARISH'] = {
+                    'detected': mss_bear,
+                    'confidence': 0.72 if mss_bear else 0.0,
+                    'level': internal_swing_low if mss_bear else None
+                }
+
+            # ── DISPLACEMENT (3+ consecutive strong closes in one direction) ─
+            if df_m1 is not None and len(df_m1) >= 8:
+                closes_m1 = df_m1['close'].values
+                opens_m1 = df_m1['open'].values
+                bodies = closes_m1[-6:] - opens_m1[-6:]
+                bull_displacement = all(bodies[-3:] > 0) and sum(bodies[-3:]) > 0
+                bear_displacement = all(bodies[-3:] < 0) and sum(bodies[-3:]) < 0
+                results['DISPLACEMENT_BULL'] = {
+                    'detected': bull_displacement,
+                    'confidence': 0.65 if bull_displacement else 0.0,
+                    'level': None
+                }
+                results['DISPLACEMENT_BEAR'] = {
+                    'detected': bear_displacement,
+                    'confidence': 0.65 if bear_displacement else 0.0,
+                    'level': None
+                }
+
+            # ── CRT MANIPULATION (sweeps both high and low then closes inside) 
+            if df_m1 is not None and len(df_m1) >= 10:
+                # The CRT manipulation candle sweeps the range high AND low
+                crt_ref_high = max(df_m1['high'].values[-10:-3])
+                crt_ref_low = min(df_m1['low'].values[-10:-3])
+                last_m1 = df_m1.iloc[-2]
+                crt_manip = (last_m1['high'] > crt_ref_high and
+                             last_m1['low'] < crt_ref_low and
+                             crt_ref_low < last_m1['close'] < crt_ref_high)
+                results['CRT_MANIPULATION'] = {
+                    'detected': crt_manip,
+                    'confidence': 0.90 if crt_manip else 0.0,
+                    'level': (crt_ref_high + crt_ref_low) / 2 if crt_manip else None
+                }
+
+        except Exception as e:
+            pass  # Fail silently — pattern detection is advisory only
+
+        return results
+
+    @staticmethod
+    def get_summary(detected: Dict) -> Tuple[List[str], float, Optional[str]]:
+        """
+        Summarize detected patterns into:
+        - List of detected pattern names
+        - Overall confidence (max of detected confidences)
+        - Directional bias ('bullish', 'bearish', None)
+        """
+        bull_patterns = {'ORDER_BLOCK_BULL', 'FVG_BULL', 'LIQUIDITY_SWEEP_LOW',
+                         'MSS_BULLISH', 'DISPLACEMENT_BULL'}
+        bear_patterns = {'ORDER_BLOCK_BEAR', 'FVG_BEAR', 'LIQUIDITY_SWEEP_HIGH',
+                         'MSS_BEARISH', 'DISPLACEMENT_BEAR'}
+
+        found = [k for k, v in detected.items() if v.get('detected')]
+        if not found:
+            return [], 0.0, None
+
+        max_conf = max(detected[k]['confidence'] for k in found)
+        bull_count = sum(1 for p in found if p in bull_patterns)
+        bear_count = sum(1 for p in found if p in bear_patterns)
+
+        direction = None
+        if bull_count > bear_count:
+            direction = 'bullish'
+        elif bear_count > bull_count:
+            direction = 'bearish'
+
+        return found, round(max_conf, 3), direction
+
+
 class PatternLearner:
     def __init__(self, memory: ExperienceMemory):
         self.memory = memory
@@ -863,48 +1074,89 @@ class PatternLearner:
         self._update_market_regime(symbol, features)
         self.save_patterns()
         
-    def get_trading_signal(self, symbol: str, current_features: Dict, df_ltf: Optional[pd.DataFrame] = None) -> Dict:
-        """Evaluate current market state and output Win Probability (AI Confidence) using Naive Bayes"""
-        # Detect patterns
+    def get_trading_signal(self, symbol: str, current_features: Dict,
+                           df_ltf: Optional[pd.DataFrame] = None,
+                           df_m5: Optional[pd.DataFrame] = None,
+                           df_h1: Optional[pd.DataFrame] = None) -> Dict:
+        """
+        Evaluate current market state and output Win Probability (AI Confidence).
+        Now integrates ChartPatternDetector for institutional SMC pattern recognition.
+        """
+        # ── 1. Legacy visual patterns (simple candle patterns) ───────────────
         visual_patterns = []
         if df_ltf is not None:
             visual_patterns = self.detect_visual_patterns(df_ltf)
-        pattern_str = "|".join(visual_patterns) if visual_patterns else "NONE"
-        
-        # 1. Unsupervised Cluster Regime Prediction
+
+        # ── 2. Advanced SMC chart pattern detection ───────────────────────────
+        smc_patterns = {}
+        smc_found = []
+        smc_confidence = 0.0
+        smc_direction = None
+        if df_ltf is not None:
+            try:
+                smc_patterns = ChartPatternDetector.detect(
+                    df_m1=df_ltf,
+                    df_m5=df_m5,
+                    df_h1=df_h1
+                )
+                smc_found, smc_confidence, smc_direction = ChartPatternDetector.get_summary(smc_patterns)
+            except Exception:
+                pass
+
+        # Merge all detected patterns for display
+        all_patterns = visual_patterns + smc_found
+        pattern_str = "|".join(all_patterns) if all_patterns else "NONE"
+
+        # ── 3. Unsupervised Cluster Regime Prediction ────────────────────────
         volatility = current_features.get('volatility', 0.0)
         price = current_features.get('price', 0.0)
         support = current_features.get('support', 0.0)
         atr_pct = current_features.get('atr_pct', 0.0)
-        
+
         state_point = np.array([
             float(volatility),
             float(abs(price - support) / (price + 1e-9)),
             float(atr_pct)
         ])
-        
         cluster_id = self.kmeans.predict(state_point)
-        
-        # 2. Supervised Win Probability Classification
+
+        # ── 4. Supervised Win Probability (Naive Bayes) ───────────────────────
         h1_bias = current_features.get('active_bias', 0)
         m15_sweep = current_features.get('liq_sweep_type', 0)
         m5_mss = current_features.get('mss_signal', 0)
         fvg_class = current_features.get('fvg_class', 'none')
-        
+        tf_aligned = current_features.get('tf_aligned', False)
+
         disc_feat = {
             'bias': 'BULLISH' if h1_bias == 1 else ('BEARISH' if h1_bias == -1 else 'NEUTRAL'),
             'setup': 'SHARP_TURN' if (m15_sweep != 0 and m5_mss != 0) else 'MSS_OR_SWEEP',
             'fvg': str(fvg_class).upper(),
-            'visual_patterns': pattern_str
+            'visual_patterns': pattern_str,
+            'tf_aligned': 'YES' if tf_aligned else 'NO'
         }
         cont_feat = {
             'volatility': float(volatility),
-            'atr_pct': float(atr_pct)
+            'atr_pct': float(atr_pct),
+            'smc_confidence': float(smc_confidence)
         }
-        
+
         win_prob = self.classifier.predict_probability(disc_feat, cont_feat)
-        
-        # Determine signal action based on win probability and bias direction
+
+        # ── 5. SMC pattern confidence boost/penalty ───────────────────────────
+        # If SMC patterns align with bias, boost win probability
+        if smc_direction == 'bullish' and h1_bias == 1:
+            win_prob = min(1.0, win_prob + smc_confidence * 0.15)
+        elif smc_direction == 'bearish' and h1_bias == -1:
+            win_prob = min(1.0, win_prob + smc_confidence * 0.15)
+        elif smc_direction is not None and smc_direction != ('bullish' if h1_bias == 1 else 'bearish'):
+            # Conflicting: slightly penalize
+            win_prob = max(0.0, win_prob - smc_confidence * 0.10)
+
+        # 6-TF alignment boost
+        if tf_aligned:
+            win_prob = min(1.0, win_prob * 1.05)
+
+        # ── 6. Signal action ──────────────────────────────────────────────────
         signal_action = 'HOLD'
         adjustment = 0.0
         if win_prob >= 0.58:
@@ -912,21 +1164,26 @@ class PatternLearner:
                 signal_action = 'BUY'
             elif h1_bias == -1:
                 signal_action = 'SELL'
-            adjustment = float((win_prob - 0.5) * 0.8) # positive boost
+            adjustment = float((win_prob - 0.5) * 0.8)
         elif win_prob <= 0.42:
             if h1_bias == 1:
                 signal_action = 'SELL'
             elif h1_bias == -1:
                 signal_action = 'BUY'
-            adjustment = float((win_prob - 0.5) * 0.8) # negative filter reduction
-            
+            adjustment = float((win_prob - 0.5) * 0.8)
+
         return {
             'signal': signal_action,
-            'confidence': win_prob,
+            'confidence': round(win_prob, 4),
             'adjustment': adjustment,
             'cluster_id': cluster_id,
-            'detected_patterns': visual_patterns
+            'detected_patterns': all_patterns,
+            'smc_patterns': smc_found,
+            'smc_confidence': smc_confidence,
+            'smc_direction': smc_direction,
+            'pattern_details': {k: v for k, v in smc_patterns.items() if v.get('detected')}
         }
+
 
     def _update_market_regime(self, symbol: str, features: Dict):
         volatility = features.get('volatility', 0.0)

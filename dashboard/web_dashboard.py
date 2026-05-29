@@ -80,16 +80,23 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 pwh = self.engine.pwh_cache.get(symbol, None)
                 pwl = self.engine.pwl_cache.get(symbol, None)
 
+                # CRT zone from CRT+TBS strategy metadata
+                crt_meta = analysis.get("crt_metadata", {})
+                ob_meta = analysis.get("ob_metadata", {})
                 levels = {
                     "support": analysis.get("support"),
                     "resistance": analysis.get("resistance"),
-                    "fib_50": fib_meta.get("fib_50"),
-                    "fib_618": fib_meta.get("fib_618"),
-                    "fib_786": fib_meta.get("fib_786"),
+                    # CRT zone (replaces fib levels)
+                    "crt_high": crt_meta.get("crt_high"),
+                    "crt_low": crt_meta.get("crt_low"),
+                    # Order Block zone
+                    "ob_top": ob_meta.get("ob_top"),
+                    "ob_bottom": ob_meta.get("ob_bottom"),
+                    "ob_direction": ob_meta.get("ob_direction"),
+                    # Volume Profile
                     "poc": fib_meta.get("poc"),
                     "val": fib_meta.get("val"),
                     "vah": fib_meta.get("vah"),
-                    "order_blocks": fib_meta.get("order_blocks", {}),
                     "pdh": pdh,
                     "pdl": pdl,
                     "pwh": pwh,
@@ -510,6 +517,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
             skipped_stats = getattr(self.engine, 'skipped_stats', {})
 
+            # Always compute active sessions at top level (fixes session display bug)
+            active_sessions = []
+            try:
+                active_sessions = self.engine.get_active_sessions()
+            except Exception:
+                pass
+
+            # Build 6-TF alignment states for dashboard panel
+            tf_alignment = {}
+            try:
+                tf_alignment = getattr(self.engine, '_last_tf_alignment', {})
+            except Exception:
+                pass
+
             return {
                 "account": account_data,
                 "settings": active_settings,
@@ -525,7 +546,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 "latency_ms": round(loop_latency, 1),
                 "spread": spread_data,
                 "prediction": prediction_data,
-                "skipped_stats": skipped_stats
+                "skipped_stats": skipped_stats,
+                "active_sessions": active_sessions,
+                "tf_alignment": tf_alignment
             }
         except Exception as e:
             logging.getLogger("PulseViper.WebDashboard").error(f"Error gathering status json: {e}")

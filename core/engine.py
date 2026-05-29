@@ -288,157 +288,226 @@ class AdvancedTradingEngine:
 
     def run_multi_timeframe_analysis(self, symbol: str) -> Optional[Dict]:
         """
-        Execute Multi-Timeframe Alignment:
-        - HTF (Bias): Trend bias determination
-        - Context (Sweep): Liquidity sweeps and session boundaries
-        - LTF (Entry): Structural entry shifts (MSS) and volume profiles
+        Full 6-Timeframe Cascade Analysis: D1 → H4 → H1 → M15 → M5 → M1
+
+        Cascade hierarchy:
+          D1  → Master Bias (bull/bear)
+          H4  → Trend Confirmation
+          H1  → Swing Structure (OB, FVG, sweep zones)
+          M15 → Session Liquidity Sweep
+          M5  → Order Flow & MSS
+          M1  → Entry Candle (TBS trigger, exact reversal level)
+
+        All modes use M1 for entry timing.
+        Mode (scalping/intraday/swing) controls RR ratio and cooldown only.
         """
         try:
-            # Get active strategy mode from settings manager
             trading_mode = settings_manager.get("trading_mode", "intraday").lower()
-            
-            # Set timeframes dynamically
-            if trading_mode == "scalping":
-                tf_htf = mt5.TIMEFRAME_H1
-                tf_context = mt5.TIMEFRAME_M5
-                tf_ltf = mt5.TIMEFRAME_M1
-            elif trading_mode == "swing":
-                tf_htf = mt5.TIMEFRAME_D1
-                tf_context = mt5.TIMEFRAME_H1
-                tf_ltf = mt5.TIMEFRAME_M15
-            else:  # intraday
-                tf_htf = mt5.TIMEFRAME_H1
-                tf_context = mt5.TIMEFRAME_M15
-                tf_ltf = mt5.TIMEFRAME_M5
-                
-            # 1. Fetch data
-            df_htf = fetch_ohlcv(symbol, tf_htf, n=500)
-            df_context = fetch_ohlcv(symbol, tf_context, n=300)
-            df_ltf = fetch_ohlcv(symbol, tf_ltf, n=200)
-            
-            if df_htf is None or df_context is None or df_ltf is None:
-                self.logger.warning(f"Failed to fetch multi-timeframe candles for {symbol}")
-                return None
-                
-            if len(df_htf) < 50 or len(df_context) < 50 or len(df_ltf) < 50:
-                self.logger.warning(f"Insufficient historical bars for {symbol}")
-                return None
-                
-            # 2. Compute SMC indicators on all timeframes
+            current_time = time.time()
             swing_window = settings_manager.get("smc_swing_window", 3)
-            htf_smc = SMCIndicators.compute_smc_features(df_htf, window=swing_window)
-            context_smc = SMCIndicators.compute_smc_features(df_context, window=swing_window)
-            ltf_smc = SMCIndicators.compute_smc_features(df_ltf, window=swing_window)
-            
-            latest_htf = htf_smc.iloc[-1]
-            latest_context = context_smc.iloc[-1]
-            latest_ltf = ltf_smc.iloc[-1]
-            
-            # Read lookback settings (auto-tuned by backtester grid optimizer)
-            _sweep_lb = settings_manager.get('smc_lookback_sweep', 20)
-            _mss_lb = settings_manager.get('smc_lookback_mss', 10)
-            _fvg_lb = settings_manager.get('smc_fvg_lookback', 5)
 
-            # Check recent sweeps on context timeframe
-            recent_context_sweeps = context_smc.iloc[-_sweep_lb:]
+            # ── 1. Fetch all 6 timeframes ──────────────────────────────────────────
+            # Use per-TF expiry cache to avoid redundant MT5 calls on fast loops
+            if not hasattr(self, '_tf_data_cache'):
+                self._tf_data_cache = {}
+            if not hasattr(self, '_tf_data_expiry'):
+                self._tf_data_expiry = {}
+
+            _tf_expiry_map = {
+                'D1': (mt5.TIMEFRAME_D1, 500, 3600),   # 1h TTL
+                'H4': (mt5.TIMEFRAME_H4, 300, 1200),   # 20min TTL
+                'H1': (mt5.TIMEFRAME_H1, 300, 600),    # 10min TTL
+                'M15': (mt5.TIMEFRAME_M15, 200, 60),   # 1min TTL
+                'M5': (mt5.TIMEFRAME_M5, 200, 30),     # 30s TTL
+                'M1': (mt5.TIMEFRAME_M1, 200, 15),     # 15s TTL
+            }
+
+            dfs = {}
+            for tf_name, (tf_const, bars, ttl) in _tf_expiry_map.items():
+                cache_key = f"{symbol}_{tf_name}"
+                if cache_key in self._tf_data_expiry and current_time < self._tf_data_expiry[cache_key]:
+                    dfs[tf_name] = self._tf_data_cache.get(cache_key)
+                else:
+                    df = fetch_ohlcv(symbol, tf_const, n=bars)
+                    if df is not None and len(df) >= 20:
+                        self._tf_data_cache[cache_key] = df
+                        self._tf_data_expiry[cache_key] = current_time + ttl
+                    dfs[tf_name] = self._tf_data_cache.get(cache_key)
+
+            df_d1  = dfs.get('D1')
+            df_h4  = dfs.get('H4')
+            df_h1  = dfs.get('H1')
+            df_m15 = dfs.get('M15')
+            df_m5  = dfs.get('M5')
+            df_m1  = dfs.get('M1')
+
+            # M1 is mandatory for entry, H1 for bias minimum
+            if df_m1 is None or len(df_m1) < 50:
+                self.logger.warning(f"Insufficient M1 bars for {symbol}")
+                return None
+            if df_h1 is None or len(df_h1) < 50:
+                self.logger.warning(f"Insufficient H1 bars for {symbol}")
+                return None
+
+            # ── 2. Compute SMC indicators on all available timeframes ───────────────
+            smc = {}
+            for tf_name, df in [('D1', df_d1), ('H4', df_h4), ('H1', df_h1),
+                                  ('M15', df_m15), ('M5', df_m5), ('M1', df_m1)]:
+                if df is not None and len(df) >= 20:
+                    try:
+                        smc[tf_name] = SMCIndicators.compute_smc_features(df, window=swing_window)
+                    except Exception:
+                        smc[tf_name] = None
+                else:
+                    smc[tf_name] = None
+
+            def get_latest(tf_name):
+                s = smc.get(tf_name)
+                return s.iloc[-1] if s is not None and len(s) > 0 else None
+
+            latest_d1  = get_latest('D1')
+            latest_h4  = get_latest('H4')
+            latest_h1  = get_latest('H1')
+            latest_m15 = get_latest('M15')
+            latest_m5  = get_latest('M5')
+            latest_m1  = get_latest('M1')
+
+            # ── 3. Build 6-TF bias cascade ─────────────────────────────────────────
+            def bias_val(row):
+                if row is None:
+                    return 0
+                return int(row.get('active_bias', 0))
+
+            d1_bias  = bias_val(latest_d1)
+            h4_bias  = bias_val(latest_h4)
+            h1_bias  = bias_val(latest_h1)
+            m15_bias = bias_val(latest_m15)
+            m5_bias  = bias_val(latest_m5)
+            m1_bias  = bias_val(latest_m1)
+
+            # Master HTF bias: D1 + H4 must agree, fallback to H1 if D1 unavailable
+            if latest_d1 is not None and latest_h4 is not None:
+                if d1_bias == h4_bias and d1_bias != 0:
+                    htf_bias = d1_bias
+                elif d1_bias != 0:
+                    htf_bias = d1_bias  # D1 wins if H4 is neutral
+                else:
+                    htf_bias = h4_bias
+            else:
+                htf_bias = h1_bias  # fallback for scalping without D1
+
+            # ── 4. Liquidity sweep on M15/H1 ──────────────────────────────────────
+            _sweep_lb = settings_manager.get('smc_lookback_sweep', 20)
             sweep_type = 0
             sweep_level = np.nan
-            
-            # Scan backward to get the most recent sweep
-            for _, row in reversed(list(recent_context_sweeps.iterrows())):
-                if row['liq_sweep_type'] != 0:
-                    sweep_type = int(row['liq_sweep_type'])
-                    sweep_level = float(row['liq_sweep_level'])
+
+            for ctx_name in ['M15', 'H1']:
+                ctx_smc = smc.get(ctx_name)
+                if ctx_smc is not None and len(ctx_smc) >= _sweep_lb:
+                    recent = ctx_smc.iloc[-_sweep_lb:]
+                    for _, row in reversed(list(recent.iterrows())):
+                        if row['liq_sweep_type'] != 0:
+                            sweep_type = int(row['liq_sweep_type'])
+                            sweep_level = float(row['liq_sweep_level'])
+                            break
+                if sweep_type != 0:
                     break
-                    
-            # Check recent MSS on LTF
-            recent_ltf_mss = ltf_smc.iloc[-_mss_lb:]
+
+            # ── 5. MSS signal on M5, fallback to M1 ───────────────────────────────
+            _mss_lb = settings_manager.get('smc_lookback_mss', 10)
             mss_signal = 0
-            # Scan backward to get the most recent MSS
-            for _, row in reversed(list(recent_ltf_mss.iterrows())):
-                if row['mss_signal'] != 0:
-                    mss_signal = int(row['mss_signal'])
+            for mss_name in ['M5', 'M1']:
+                mss_smc = smc.get(mss_name)
+                if mss_smc is not None and len(mss_smc) >= _mss_lb:
+                    recent = mss_smc.iloc[-_mss_lb:]
+                    for _, row in reversed(list(recent.iterrows())):
+                        if row['mss_signal'] != 0:
+                            mss_signal = int(row['mss_signal'])
+                            break
+                if mss_signal != 0:
                     break
 
-            # FVG class: check last N bars for any non-rfvg FVG
-            recent_fvg = ltf_smc.iloc[-_fvg_lb:]
-            non_rfvg_rows = recent_fvg[(recent_fvg['fvg_class'] != 'none') & (recent_fvg['fvg_class'] != 'rfvg')] if len(recent_fvg) > 0 else pd.DataFrame()
-            if len(non_rfvg_rows) > 0:
-                best_fvg_row = non_rfvg_rows.iloc[-1]
-                fvg_class = best_fvg_row['fvg_class']
-                fvg_type = best_fvg_row['fvg_type']
-                fvg_top = best_fvg_row['fvg_top']
-                fvg_bottom = best_fvg_row['fvg_bottom']
+            # ── 6. FVG on M1 (execution level) ────────────────────────────────────
+            _fvg_lb = settings_manager.get('smc_fvg_lookback', 5)
+            m1_smc = smc.get('M1')
+            if m1_smc is not None and len(m1_smc) > 0:
+                recent_fvg = m1_smc.iloc[-_fvg_lb:]
+                non_rfvg_rows = recent_fvg[
+                    (recent_fvg['fvg_class'] != 'none') &
+                    (recent_fvg['fvg_class'] != 'rfvg')
+                ] if len(recent_fvg) > 0 else pd.DataFrame()
+                if len(non_rfvg_rows) > 0:
+                    best_fvg_row = non_rfvg_rows.iloc[-1]
+                    fvg_class = best_fvg_row['fvg_class']
+                    fvg_type = best_fvg_row['fvg_type']
+                    fvg_top = best_fvg_row['fvg_top']
+                    fvg_bottom = best_fvg_row['fvg_bottom']
+                else:
+                    fvg_class = latest_m1['fvg_class'] if latest_m1 is not None else 'none'
+                    fvg_type = latest_m1['fvg_type'] if latest_m1 is not None else 'none'
+                    fvg_top = latest_m1['fvg_top'] if latest_m1 is not None else np.nan
+                    fvg_bottom = latest_m1['fvg_bottom'] if latest_m1 is not None else np.nan
             else:
-                fvg_class = latest_ltf['fvg_class']
-                fvg_type = latest_ltf['fvg_type']
-                fvg_top = latest_ltf['fvg_top']
-                fvg_bottom = latest_ltf['fvg_bottom']
+                fvg_class, fvg_type, fvg_top, fvg_bottom = 'none', 'none', np.nan, np.nan
 
-            # Calculate and cache technical sentiment for all 7 timeframes
-            tfs = {
-                'd1': mt5.TIMEFRAME_D1,
-                'h4': mt5.TIMEFRAME_H4,
-                'h1': mt5.TIMEFRAME_H1,
-                'm30': mt5.TIMEFRAME_M30,
-                'm15': mt5.TIMEFRAME_M15,
-                'm5': mt5.TIMEFRAME_M5,
-                'm1': mt5.TIMEFRAME_M1
+            # ── 7. LTF reference (always M1) ──────────────────────────────────────
+            # For ATR, support/resistance, volatility — use M1 for execution precision
+            ref_ltf = latest_m1 if latest_m1 is not None else (latest_m5 if latest_m5 is not None else latest_h1)
+            df_ltf = df_m1 if df_m1 is not None else df_m5
+
+            # ── 8. Build 6-TF alignment state for dashboard ───────────────────────
+            def bias_label(b):
+                return "BULLISH" if b == 1 else ("BEARISH" if b == -1 else "NEUTRAL")
+
+            tf_alignment = {
+                'D1':  {'bias': d1_bias,  'label': bias_label(d1_bias)},
+                'H4':  {'bias': h4_bias,  'label': bias_label(h4_bias)},
+                'H1':  {'bias': h1_bias,  'label': bias_label(h1_bias)},
+                'M15': {'bias': m15_bias, 'label': 'SWEEP↑' if sweep_type == 1 else ('SWEEP↓' if sweep_type == -1 else bias_label(m15_bias))},
+                'M5':  {'bias': m5_bias,  'label': 'MSS↑' if mss_signal == 1 else ('MSS↓' if mss_signal == -1 else bias_label(m5_bias))},
+                'M1':  {'bias': m1_bias,  'label': 'TBS✅' if mss_signal != 0 and sweep_type != 0 else bias_label(m1_bias)},
+                'htf_bias': htf_bias,
+                'aligned': (htf_bias != 0 and sweep_type != 0 and mss_signal != 0 and
+                           htf_bias == (1 if sweep_type > 0 else -1) and
+                           htf_bias == (1 if mss_signal > 0 else -1))
             }
-            
-            # Map current tf_htf, tf_context, tf_ltf to their dataframes to optimize fetching
-            mode_tfs = {
-                tf_htf: df_htf,
-                tf_context: df_context,
-                tf_ltf: df_ltf
-            }
-            
-            # Expiration-based sentiment cache to prevent blocking MT5 calls
-            current_time = time.time()
+            self._last_tf_alignment = tf_alignment
+
+            # ── 9. Technical sentiment cache ──────────────────────────────────────
             if not hasattr(self, 'sentiment_cache_expiry'):
                 self.sentiment_cache_expiry = {}
-                
-            tf_expirations = {
-                'd1': 3600,   # 1 hour
-                'h4': 1800,   # 30 mins
-                'h1': 600,    # 10 mins
-                'm30': 300,   # 5 mins
-                'm15': 60,    # 1 min
-                'm5': 30,     # 30 secs
-                'm1': 15      # 15 secs
+
+            tf_sentiment_map = {
+                'd1': (mt5.TIMEFRAME_D1, df_d1, 3600),
+                'h4': (mt5.TIMEFRAME_H4, df_h4, 1200),
+                'h1': (mt5.TIMEFRAME_H1, df_h1, 600),
+                'm15': (mt5.TIMEFRAME_M15, df_m15, 60),
+                'm5': (mt5.TIMEFRAME_M5, df_m5, 30),
+                'm1': (mt5.TIMEFRAME_M1, df_m1, 15),
             }
-            
+
             _temp_sentiment = dict(self.sentiment_cache)
             sentiment_changed = False
-            for tf_name, tf_const in tfs.items():
+            for tf_name, (tf_const, df_tf, ttl) in tf_sentiment_map.items():
                 cache_key = f"{symbol}_{tf_name}"
                 if cache_key in self.sentiment_cache_expiry and current_time < self.sentiment_cache_expiry[cache_key]:
                     continue
-                    
-                if tf_const in mode_tfs:
-                    df_tf = mode_tfs[tf_const]
-                else:
-                    df_tf = fetch_ohlcv(symbol, tf_const, n=100)
-                
                 if df_tf is not None and len(df_tf) >= 50:
                     _temp_sentiment[tf_name] = sentiment_analyzer.calculate_technical_sentiment(df_tf)
-                    self.sentiment_cache_expiry[cache_key] = current_time + tf_expirations.get(tf_name, 300)
+                    self.sentiment_cache_expiry[cache_key] = current_time + ttl
                     sentiment_changed = True
-                else:
-                    _temp_sentiment[tf_name] = self.sentiment_cache.get(tf_name, 0.0)
-                    
+
             if sentiment_changed:
                 self.sentiment_cache = _temp_sentiment
                 try:
-                    import os
                     import json
                     cache_path = os.path.join("configs", "sentiment_cache.json")
                     with open(cache_path, "w") as f:
                         json.dump(self.sentiment_cache, f)
-                except Exception as e:
+                except Exception:
                     pass
 
-            # Dynamic caching of daily/weekly levels to reduce MT5 calls
+            # ── 10. Daily/weekly key levels cache ─────────────────────────────────
             if not hasattr(self, '_last_daily_levels_time'):
                 self._last_daily_levels_time = {}
             if not hasattr(self, 'pdh_cache'):
@@ -446,18 +515,23 @@ class AdvancedTradingEngine:
                 self.pdl_cache = {}
                 self.pwh_cache = {}
                 self.pwl_cache = {}
-                
+
             last_lvl_time = self._last_daily_levels_time.get(symbol, 0)
             if current_time - last_lvl_time >= 900 or symbol not in self.pdh_cache:
                 try:
-                    rates_d1 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, 2)
-                    if rates_d1 is not None and len(rates_d1) >= 2:
-                        self.pdh_cache[symbol] = float(rates_d1[-2]['high'])
-                        self.pdl_cache[symbol] = float(rates_d1[-2]['low'])
+                    # Use D1 data already fetched if available
+                    if df_d1 is not None and len(df_d1) >= 2:
+                        self.pdh_cache[symbol] = float(df_d1.iloc[-2]['high'])
+                        self.pdl_cache[symbol] = float(df_d1.iloc[-2]['low'])
                     else:
-                        self.pdh_cache[symbol] = np.nan
-                        self.pdl_cache[symbol] = np.nan
-                        
+                        rates_d1 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, 2)
+                        if rates_d1 is not None and len(rates_d1) >= 2:
+                            self.pdh_cache[symbol] = float(rates_d1[-2]['high'])
+                            self.pdl_cache[symbol] = float(rates_d1[-2]['low'])
+                        else:
+                            self.pdh_cache[symbol] = np.nan
+                            self.pdl_cache[symbol] = np.nan
+
                     rates_w1 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_W1, 0, 2)
                     if rates_w1 is not None and len(rates_w1) >= 2:
                         self.pwh_cache[symbol] = float(rates_w1[-2]['high'])
@@ -465,131 +539,151 @@ class AdvancedTradingEngine:
                     else:
                         self.pwh_cache[symbol] = np.nan
                         self.pwl_cache[symbol] = np.nan
-                        
                     self._last_daily_levels_time[symbol] = current_time
                 except Exception as ex:
-                    self.logger.warning(f"Failed to fetch daily levels for cache: {ex}")
+                    self.logger.warning(f"Failed to fetch daily levels: {ex}")
 
-            # Calculate and cache volume metrics at most once per 10 seconds to optimize CPU
+            # ── 11. Volume metrics ─────────────────────────────────────────────────
             if not hasattr(self, '_last_volume_calc_time'):
                 self._last_volume_calc_time = {}
-            if not hasattr(self, 'volume_cache'):
-                self.volume_cache = {"rvol": 1.0, "buy_pressure": 50.0, "sell_pressure": 50.0, "profile": {}}
-                
+
             last_vol_time = self._last_volume_calc_time.get(symbol, 0)
             if current_time - last_vol_time >= 10.0 or not self.volume_cache or "rvol" not in self.volume_cache:
                 latest_rvol = VolumeAnalyzer.calculate_rvol_latest(df_ltf, period=20)
                 latest_buy_press, latest_sell_press = VolumeAnalyzer.calculate_buying_selling_pressure_latest(df_ltf)
-                
                 total_press = latest_buy_press + latest_sell_press
-                if total_press > 0:
-                    buy_pct = (latest_buy_press / total_press) * 100.0
-                    sell_pct = (latest_sell_press / total_press) * 100.0
-                else:
-                    buy_pct = 50.0
-                    sell_pct = 50.0
-                    
+                buy_pct = (latest_buy_press / total_press * 100.0) if total_press > 0 else 50.0
+                sell_pct = (latest_sell_press / total_press * 100.0) if total_press > 0 else 50.0
                 vp_profile = VolumeAnalyzer.calculate_volume_profile(df_ltf, lookback=100, bins=20)
-                
                 self.volume_cache = {
-                    "rvol": latest_rvol,
-                    "buy_pressure": buy_pct,
-                    "sell_pressure": sell_pct,
-                    "profile": vp_profile
+                    "rvol": latest_rvol, "buy_pressure": buy_pct,
+                    "sell_pressure": sell_pct, "profile": vp_profile
                 }
                 self._last_volume_calc_time[symbol] = current_time
 
-            # Current bid/ask
+            # ── 12. Current tick ───────────────────────────────────────────────────
             tick = mt5.symbol_info_tick(symbol)
             if not tick:
                 return None
-                
-            # Inject daily/weekly levels into the sentiment payload
+
             sentiment_payload = dict(self.sentiment_cache)
             sentiment_payload['pdh'] = self.pdh_cache.get(symbol, np.nan)
             sentiment_payload['pdl'] = self.pdl_cache.get(symbol, np.nan)
             sentiment_payload['pwh'] = self.pwh_cache.get(symbol, np.nan)
             sentiment_payload['pwl'] = self.pwl_cache.get(symbol, np.nan)
-            
-            # Get active strategy
+
+            # ── 13. Strategy evaluation with full 6-TF context ───────────────────
             active_strategy = settings_manager.get("active_strategy", "both")
             if active_strategy == "fib_retest":
                 active_strategy = "both"
-            
+
             fib_action, fib_regime, fib_sl, fib_tp, fib_metadata = None, "sideway", 0.0, 0.0, {}
             crt_action, crt_regime, crt_sl, crt_tp, crt_metadata = None, "sideway", 0.0, 0.0, {}
-            
-            # Evaluate Candle Range Theory (CRT) + Turtle Body Soup (TBS) Strategy
+
             if active_strategy in ["crt_tbs", "both"]:
                 crt_action, crt_regime, crt_sl, crt_tp, crt_metadata = CrtTbsStrategy.evaluate_crt_tbs(
-                    df_context=df_context,
+                    df_d1=df_d1,
+                    df_h4=df_h4,
+                    df_h1=df_h1,
+                    df_m15=df_m15,
+                    df_m5=df_m5,
+                    df_m1=df_m1,
                     current_price=tick.bid,
-                    atr=latest_ltf['atr'],
+                    atr=float(ref_ltf['atr']) if ref_ltf is not None else 1.0,
                     volume_cache=self.volume_cache,
                     sentiment_cache=sentiment_payload,
-                    htf_bias=latest_htf['active_bias'],
-                    df_ltf=df_ltf
+                    htf_bias=htf_bias
                 )
-            
-            # Update pattern learner's market regimes state (upper case)
-            active_regime = crt_regime if active_strategy == "crt_tbs" else ("bullish" if latest_htf['active_bias'] == 1 else ("bearish" if latest_htf['active_bias'] == -1 else "sideway"))
+
+            active_regime = crt_regime if active_strategy == "crt_tbs" else (
+                "bullish" if htf_bias == 1 else ("bearish" if htf_bias == -1 else "sideway")
+            )
             self.pattern_learner.market_regimes[symbol] = {
                 'regime': active_regime.upper(),
                 'timestamp': str(pd.Timestamp.now()),
-                'volatility': latest_ltf['volatility'],
-                'atr_pct': latest_ltf['atr_pct']
+                'volatility': float(ref_ltf['volatility']) if ref_ltf is not None else 0.0,
+                'atr_pct': float(ref_ltf['atr_pct']) if ref_ltf is not None else 0.0
             }
-                
+
+            # Extract OB metadata for dashboard chart
+            ob_meta = {}
+            try:
+                if latest_h1 is not None:
+                    ob_top = float(latest_h1.get('resistance', np.nan))
+                    ob_bottom = float(latest_h1.get('support', np.nan))
+                    if not np.isnan(ob_top) and not np.isnan(ob_bottom):
+                        ob_meta = {
+                            'ob_top': ob_top,
+                            'ob_bottom': ob_bottom,
+                            'ob_direction': 'bullish' if htf_bias == 1 else 'bearish'
+                        }
+            except Exception:
+                pass
+
             analysis = {
                 'symbol': symbol,
                 'price': tick.bid,
                 'bid': tick.bid,
                 'ask': tick.ask,
-                'h1_bias': latest_htf['active_bias'],
+                # 6-TF bias states
+                'htf_bias': htf_bias,
+                'd1_bias': d1_bias,
+                'h4_bias': h4_bias,
+                'h1_bias': h1_bias,
+                'm15_bias': m15_bias,
+                'm5_bias': m5_bias,
+                'm1_bias': m1_bias,
+                # Sweep/MSS signals
                 'm15_sweep_type': sweep_type,
-                'm15_sweep_level': sweep_level,
+                'm15_sweep_level': float(sweep_level) if not np.isnan(sweep_level) else 0.0,
                 'm5_mss_signal': mss_signal,
+                # FVG (M1-level)
                 'm5_fvg_class': fvg_class,
                 'm5_fvg_type': fvg_type,
-                'm5_fvg_top': fvg_top,
-                'm5_fvg_bottom': fvg_bottom,
-                'support': latest_ltf['support'],
-                'resistance': latest_ltf['resistance'],
-                'volatility': latest_ltf['volatility'],
-                'atr_pct': latest_ltf['atr_pct'],
-                'atr': latest_ltf['atr'],
+                'm5_fvg_top': float(fvg_top) if not np.isnan(fvg_top) else 0.0,
+                'm5_fvg_bottom': float(fvg_bottom) if not np.isnan(fvg_bottom) else 0.0,
+                # Technical levels from M1
+                'support': float(ref_ltf['support']) if ref_ltf is not None else 0.0,
+                'resistance': float(ref_ltf['resistance']) if ref_ltf is not None else 0.0,
+                'volatility': float(ref_ltf['volatility']) if ref_ltf is not None else 0.0,
+                'atr_pct': float(ref_ltf['atr_pct']) if ref_ltf is not None else 0.0,
+                'atr': float(ref_ltf['atr']) if ref_ltf is not None else 1.0,
                 'hour': datetime.now(timezone.utc).hour,
-                'fib_action': fib_action,
-                'fib_regime': fib_regime,
-                'fib_sl': fib_sl,
-                'fib_tp': fib_tp,
-                'fib_metadata': fib_metadata,
-                'crt_action': crt_action,
-                'crt_regime': crt_regime,
-                'crt_sl': crt_sl,
-                'crt_tp': crt_tp,
-                'crt_metadata': crt_metadata,
-                'df_ltf': df_ltf,
+                # Strategy outputs
+                'fib_action': fib_action, 'fib_regime': fib_regime,
+                'fib_sl': fib_sl, 'fib_tp': fib_tp, 'fib_metadata': fib_metadata,
+                'crt_action': crt_action, 'crt_regime': crt_regime,
+                'crt_sl': crt_sl, 'crt_tp': crt_tp, 'crt_metadata': crt_metadata,
+                'ob_metadata': ob_meta,
+                # Dataframe references
+                'df_ltf': df_m1,  # always M1 for entry
+                'df_m5': df_m5,
+                'df_h1': df_h1,
+                'df_h4': df_h4,
+                'df_d1': df_d1,
+                'tf_alignment': tf_alignment,
                 'features': {
-                    'active_bias': latest_htf['active_bias'],
+                    'active_bias': htf_bias,
+                    'd1_bias': d1_bias,
+                    'h4_bias': h4_bias,
+                    'h1_bias': h1_bias,
                     'liq_sweep_type': sweep_type,
                     'mss_signal': mss_signal,
                     'fvg_class': fvg_class,
-                    'support': latest_ltf['support'],
-                    'resistance': latest_ltf['resistance'],
-                    'atr_pct': latest_ltf['atr_pct'],
-                    'volatility': latest_ltf['volatility'],
+                    'support': float(ref_ltf['support']) if ref_ltf is not None else 0.0,
+                    'resistance': float(ref_ltf['resistance']) if ref_ltf is not None else 0.0,
+                    'atr_pct': float(ref_ltf['atr_pct']) if ref_ltf is not None else 0.0,
+                    'volatility': float(ref_ltf['volatility']) if ref_ltf is not None else 0.0,
                     'hour': datetime.now(timezone.utc).hour,
-                    'price': tick.bid
+                    'price': tick.bid,
+                    'tf_aligned': tf_alignment.get('aligned', False)
                 }
             }
-            
-            # Dynamic broker Adaptation (only on first run or if not configured)
+
+            # ── 14. Broker profile (once only) ────────────────────────────────────
             if not getattr(self, '_broker_profile_set', False):
                 from utils.symbol_manager import symbol_manager
                 profile = symbol_manager.get_broker_profile(symbol)
-                
-                # Check if user has explicitly customized max_spread_points in the config file
                 has_custom_setting = False
                 try:
                     import json
@@ -600,16 +694,16 @@ class AdvancedTradingEngine:
                                 has_custom_setting = True
                 except Exception as e:
                     self.logger.error(f"Error checking settings file: {e}")
-
                 if not has_custom_setting:
                     settings_manager.set("max_spread_points", profile["max_spread_points"])
                 self._broker_profile_set = True
-            
+
             return analysis
         except Exception as e:
-            self.logger.error(f"Error during MTF analysis: {e}")
+            self.logger.error(f"Error during 6-TF analysis: {e}")
             traceback.print_exc()
             return None
+
 
     def evaluate_entry_rules(self, analysis: Dict) -> Optional[Tuple[str, float, float, str]]:
         """
@@ -633,7 +727,7 @@ class AdvancedTradingEngine:
         ask = analysis['ask']
         atr = analysis['atr']
         
-        h1_bias = analysis['h1_bias']
+        h1_bias = analysis.get('htf_bias', analysis.get('h1_bias', 0))  # use master HTF bias
         m15_sweep = analysis['m15_sweep_type']
         m5_mss = analysis['m5_mss_signal']
         fvg_class = analysis['m5_fvg_class']
@@ -657,7 +751,13 @@ class AdvancedTradingEngine:
         rr_ratio = settings_manager.get("min_rr_ratio", rr_ratio)
 
         # Get AI signal confidence/adjustment for logs only
-        ai_signal = self.pattern_learner.get_trading_signal(symbol, analysis['features'], df_ltf=analysis.get('df_ltf'))
+        ai_signal = self.pattern_learner.get_trading_signal(
+            symbol,
+            analysis['features'],
+            df_ltf=analysis.get('df_ltf'),
+            df_m5=analysis.get('df_m5'),
+            df_h1=analysis.get('df_h1')
+        )
         confidence = ai_signal.get('confidence', 0.5)
         adjustment = ai_signal.get('adjustment', 0.0)
 
@@ -945,29 +1045,34 @@ class AdvancedTradingEngine:
             self.logger.info(f"🧠 Closed Position Learnt: {pos.symbol} {pos.action} Ticket #{pos.id} closed due to {pos.close_reason} | PnL: ${pos.pnl:.2f}")
 
     def get_prediction_data(self, symbol: str) -> dict:
-        """Return next predicted trade setup, current price and session info."""
+        """Return next predicted trade setup, current price, sessions, and 6-TF alignment info."""
         try:
             analysis = self.cached_analysis.get(symbol)
             if not analysis:
                 return {}
-            
+
             tick = mt5.symbol_info_tick(symbol)
             bid = tick.bid if tick else 0.0
             ask = tick.ask if tick else 0.0
-            
-            # Run AI prediction unconditionally to get patterns and cluster regime
-            ai_signal = self.pattern_learner.get_trading_signal(symbol, analysis.get('features', {}), df_ltf=analysis.get('df_ltf'))
-            
+
+            # Run AI prediction with all available TF dataframes
+            ai_signal = self.pattern_learner.get_trading_signal(
+                symbol,
+                analysis.get('features', {}),
+                df_ltf=analysis.get('df_ltf'),
+                df_m5=analysis.get('df_m5'),
+                df_h1=analysis.get('df_h1')
+            )
+
             detected_patterns = ai_signal.get('detected_patterns', [])
+            smc_patterns = ai_signal.get('smc_patterns', [])
+
             if not detected_patterns:
-                # Construct structural regime description based on current market structure
-                fib_regime = analysis.get('fib_regime', 'sideway').upper()
-                h1_bias = analysis.get('h1_bias', 0)
+                htf_bias = analysis.get('htf_bias', analysis.get('h1_bias', 0))
                 m15_sweep = analysis.get('m15_sweep_type', 0)
                 m5_mss = analysis.get('m5_mss_signal', 0)
                 fvg_class = str(analysis.get('m5_fvg_class', 'none')).upper()
-                
-                # Check for specific regimes
+
                 if m15_sweep == 1 and m5_mss == 1:
                     detected_patterns = ["BULLISH REVERSAL SWEEP"]
                 elif m15_sweep == -1 and m5_mss == -1:
@@ -985,9 +1090,17 @@ class AdvancedTradingEngine:
                 elif fvg_class == "PFVG":
                     detected_patterns = ["BEARISH FVG ENTRY SCAN"]
                 else:
-                    bias_str = "BULLISH" if h1_bias > 0 else ("BEARISH" if h1_bias < 0 else "NEUTRAL")
-                    detected_patterns = [f"{bias_str} {fib_regime} REGIME"]
-            
+                    bias_str = "BULLISH" if htf_bias > 0 else ("BEARISH" if htf_bias < 0 else "NEUTRAL")
+                    detected_patterns = [f"{bias_str} REGIME SCAN"]
+
+            # Get CRT metadata from crt_metadata if available
+            crt_meta = analysis.get('crt_metadata', {})
+            crt_low = crt_meta.get('crt_low', analysis.get('crt_low', 0.0))
+            crt_high = crt_meta.get('crt_high', analysis.get('crt_high', 0.0))
+
+            # Get 6-TF alignment from analysis (set by run_multi_timeframe_analysis)
+            tf_alignment = analysis.get('tf_alignment', getattr(self, '_last_tf_alignment', {}))
+
             result = {
                 'symbol': symbol,
                 'bid': bid,
@@ -1001,15 +1114,27 @@ class AdvancedTradingEngine:
                 'confidence': 0.0,
                 'setup_type': None,
                 'detected_patterns': detected_patterns,
+                'smc_patterns': smc_patterns,
+                'smc_confidence': ai_signal.get('smc_confidence', 0.0),
                 'cluster_id': int(ai_signal.get('cluster_id', 0)),
                 'training_stats': self.pattern_learner.training_stats.get(symbol, {}),
+                # 6-TF bias data for dashboard panel
+                'htf_bias': int(analysis.get('htf_bias', analysis.get('h1_bias', 0))),
+                'd1_bias': int(analysis.get('d1_bias', 0)),
+                'h4_bias': int(analysis.get('h4_bias', 0)),
                 'h1_bias': int(analysis.get('h1_bias', 0)),
+                'm15_bias': int(analysis.get('m15_bias', 0)),
+                'm5_bias': int(analysis.get('m5_bias', 0)),
+                'm1_bias': int(analysis.get('m1_bias', 0)),
                 'm15_sweep_type': int(analysis.get('m15_sweep_type', 0)),
                 'm5_mss_signal': int(analysis.get('m5_mss_signal', 0)),
-                'crt_low': float(analysis.get('crt_low', 0.0)) if 'crt_low' in analysis else 0.0,
-                'crt_high': float(analysis.get('crt_high', 0.0)) if 'crt_high' in analysis else 0.0
+                'tf_alignment': tf_alignment,
+                # CRT zone metadata for chart
+                'crt_low': float(crt_low) if crt_low else 0.0,
+                'crt_high': float(crt_high) if crt_high else 0.0,
+                'ob_metadata': analysis.get('ob_metadata', {})
             }
-            
+
             setup = self.evaluate_entry_rules(analysis)
             if setup:
                 action, sl, tp, setup_type = setup
@@ -1027,6 +1152,8 @@ class AdvancedTradingEngine:
         except Exception as e:
             self.logger.error(f"get_prediction_data error: {e}")
             return {}
+
+
 
     def get_active_sessions(self) -> list:
         """Return list of currently active forex market sessions based on UTC hour."""

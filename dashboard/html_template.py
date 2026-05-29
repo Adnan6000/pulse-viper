@@ -1123,23 +1123,39 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             <span>Active Sessions</span>
                             <span id="pred-sessions">—</span>
                         </div>
-                        <div class="pred-row" style="flex-direction:column; align-items:flex-start; gap:4px; border-top: 1px solid rgba(255,255,255,0.05); padding-top:6px; margin-top:4px;">
-                            <span>Timeframe Alignment Status</span>
-                            <div style="display:flex; gap:8px; width:100%; margin-top:2px;">
-                                <div style="flex:1; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); border-radius:6px; padding:6px; text-align:center;">
-                                    <div style="font-size:9px; color:var(--text-muted);">HTF (H1)</div>
-                                    <div id="align-htf" style="font-size:10px; font-weight:800; margin-top:2px;">—</div>
+                        <div class="pred-row" style="flex-direction:column; align-items:flex-start; gap:6px; border-top: 1px solid rgba(255,255,255,0.05); padding-top:6px; margin-top:4px;">
+                            <div style="display:flex; align-items:center; justify-content:space-between; width:100%;">
+                                <span>6-TF Cascade</span>
+                                <span id="align-status" style="font-size:10px; font-weight:800; color:var(--text-muted);">⏳ SCANNING</span>
+                            </div>
+                            <div style="display:grid; grid-template-columns: repeat(6,1fr); gap:4px; width:100%; margin-top:2px;">
+                                <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); border-radius:6px; padding:5px 3px; text-align:center;">
+                                    <div style="font-size:9px; color:var(--text-muted); font-weight:700;">D1</div>
+                                    <div id="align-d1" style="font-size:9px; font-weight:800; margin-top:2px; transition:color 0.3s;">—</div>
                                 </div>
-                                <div style="flex:1; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); border-radius:6px; padding:6px; text-align:center;">
-                                    <div style="font-size:9px; color:var(--text-muted);">CTX (M5)</div>
-                                    <div id="align-ctx" style="font-size:10px; font-weight:800; margin-top:2px;">—</div>
+                                <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); border-radius:6px; padding:5px 3px; text-align:center;">
+                                    <div style="font-size:9px; color:var(--text-muted); font-weight:700;">H4</div>
+                                    <div id="align-h4" style="font-size:9px; font-weight:800; margin-top:2px; transition:color 0.3s;">—</div>
                                 </div>
-                                <div style="flex:1; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); border-radius:6px; padding:6px; text-align:center;">
-                                    <div style="font-size:9px; color:var(--text-muted);">LTF (M1)</div>
-                                    <div id="align-ltf" style="font-size:10px; font-weight:800; margin-top:2px;">—</div>
+                                <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); border-radius:6px; padding:5px 3px; text-align:center;">
+                                    <div style="font-size:9px; color:var(--text-muted); font-weight:700;">H1</div>
+                                    <div id="align-htf" style="font-size:9px; font-weight:800; margin-top:2px; transition:color 0.3s;">—</div>
+                                </div>
+                                <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); border-radius:6px; padding:5px 3px; text-align:center;">
+                                    <div style="font-size:9px; color:var(--text-muted); font-weight:700;">M15</div>
+                                    <div id="align-ctx" style="font-size:9px; font-weight:800; margin-top:2px; transition:color 0.3s;">—</div>
+                                </div>
+                                <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); border-radius:6px; padding:5px 3px; text-align:center;">
+                                    <div style="font-size:9px; color:var(--text-muted); font-weight:700;">M5</div>
+                                    <div id="align-m5" style="font-size:9px; font-weight:800; margin-top:2px; transition:color 0.3s;">—</div>
+                                </div>
+                                <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); border-radius:6px; padding:5px 3px; text-align:center;">
+                                    <div style="font-size:9px; color:var(--text-muted); font-weight:700;">M1</div>
+                                    <div id="align-ltf" style="font-size:9px; font-weight:800; margin-top:2px; transition:color 0.3s;">—</div>
                                 </div>
                             </div>
                         </div>
+
                         <div class="pred-row" style="flex-direction:column; align-items:flex-start; gap:4px; border-top: 1px solid rgba(255,255,255,0.05); padding-top:6px; margin-top:4px;">
                             <span>AI Training Diagnostics</span>
                             <span id="pred-train-stats" style="color:var(--color-green); font-size:10px; font-weight:700; word-break:break-all; text-align:left;">—</span>
@@ -2233,50 +2249,61 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('pred-lots').innerText = pred.lots ? pred.lots.toFixed(2) : '0.01';
                 document.getElementById('pred-confidence').innerText = pred.confidence ? `${pred.confidence}%` : '—';
 
-                // Active Sessions
-                const sessions = pred.active_sessions || [];
+                // Active Sessions — read from top-level (fixed: previously read from pred which could be empty)
+                const sessions = data.active_sessions || pred.active_sessions || [];
+                const sessionColors = {
+                    'Sydney': '#a855f7',
+                    'Asian': '#f59e0b',
+                    'London': '#3b82f6',
+                    'New York': '#10b981'
+                };
                 document.getElementById('pred-sessions').innerHTML = sessions.length > 0
-                    ? sessions.map(s => `<span style="background: rgba(0, 168, 255, 0.15); border: 1px solid rgba(0, 168, 255, 0.3); border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 700; color: var(--color-blue); margin-right: 4px;">${s}</span>`).join('')
-                    : '<span style="color:var(--text-muted);">NONE</span>';
+                    ? sessions.map(s => `<span style="background: rgba(${s==='Sydney'?'168,85,247':s==='Asian'?'245,158,11':s==='London'?'59,130,246':'16,185,129'}, 0.18); border: 1px solid rgba(${s==='Sydney'?'168,85,247':s==='Asian'?'245,158,11':s==='London'?'59,130,246':'16,185,129'}, 0.5); border-radius: 5px; padding: 3px 9px; font-size: 11px; font-weight: 700; color: ${sessionColors[s]||'var(--color-blue)'}; margin-right: 5px; text-shadow: 0 0 6px currentColor;">${s}</span>`).join('')
+                    : '<span style="color:var(--text-muted);">NO SESSION</span>';
 
-                // Timeframe Alignment
-                const h1Bias = pred.h1_bias !== undefined ? pred.h1_bias : 0;
-                const htfEl = document.getElementById('align-htf');
-                if (h1Bias > 0) {
-                    htfEl.innerText = 'BULLISH 🟢';
-                    htfEl.style.color = 'var(--color-green)';
-                } else if (h1Bias < 0) {
-                    htfEl.innerText = 'BEARISH 🔴';
-                    htfEl.style.color = 'var(--color-red)';
-                } else {
-                    htfEl.innerText = 'NEUTRAL ⚪';
-                    htfEl.style.color = 'var(--text-muted)';
-                }
+                // ── 6-TF Cascade Alignment Panel ─────────────────────────────
+                const tfAlign = pred.tf_alignment || data.tf_alignment || {};
+                const biasLabel = (b, custom) => {
+                    if (custom) return custom;
+                    if (b > 0) return 'BULLISH';
+                    if (b < 0) return 'BEARISH';
+                    return 'NEUTRAL';
+                };
+                const biasColor = (b, lbl) => {
+                    if (lbl && (lbl.includes('SWEEP') || lbl.includes('MSS') || lbl.includes('TBS'))) return '#ffd32a';
+                    if (b > 0) return 'var(--color-green)';
+                    if (b < 0) return 'var(--color-red)';
+                    return 'var(--text-muted)';
+                };
 
-                const ctxSweep = pred.m15_sweep_type !== undefined ? pred.m15_sweep_type : 0;
-                const ctxEl = document.getElementById('align-ctx');
-                if (ctxSweep > 0) {
-                    ctxEl.innerText = 'SWEEP (BULL) 🟡';
-                    ctxEl.style.color = '#ffd32a';
-                } else if (ctxSweep < 0) {
-                    ctxEl.innerText = 'SWEEP (BEAR) 🟡';
-                    ctxEl.style.color = '#ffd32a';
-                } else {
-                    ctxEl.innerText = 'STABLE ⚪';
-                    ctxEl.style.color = 'var(--text-muted)';
-                }
+                const tfsToUpdate = [
+                    {id: 'align-d1',  key: 'D1',  defaultBias: pred.d1_bias || 0},
+                    {id: 'align-h4',  key: 'H4',  defaultBias: pred.h4_bias || 0},
+                    {id: 'align-htf', key: 'H1',  defaultBias: pred.h1_bias || 0},
+                    {id: 'align-ctx', key: 'M15', defaultBias: pred.m15_bias || 0},
+                    {id: 'align-m5',  key: 'M5',  defaultBias: pred.m5_bias || 0},
+                    {id: 'align-ltf', key: 'M1',  defaultBias: pred.m1_bias || 0},
+                ];
 
-                const ltfMss = pred.m5_mss_signal !== undefined ? pred.m5_mss_signal : 0;
-                const ltfEl = document.getElementById('align-ltf');
-                if (ltfMss > 0) {
-                    ltfEl.innerText = 'MSS (BULL) 🟢';
-                    ltfEl.style.color = 'var(--color-green)';
-                } else if (ltfMss < 0) {
-                    ltfEl.innerText = 'MSS (BEAR) 🔴';
-                    ltfEl.style.color = 'var(--color-red)';
-                } else {
-                    ltfEl.innerText = 'SCANNING 🔍';
-                    ltfEl.style.color = 'var(--color-blue)';
+                tfsToUpdate.forEach(({id, key, defaultBias}) => {
+                    const el = document.getElementById(id);
+                    if (!el) return;
+                    const tfData = tfAlign[key] || {};
+                    const bias = tfData.bias !== undefined ? tfData.bias : defaultBias;
+                    const lbl = tfData.label || biasLabel(bias);
+                    el.innerText = lbl;
+                    el.style.color = biasColor(bias, lbl);
+                    // Add a subtle glow for active signals
+                    el.style.textShadow = bias !== 0 ? `0 0 8px ${biasColor(bias, lbl)}` : 'none';
+                });
+
+                // Alignment status indicator
+                const isAligned = tfAlign.aligned || false;
+                const alignStatusEl = document.getElementById('align-status');
+                if (alignStatusEl) {
+                    alignStatusEl.innerText = isAligned ? '✅ ALIGNED' : '⏳ SCANNING';
+                    alignStatusEl.style.color = isAligned ? 'var(--color-green)' : 'var(--text-muted)';
+                    alignStatusEl.style.textShadow = isAligned ? '0 0 10px var(--glow-green)' : 'none';
                 }
 
                 // Skip logs
