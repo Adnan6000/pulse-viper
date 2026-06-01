@@ -6,7 +6,7 @@ Halts trading entry if thresholds are violated.
 """
 import logging
 import sqlite3
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from typing import Tuple, Dict
 import MetaTrader5 as mt5
 from utils.settings_manager import settings_manager
@@ -121,7 +121,3 @@ class SafetyEngine:
             return False, reason
 
         return True, "Allowed"
-
-
-# Helper function to compute Monday UTC
-from datetime import timedelta
