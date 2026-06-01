@@ -2,7 +2,7 @@
 """
 PulseViper TradeBrain Calibrator.
 Tracks component win-rate statistics from closed trades and adjusts component weights using an EMA loop.
-Normalizes weights to ensure Tier 1 and Tier 2 sums remain constant.
+Isolates weight arrays by active market regime (trending vs range) and normalizes weights.
 """
 import os
 import json
@@ -23,11 +23,12 @@ DEFAULT_T1_WEIGHTS = {
 }
 
 DEFAULT_T2_WEIGHTS = {
-    "structure": 12.0,
-    "fvg": 7.0,
-    "vsa": 10.0,
-    "volume": 4.0,
-    "liquidity": 4.0,
+    "structure": 10.0,
+    "fvg": 5.0,
+    "vsa": 4.0,
+    "volume": 1.5,
+    "liquidity": 1.5,
+    "statistical_bounds": 5.0,
     "ai_confidence": 8.0
 }
 
@@ -38,24 +39,31 @@ class BrainCalibrator:
         self._weights = self._load_weights()
 
     def get_weights(self) -> Dict:
-        """Return the current active weights."""
+        """Return the current active weights dictionary."""
         return self._weights
 
     def _load_weights(self) -> Dict:
-        """Load weights from file or initialize with defaults."""
+        """Load weights from file or initialize with isolated regime defaults."""
         if os.path.exists(CALIBRATION_FILE):
             try:
                 with open(CALIBRATION_FILE, "r") as f:
                     data = json.load(f)
-                    self.logger.info(f"Loaded calibrated weights from {CALIBRATION_FILE}")
-                    return data
+                    if "trending" in data and "range" in data:
+                        self.logger.info(f"Loaded calibrated weights from {CALIBRATION_FILE}")
+                        return data
             except Exception as e:
                 self.logger.error(f"Error reading calibrated weights: {e}")
 
-        # Default weights structure
+        # Isolated default weight arrays by regime (lowercased key matching)
         return {
-            "tier1": dict(DEFAULT_T1_WEIGHTS),
-            "tier2": dict(DEFAULT_T2_WEIGHTS)
+            "trending": {
+                "tier1": dict(DEFAULT_T1_WEIGHTS),
+                "tier2": dict(DEFAULT_T2_WEIGHTS)
+            },
+            "range": {
+                "tier1": dict(DEFAULT_T1_WEIGHTS),
+                "tier2": dict(DEFAULT_T2_WEIGHTS)
+            }
         }
 
     def _save_weights(self):
@@ -68,9 +76,9 @@ class BrainCalibrator:
         except Exception as e:
             self.logger.error(f"Failed to save calibrated weights: {e}")
 
-    def record_outcome(self, reason_map: Dict, outcome: str, pnl: float):
+    def record_outcome(self, reason_map: Dict, outcome: str, pnl: float, regime: str = "RANGE"):
         """
-        Record the closed trade details.
+        Record the closed trade details with its active regime context.
         outcome: "WIN" (PnL > 0), "LOSS" (PnL < 0), or "BE" (PnL = 0)
         """
         if not reason_map:
@@ -79,7 +87,8 @@ class BrainCalibrator:
         self._trade_log.append({
             "reason_map": reason_map,
             "outcome": outcome,
-            "pnl": pnl
+            "pnl": pnl,
+            "regime": str(regime).upper()
         })
 
         # Run calibration check
@@ -88,7 +97,7 @@ class BrainCalibrator:
 
     def calibrate(self):
         """
-        Analyze trade outcomes and recalibrate weights.
+        Analyze trade outcomes separately by market regime and recalibrate weights.
         """
         if len(self._trade_log) < MIN_CALIBRATION_SAMPLES:
             self.logger.debug(
@@ -96,57 +105,64 @@ class BrainCalibrator:
             )
             return
 
-        self.logger.info(f"Starting TradeBrain weight calibration over {len(self._trade_log)} trades...")
+        # Perform isolated adjustments for both regimes
+        for r_type in ["TRENDING", "RANGE"]:
+            regime_trades = [t for t in self._trade_log if t.get("regime") == r_type]
+            if len(regime_trades) < 10:
+                # Need at least 10 trades in this specific regime context to run calibration
+                continue
 
-        # 1. Update Tier 1 weights
-        t1_updated = {}
-        for key in DEFAULT_T1_WEIGHTS.keys():
-            t1_updated[key] = self._calibrate_component(f"t1_{key}", self._weights["tier1"][key])
-        
-        # Normalize Tier 1 (must sum to 50.0)
-        t1_sum = sum(t1_updated.values())
-        if t1_sum > 0:
-            for k in t1_updated:
-                # Apply new weight with ±15% safety boundaries from original default
-                target_w = (t1_updated[k] / t1_sum) * 50.0
-                default_w = DEFAULT_T1_WEIGHTS[k]
-                # Bound between 85% and 115% of default weight to prevent over-optimization
-                self._weights["tier1"][k] = float(max(default_w * 0.85, min(default_w * 1.15, target_w)))
+            self.logger.info(f"Calibrating weights for regime {r_type} over {len(regime_trades)} trades...")
+            r_key = r_type.lower()
 
-        # Re-normalize Tier 1 after bounding to ensure it is exactly 50.0
-        t1_sum_bounded = sum(self._weights["tier1"].values())
-        for k in self._weights["tier1"]:
-            self._weights["tier1"][k] = float(round((self._weights["tier1"][k] / t1_sum_bounded) * 50.0, 2))
+            # 1. Update Tier 1 weights
+            t1_updated = {}
+            for key in DEFAULT_T1_WEIGHTS.keys():
+                t1_updated[key] = self._calibrate_component_regime(f"t1_{key}", self._weights[r_key]["tier1"][key], regime_trades)
+            
+            # Normalize Tier 1 (must sum to 50.0)
+            t1_sum = sum(t1_updated.values())
+            if t1_sum > 0:
+                for k in t1_updated:
+                    target_w = (t1_updated[k] / t1_sum) * 50.0
+                    default_w = DEFAULT_T1_WEIGHTS[k]
+                    # Bound between 85% and 115% of default weight to prevent over-optimization
+                    self._weights[r_key]["tier1"][k] = float(max(default_w * 0.85, min(default_w * 1.15, target_w)))
 
-        # 2. Update Tier 2 weights
-        t2_updated = {}
-        for key in DEFAULT_T2_WEIGHTS.keys():
-            t2_updated[key] = self._calibrate_component(f"t2_{key}", self._weights["tier2"][key])
+            # Re-normalize Tier 1 after bounding to ensure it is exactly 50.0
+            t1_sum_bounded = sum(self._weights[r_key]["tier1"].values())
+            for k in self._weights[r_key]["tier1"]:
+                self._weights[r_key]["tier1"][k] = float(round((self._weights[r_key]["tier1"][k] / t1_sum_bounded) * 50.0, 2))
 
-        # Normalize Tier 2 (must sum to 45.0 raw max)
-        t2_sum = sum(t2_updated.values())
-        if t2_sum > 0:
-            for k in t2_updated:
-                target_w = (t2_updated[k] / t2_sum) * 45.0
-                default_w = DEFAULT_T2_WEIGHTS[k]
-                self._weights["tier2"][k] = float(max(default_w * 0.85, min(default_w * 1.15, target_w)))
+            # 2. Update Tier 2 weights
+            t2_updated = {}
+            for key in DEFAULT_T2_WEIGHTS.keys():
+                t2_updated[key] = self._calibrate_component_regime(f"t2_{key}", self._weights[r_key]["tier2"][key], regime_trades)
 
-        t2_sum_bounded = sum(self._weights["tier2"].values())
-        for k in self._weights["tier2"]:
-            self._weights["tier2"][k] = float(round((self._weights["tier2"][k] / t2_sum_bounded) * 45.0, 2))
+            # Normalize Tier 2 (must sum to 35.0 raw max)
+            t2_sum = sum(t2_updated.values())
+            if t2_sum > 0:
+                for k in t2_updated:
+                    target_w = (t2_updated[k] / t2_sum) * 35.0
+                    default_w = DEFAULT_T2_WEIGHTS[k]
+                    self._weights[r_key]["tier2"][k] = float(max(default_w * 0.85, min(default_w * 1.15, target_w)))
+
+            t2_sum_bounded = sum(self._weights[r_key]["tier2"].values())
+            for k in self._weights[r_key]["tier2"]:
+                self._weights[r_key]["tier2"][k] = float(round((self._weights[r_key]["tier2"][k] / t2_sum_bounded) * 35.0, 2))
 
         # Save results
         self._save_weights()
 
-    def _calibrate_component(self, reason_key: str, current_weight: float) -> float:
+    def _calibrate_component_regime(self, reason_key: str, current_weight: float, trades: List[Dict]) -> float:
         """
-        Compute the win rate of trades where this component was active.
+        Compute the win rate of trades in a specific subset where this component was active.
         Applies learning rate and updates weight via EMA.
         """
         active_trades = []
         wins = 0
 
-        for trade in self._trade_log:
+        for trade in trades:
             reason_map = trade["reason_map"]
             outcome = trade["outcome"]
             val = reason_map.get(reason_key, 0.0)
@@ -158,8 +174,8 @@ class BrainCalibrator:
                     wins += 1
 
         total_active = len(active_trades)
-        if total_active < 10:
-            # Not enough samples for this specific component, keep current weight
+        if total_active < 3:
+            # Not enough samples in this regime subset for this component, keep current weight
             return current_weight
 
         win_rate = wins / total_active
@@ -171,9 +187,4 @@ class BrainCalibrator:
 
         # Apply EMA
         new_weight = current_weight * (1.0 - EMA_ALPHA) + updated_weight * EMA_ALPHA
-        
-        self.logger.debug(
-            f"Component {reason_key} | Active: {total_active} | WinRate: {win_rate:.2f} | "
-            f"Weight: {current_weight:.2f} -> {new_weight:.2f}"
-        )
         return new_weight

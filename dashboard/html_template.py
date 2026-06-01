@@ -677,10 +677,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             display: inline-block;
             white-space: nowrap;
             padding-left: 100%;
-            animation: marquee 30s linear infinite;
+            animation: marquee 90s linear infinite;
         }
         .news-ticker .ticker-wrap {
-            animation-duration: 48s;
+            animation-duration: 150s;
         }
         @keyframes marquee {
             0% { transform: translate3d(0, 0, 0); }

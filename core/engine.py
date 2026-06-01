@@ -313,6 +313,36 @@ class AdvancedTradingEngine:
         
         return london_active or ny_active
 
+    @staticmethod
+    def calculate_regression_zscore(df_h1: pd.DataFrame, period: int = 100) -> float:
+        """
+        Computes the Z-score of deviation of the current price from the linear regression channel.
+        Uses the last 'period' H1 bars (representing 4 days of market action).
+        """
+        try:
+            if df_h1 is None or len(df_h1) < period:
+                return 0.0
+                
+            prices = df_h1['close'].tail(period).values
+            n = len(prices)
+            x = np.arange(n)
+            
+            # Linear regression using numpy polyfit
+            slope, intercept = np.polyfit(x, prices, 1)
+            fitted = slope * x + intercept
+            
+            deviations = prices - fitted
+            std_dev = np.std(deviations)
+            
+            if std_dev < 1e-9:
+                return 0.0
+                
+            latest_deviation = prices[-1] - fitted[-1]
+            z_score = latest_deviation / std_dev
+            return float(z_score)
+        except Exception:
+            return 0.0
+
     def run_multi_timeframe_analysis(self, symbol: str) -> Optional[Dict]:
         """
         Full 6-Timeframe Cascade Analysis: D1 → H4 → H1 → M15 → M5 → M1
@@ -333,33 +363,78 @@ class AdvancedTradingEngine:
             current_time = time.time()
             swing_window = settings_manager.get("smc_swing_window", 3)
 
-            # ── 1. Fetch all 6 timeframes ──────────────────────────────────────────
-            # Use per-TF expiry cache to avoid redundant MT5 calls on fast loops
+            # ── 1. Fetch and compute SMC for 6 timeframes with Closed-Candle Caching ─
+            if not hasattr(self, '_last_closed_candle_times'):
+                self._last_closed_candle_times = {}
             if not hasattr(self, '_tf_data_cache'):
                 self._tf_data_cache = {}
-            if not hasattr(self, '_tf_data_expiry'):
-                self._tf_data_expiry = {}
+            if not hasattr(self, '_tf_smc_cache'):
+                self._tf_smc_cache = {}
 
             _tf_expiry_map = {
-                'D1': (mt5.TIMEFRAME_D1, 500, 3600),   # 1h TTL
-                'H4': (mt5.TIMEFRAME_H4, 300, 1200),   # 20min TTL
-                'H1': (mt5.TIMEFRAME_H1, 300, 600),    # 10min TTL
-                'M15': (mt5.TIMEFRAME_M15, 200, 60),   # 1min TTL
-                'M5': (mt5.TIMEFRAME_M5, 200, 30),     # 30s TTL
-                'M1': (mt5.TIMEFRAME_M1, 200, 15),     # 15s TTL
+                'D1': (mt5.TIMEFRAME_D1, 500),
+                'H4': (mt5.TIMEFRAME_H4, 300),
+                'H1': (mt5.TIMEFRAME_H1, 300),
+                'M15': (mt5.TIMEFRAME_M15, 200),
+                'M5': (mt5.TIMEFRAME_M5, 200),
+                'M1': (mt5.TIMEFRAME_M1, 200),
             }
 
             dfs = {}
-            for tf_name, (tf_const, bars, ttl) in _tf_expiry_map.items():
+            smc = {}
+
+            for tf_name, (tf_const, bars) in _tf_expiry_map.items():
                 cache_key = f"{symbol}_{tf_name}"
-                if cache_key in self._tf_data_expiry and current_time < self._tf_data_expiry[cache_key]:
-                    dfs[tf_name] = self._tf_data_cache.get(cache_key)
+                
+                # Fetch index 1 closed bar time
+                closed_bar = mt5.copy_rates_from_pos(symbol, tf_const, 1, 1)
+                closed_time = closed_bar[0]['time'] if (closed_bar is not None and len(closed_bar) > 0) else None
+                
+                df_closed = None
+                if (closed_time is not None and 
+                    closed_time == self._last_closed_candle_times.get(cache_key) and 
+                    cache_key in self._tf_data_cache):
+                    df_closed = self._tf_data_cache[cache_key]
                 else:
-                    df = fetch_ohlcv(symbol, tf_const, n=bars)
-                    if df is not None and len(df) >= 20:
-                        self._tf_data_cache[cache_key] = df
-                        self._tf_data_expiry[cache_key] = current_time + ttl
-                    dfs[tf_name] = self._tf_data_cache.get(cache_key)
+                    # Fetch bars count including active bar
+                    df_full = fetch_ohlcv(symbol, tf_const, n=bars)
+                    if df_full is not None and len(df_full) >= 20:
+                        # Store only closed candles in cache (exclude active forming bar at index 0)
+                        df_closed = df_full.iloc[:-1].copy()
+                        self._tf_data_cache[cache_key] = df_closed
+                        if closed_time is not None:
+                            self._last_closed_candle_times[cache_key] = closed_time
+                            
+                # Get the live forming candle (index 0)
+                live_rates = mt5.copy_rates_from_pos(symbol, tf_const, 0, 1)
+                if live_rates is not None and len(live_rates) > 0:
+                    df_live = pd.DataFrame(live_rates)
+                    df_live['time'] = pd.to_datetime(df_live['time'], unit='s')
+                    df_live.set_index('time', inplace=True)
+                    df_live = df_live[['open','high','low','close','tick_volume']].rename(columns={'tick_volume':'volume'})
+                    
+                    if df_closed is not None:
+                        # Exclude any index in df_closed that is also in df_live
+                        df_combined = pd.concat([df_closed[~df_closed.index.isin(df_live.index)], df_live])
+                    else:
+                        df_combined = df_live
+                else:
+                    df_combined = df_closed
+
+                if df_combined is not None and len(df_combined) >= 20:
+                    dfs[tf_name] = df_combined
+                    try:
+                        from utils.smc_indicators import SMCIndicators
+                        features_df = SMCIndicators.compute_smc_features(df_combined, window=swing_window)
+                        smc[tf_name] = features_df
+                        self._tf_smc_cache[cache_key] = features_df
+                    except Exception as e:
+                        self.logger.error(f"SMC Indicators computation error for {tf_name}: {e}")
+                        smc[tf_name] = None
+                        self._tf_smc_cache[cache_key] = None
+                else:
+                    dfs[tf_name] = None
+                    smc[tf_name] = None
 
             df_d1  = dfs.get('D1')
             df_h4  = dfs.get('H4')
@@ -399,18 +474,6 @@ class AdvancedTradingEngine:
 
             # D. Session context (Phase 10)
             session_ctx = self.session_engine.get_session_context()
-
-            # ── 2. Compute SMC indicators on all available timeframes ───────────────
-            smc = {}
-            for tf_name, df in [('D1', df_d1), ('H4', df_h4), ('H1', df_h1),
-                                  ('M15', df_m15), ('M5', df_m5), ('M1', df_m1)]:
-                if df is not None and len(df) >= 20:
-                    try:
-                        smc[tf_name] = SMCIndicators.compute_smc_features(df, window=swing_window)
-                    except Exception:
-                        smc[tf_name] = None
-                else:
-                    smc[tf_name] = None
 
             def get_latest(tf_name):
                 s = smc.get(tf_name)
@@ -699,6 +762,9 @@ class AdvancedTradingEngine:
             buy_pressure_val = self.volume_cache.get('buy_pressure', 50.0) if self.volume_cache else 50.0
             sell_pressure_val = self.volume_cache.get('sell_pressure', 50.0) if self.volume_cache else 50.0
 
+            # Calculate linear regression Z-score on H1
+            regression_zscore = self.calculate_regression_zscore(df_h1)
+
             analysis = {
                 'symbol': symbol,
                 'price': tick.bid,
@@ -710,6 +776,7 @@ class AdvancedTradingEngine:
                 'market_regime': regime.name,
                 'swept_pools': swept_pools,
                 'resting_pools': self.liquidity_map.get_resting_pools(),
+                'regression_zscore': regression_zscore,
                 # 6-TF bias states
                 'htf_bias': htf_bias,
                 'd1_bias': d1_bias,
@@ -822,13 +889,6 @@ class AdvancedTradingEngine:
             if current_candle == self.last_close_candle.get(symbol, 0):
                 return None
                 
-        # Rule 0.1: Safety Engine Check (consecutive losses / drawdown)
-        allowed, safety_reason = self.safety_engine.check_entry_allowed()
-        if not allowed:
-            self.skipped_stats['safety_halt'] = self.skipped_stats.get('safety_halt', 0) + 1
-            analysis['brain_block_reason'] = "SAFETY_HALT"
-            return None
-
         bid = analysis['bid']
         ask = analysis['ask']
         atr = analysis['atr']
@@ -838,39 +898,7 @@ class AdvancedTradingEngine:
         m5_mss = analysis['m5_mss_signal']
         fvg_class = analysis['m5_fvg_class']
         fvg_type = analysis['m5_fvg_type']
-        
-        # Rule 1: Killzone Active check
-        if not self.is_killzone_active():
-            self.skipped_stats['killzone_inactive'] = self.skipped_stats.get('killzone_inactive', 0) + 1
-            return None
 
-        # Rule 1.1: News Lockout check
-        if analysis.get('news_locked', False):
-            self.skipped_stats['news_filter'] = self.skipped_stats.get('news_filter', 0) + 1
-            import time
-            current_time = time.time()
-            if not hasattr(self, '_last_news_log_time'):
-                self._last_news_log_time = 0
-            if current_time - self._last_news_log_time >= 60.0:
-                self.logger.warning(f"🚫 Trade entry blocked on {symbol} due to news lockout: {analysis.get('news_lockout_reason')}")
-                self._last_news_log_time = current_time
-            return None
-
-        # Rule 1.2: CHAOTIC regime — hard gate before Brain (defence-in-depth)
-        # COMPRESSION is handled by Brain v2 via raised threshold (65 pts) — NOT hard-blocked here
-        regime_str = analysis.get('market_regime', 'RANGE')
-        if settings_manager.get("dynamic_regime_filter", True):
-            if regime_str == "CHAOTIC":
-                self.skipped_stats['regime_filter'] = self.skipped_stats.get('regime_filter', 0) + 1
-                import time
-                current_time = time.time()
-                if not hasattr(self, '_last_regime_log_time'):
-                    self._last_regime_log_time = 0
-                if current_time - self._last_regime_log_time >= 60.0:
-                    self.logger.warning(f"🚫 Trade entry hard-blocked on {symbol}: CHAOTIC regime (pre-Brain gate)")
-                    self._last_regime_log_time = current_time
-                return None
-            
         # Get active risk-reward ratio from mode
         trading_mode = settings_manager.get("trading_mode", "intraday").lower()
         if trading_mode == "scalping":
@@ -915,6 +943,57 @@ class AdvancedTradingEngine:
         analysis['brain_tier3']      = brain_result.tier3_score
         analysis['brain_block_reason'] = brain_result.block_reason
 
+        # ── Decoupled Veto Gates (checked AFTER evaluation for full telemetry) ──
+        
+        # 1. Safety Engine Check
+        allowed, safety_reason = self.safety_engine.check_entry_allowed()
+        if not allowed:
+            self.skipped_stats['safety_halt'] = self.skipped_stats.get('safety_halt', 0) + 1
+            analysis['brain_block_reason'] = "SAFETY_HALT"
+            analysis['brain_label'] = "SAFETY HALT"
+            analysis['brain_color'] = "#ff9900"
+            return None
+
+        # 2. Killzone Check
+        if not self.is_killzone_active():
+            self.skipped_stats['killzone_inactive'] = self.skipped_stats.get('killzone_inactive', 0) + 1
+            analysis['brain_block_reason'] = "KILLZONE_INACTIVE"
+            analysis['brain_label'] = "KILLZONE INACTIVE"
+            analysis['brain_color'] = "#666666"
+            return None
+
+        # 3. News Lockout Check
+        if analysis.get('news_locked', False):
+            self.skipped_stats['news_filter'] = self.skipped_stats.get('news_filter', 0) + 1
+            import time
+            current_time = time.time()
+            if not hasattr(self, '_last_news_log_time'):
+                self._last_news_log_time = 0
+            if current_time - self._last_news_log_time >= 60.0:
+                self.logger.warning(f"🚫 Trade entry blocked on {symbol} due to news lockout: {analysis.get('news_lockout_reason')}")
+                self._last_news_log_time = current_time
+            analysis['brain_block_reason'] = "NEWS_LOCKOUT"
+            analysis['brain_label'] = "NEWS LOCKOUT"
+            analysis['brain_color'] = "#ff3366"
+            return None
+
+        # 4. Chaotic Regime Check
+        regime_str = analysis.get('market_regime', 'RANGE')
+        if settings_manager.get("dynamic_regime_filter", True) and regime_str == "CHAOTIC":
+            self.skipped_stats['regime_filter'] = self.skipped_stats.get('regime_filter', 0) + 1
+            import time
+            current_time = time.time()
+            if not hasattr(self, '_last_regime_log_time'):
+                self._last_regime_log_time = 0
+            if current_time - self._last_regime_log_time >= 60.0:
+                self.logger.warning(f"🚫 Trade entry hard-blocked on {symbol}: CHAOTIC regime (pre-Brain gate)")
+                self._last_regime_log_time = current_time
+            analysis['brain_block_reason'] = "CHAOTIC_REGIME"
+            analysis['brain_label'] = "CHAOTIC REGIME"
+            analysis['brain_color'] = "#9900cc"
+            return None
+
+        # 5. TradeBrain score/threshold/direction confirmation
         if not brain_result.passed:
             self.skipped_stats['brain_filter'] = self.skipped_stats.get('brain_filter', 0) + 1
             # Log reason at reduced frequency
@@ -1305,12 +1384,57 @@ class AdvancedTradingEngine:
                 self.brain_calibrator.record_outcome(
                     reason_map=getattr(pos, 'brain_reason_map', {}),
                     outcome="WIN" if pos.pnl > 0.0 else ("LOSS" if pos.pnl < 0.0 else "BE"),
-                    pnl=pos.pnl
+                    pnl=pos.pnl,
+                    regime=getattr(pos, 'volatility_regime', 'RANGE')
                 )
             except Exception as e:
                 self.logger.error(f"Failed to write trade to journal / calibrator: {e}")
 
             self.logger.info(f"🧠 Closed Position Learnt: {pos.symbol} {pos.action} Ticket #{pos.id} closed due to {pos.close_reason} | PnL: ${pos.pnl:.2f}")
+            
+            # Online incremental learning on PyTorch neural net every 30 closed trades
+            self._closed_trades_count = getattr(self, '_closed_trades_count', 0) + 1
+            if self._closed_trades_count % 30 == 0:
+                self.check_and_run_incremental_learning()
+
+    def check_and_run_incremental_learning(self):
+        """Query last 30 trades from trade history and trigger incremental learning epoch."""
+        try:
+            from core.trade_journal import JOURNAL_DB
+            import sqlite3
+            conn = sqlite3.connect(JOURNAL_DB)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            # Query last 30 closed trades
+            cursor.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 30")
+            rows = cursor.fetchall()
+            conn.close()
+            
+            if len(rows) < 30:
+                return
+                
+            trades_batch = []
+            for r in rows:
+                features = {
+                    'active_bias': 1 if r['bias'] == 'BULLISH' else (-1 if r['bias'] == 'BEARISH' else 0),
+                    'liq_sweep_type': 1 if 'sweep' in str(r['setup_type']).lower() else 0,
+                    'mss_signal': 1 if 'mss' in str(r['setup_type']).lower() else 0,
+                    'fvg_class': r['fvg_class'].lower(),
+                    'volatility': 0.02 if r['volatility_regime'] == 'TRENDING' else 0.005,
+                    'atr_pct': 0.001,
+                    'rvol': 1.5,
+                    'buy_pressure': 60.0 if r['action'] == 'BUY' else 40.0,
+                    'sell_pressure': 40.0 if r['action'] == 'BUY' else 60.0,
+                }
+                trades_batch.append({
+                    'features': features,
+                    'pnl': r['pnl']
+                })
+                
+            self.pattern_learner.train_incremental(trades_batch)
+        except Exception as e:
+            self.logger.error(f"Error querying closed trades for online learning: {e}")
 
     def get_prediction_data(self, symbol: str) -> dict:
         """Return next predicted trade setup, current price, sessions, and 6-TF alignment info."""

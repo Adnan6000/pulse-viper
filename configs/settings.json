@@ -1,6 +1,6 @@
 {
-    "paper_mode": true,
-    "trading_mode": "scalping",
+    "paper_mode": false,
+    "trading_mode": "intraday",
     "hedging_mode": false,
     "compounding_mode": true,
     "risk_percent": 1.0,
@@ -17,6 +17,7 @@
     "dynamic_regime_filter": true,
     "news_lockout_minutes": 30,
     "news_cooldown_minutes": 15,
+    "break_even_buffer_points": 20.0,
     "vsa_filter_enabled": true,
     "smc_swing_window": 3,
     "smc_lookback_sweep": 15,

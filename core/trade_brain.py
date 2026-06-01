@@ -68,11 +68,12 @@ DEFAULT_T1_WEIGHTS = {
 }
 
 DEFAULT_T2_WEIGHTS = {
-    "structure": 12.0,
-    "fvg": 7.0,
-    "vsa": 10.0,
-    "volume": 4.0,
-    "liquidity": 4.0,
+    "structure": 10.0,
+    "fvg": 5.0,
+    "vsa": 4.0,
+    "volume": 1.5,
+    "liquidity": 1.5,
+    "statistical_bounds": 5.0,
     "ai_confidence": 8.0
 }
 
@@ -133,6 +134,7 @@ BLOCK_REASON_NEWS = "NEWS_LOCKOUT"
 BLOCK_REASON_CHAOTIC = "CHAOTIC_REGIME"
 BLOCK_REASON_SCORE = "SCORE_BELOW_THRESHOLD"
 BLOCK_REASON_CONFLICTED = "DIRECTIONAL_CONFLICT"
+BLOCK_REASON_LOW_CONFIDENCE = "LOW_CONFIDENCE"
 
 
 class BrainResult:
@@ -164,7 +166,7 @@ class BrainResult:
         self.tier1_score = tier1_score
         self.tier2_score = tier2_score
         self.tier3_score = tier3_score
-        self.passed = (brain_score >= threshold) and (brain_direction is not None)
+        self.passed = (brain_score >= threshold) and (brain_direction is not None) and (block_reason is None)
 
     @property
     def is_chaotic(self) -> bool:
@@ -231,19 +233,26 @@ class TradeBrain:
         self.base_threshold = base_threshold
         self.logger = logging.getLogger("PulseViper.TradeBrain")
         self._eval_count = 0
-        self._load_calibrated_weights()
+        self._load_calibrated_weights("RANGE")
 
-    def _load_calibrated_weights(self):
-        """Load calibrated weights from file if available, otherwise use defaults."""
+    def _load_calibrated_weights(self, regime: str = "RANGE"):
+        """Load calibrated weights from file for the active regime, otherwise use defaults."""
+        r_key = "trending" if regime == "TRENDING" else "range"
         try:
             if os.path.exists("data/brain_weights.json"):
                 with open("data/brain_weights.json", "r") as f:
                     data = json.load(f)
-                    self.t1_weights = data.get("tier1", dict(DEFAULT_T1_WEIGHTS))
-                    self.t2_weights = data.get("tier2", dict(DEFAULT_T2_WEIGHTS))
-                    return
+                    if r_key in data:
+                        self.t1_weights = data[r_key].get("tier1", dict(DEFAULT_T1_WEIGHTS))
+                        self.t2_weights = data[r_key].get("tier2", dict(DEFAULT_T2_WEIGHTS))
+                        return
+                    elif "tier1" in data:
+                        # Fallback for flat structure
+                        self.t1_weights = data.get("tier1", dict(DEFAULT_T1_WEIGHTS))
+                        self.t2_weights = data.get("tier2", dict(DEFAULT_T2_WEIGHTS))
+                        return
         except Exception as e:
-            self.logger.warning(f"Error loading calibrated weights: {e}")
+            self.logger.warning(f"Error loading calibrated weights for {regime}: {e}")
         
         self.t1_weights = dict(DEFAULT_T1_WEIGHTS)
         self.t2_weights = dict(DEFAULT_T2_WEIGHTS)
@@ -272,79 +281,135 @@ class TradeBrain:
             BrainResult — always populated, check .passed before executing
         """
         self._eval_count += 1
-        
-        # Reload weights to pick up online calibration updates
-        self._load_calibrated_weights()
-        
         regime = str(analysis.get("market_regime", "RANGE")).upper()
+        
+        # Reload weights to pick up online calibration updates for active regime
+        self._load_calibrated_weights(regime)
         threshold = ADAPTIVE_THRESHOLDS.get(regime, self.base_threshold)
 
-        def _blocked(reason: str) -> BrainResult:
+        # ── Pre-Scoring Hard Gates ───────────────────────────────────────────
+        if regime in HARD_BLOCKED_REGIMES:
             return BrainResult(
                 brain_score=0.0,
                 brain_direction=None,
                 threshold=threshold,
-                reason_map={"block_reason": 0.0},
+                reason_map={},
                 regime=regime,
-                block_reason=reason,
+                block_reason=BLOCK_REASON_CHAOTIC
+            )
+            
+        if analysis.get("news_locked", False):
+            return BrainResult(
+                brain_score=0.0,
+                brain_direction=None,
+                threshold=threshold,
+                reason_map={},
+                regime=regime,
+                block_reason=BLOCK_REASON_NEWS
             )
 
-        # ── FIX 5 + FIX 3: Hard gates BEFORE scoring ──────────────────────────
-        # Gate 1: News lockout is always a hard block — never a soft penalty
-        if analysis.get("news_locked", False):
-            self._log(0.0, None, regime, threshold, {}, "NEWS_LOCKED")
-            return _blocked(BLOCK_REASON_NEWS)
-
-        # Gate 2: CHAOTIC regime is always a hard block — one mechanism, clean
-        if regime in HARD_BLOCKED_REGIMES:
-            self._log(0.0, None, regime, threshold, {}, "CHAOTIC")
-            return _blocked(BLOCK_REASON_CHAOTIC)
-
-        # ── FIX 1 + FIX 2: 3-Tier normalized scoring ─────────────────────────
-
+        # ── TIER 1 & TIER 2 Evaluation ───────────────────────────────────────
         # TIER 1: DIRECTIONAL (max 50 pts)
         bull_t1, bear_t1, t1_map = self._score_tier1_directional(analysis)
 
         # TIER 2: EXECUTION QUALITY (max 35 pts)
         bull_t2, bear_t2, t2_map = self._score_tier2_execution(analysis, ai_confidence)
 
-        # ── FIX 4: Direction determined cleanly from Tier 1 + Tier 2 ──────────
+        # ── Extract Directional Bias First (Preserves Telemetry) ──────────────
         bull_raw = bull_t1 + bull_t2
         bear_raw = bear_t1 + bear_t2
 
         if bull_raw > bear_raw + DIRECTIONAL_CONVICTION_GAP:
             brain_direction = "BUY"
-            directional_score = bull_raw
         elif bear_raw > bull_raw + DIRECTIONAL_CONVICTION_GAP:
             brain_direction = "SELL"
-            directional_score = bear_raw
         else:
             brain_direction = None
-            directional_score = max(bull_raw, bear_raw)
+
+        # ── AI Disaster Veto Check ───────────────────────────────────────────
+        if analysis.get("veto_low_confidence", False) or ai_confidence < 0.35:
+            reason_map = {}
+            reason_map.update(t1_map)
+            reason_map.update(t2_map)
+            reason_map["_tier1"] = 0.0
+            reason_map["_tier2"] = 0.0
+            reason_map["_tier3"] = 0.0
+            return BrainResult(
+                brain_score=0.0,
+                brain_direction=brain_direction,
+                threshold=threshold,
+                reason_map=reason_map,
+                regime=regime,
+                block_reason=BLOCK_REASON_LOW_CONFIDENCE,
+                tier1_score=0.0,
+                tier2_score=0.0,
+                tier3_score=0.0
+            )
 
         # Normalize directional score to [0, 85] (T1_MAX + T2_MAX)
-        dir_max = TIER1_MAX + TIER2_MAX  # 85
-        t1_score = float(np.clip(bull_t1 if brain_direction == "BUY" else bear_t1, 0, TIER1_MAX))
-        t2_score = float(np.clip(bull_t2 if brain_direction == "BUY" else bear_t2, 0, TIER2_MAX))
+        if brain_direction == "BUY":
+            t1_score = float(np.clip(bull_t1, 0, TIER1_MAX))
+            t2_score = float(np.clip(bull_t2, 0, TIER2_MAX))
+        elif brain_direction == "SELL":
+            t1_score = float(np.clip(bear_t1, 0, TIER1_MAX))
+            t2_score = float(np.clip(bear_t2, 0, TIER2_MAX))
+        else:
+            t1_score = float(np.clip(max(bull_t1, bear_t1), 0, TIER1_MAX))
+            t2_score = float(np.clip(max(bull_t2, bear_t2), 0, TIER2_MAX))
 
-        # TIER 3: RISK QUALITY (max 15 pts)
-        # Regime quality (0-8) + Session quality (0-7)
+        # ── Setup Validation Gate (Must be >= 12.25 out of 35) ────────────────
+        setup_passed = t2_score >= 12.25
+        if not setup_passed:
+            # Score is set to 0.0 to prevent execution, but direction and scores are preserved for telemetry
+            t3_score, t3_map = self._score_tier3_risk(regime, session_score)
+            reason_map = {}
+            reason_map.update(t1_map)
+            reason_map.update(t2_map)
+            reason_map.update(t3_map)
+            reason_map["_tier1"] = t1_score
+            reason_map["_tier2"] = t2_score
+            reason_map["_tier3"] = 0.0
+            return BrainResult(
+                brain_score=0.0,
+                brain_direction=brain_direction,
+                threshold=threshold,
+                reason_map=reason_map,
+                regime=regime,
+                block_reason=BLOCK_REASON_SCORE,
+                tier1_score=t1_score,
+                tier2_score=t2_score,
+                tier3_score=0.0
+            )
+
+        # ── TIER 3: RISK QUALITY (max 15 pts) ────────────────────────────────
         t3_score, t3_map = self._score_tier3_risk(regime, session_score)
 
-        # Final brain score — always in [0, 100]
-        raw_score = t1_score + t2_score + t3_score
+        # Apply Regime Multiplier to directional/execution score
+        regime_multiplier = 1.0
+        htf_bias = int(analysis.get("htf_bias", 0))
+        if regime == "TRENDING" and brain_direction is not None:
+            if (brain_direction == "BUY" and htf_bias == -1) or (brain_direction == "SELL" and htf_bias == 1):
+                regime_multiplier = 0.2
+
+        # ── Final Multiplicative Assembly for Valid Setups ───────────────────
+        raw_score = (t1_score + t2_score) * regime_multiplier
+        if raw_score > 0:
+            raw_score += t3_score
+            
+            # Strategy confirmation (advisory only)
+            strategy_quality_boost = 0.0
+            if strategy_action is not None and brain_direction is not None:
+                if strategy_action == brain_direction:
+                    strategy_quality_boost = 2.0
+            t2_map["strategy_confirm"] = strategy_quality_boost
+            raw_score += strategy_quality_boost
+        else:
+            t2_map["strategy_confirm"] = 0.0
+
         brain_score = float(np.clip(raw_score, 0.0, 100.0))
 
-        # ── Strategy confirmation (advisory only, no direction override) ──────
-        strategy_quality_boost = 0.0
-        if strategy_action is not None and brain_direction is not None:
-            if strategy_action == brain_direction:
-                strategy_quality_boost = 2.0  # Modest bonus — confirms entry
-        t2_map["strategy_confirm"] = strategy_quality_boost
-        brain_score = float(np.clip(brain_score + strategy_quality_boost, 0.0, 100.0))
-
         # ── Build unified reason_map ───────────────────────────────────────────
-        reason_map: Dict[str, float] = {}
+        reason_map = {}
         reason_map.update(t1_map)
         reason_map.update(t2_map)
         reason_map.update(t3_map)
@@ -352,13 +417,12 @@ class TradeBrain:
         reason_map["_tier2"] = t2_score
         reason_map["_tier3"] = t3_score
 
-        # ── Apply threshold gate ───────────────────────────────────────────────
+        # ── Apply Gates ──────────────────────────────────────────────────────
         block_reason = None
         if brain_direction is None:
             block_reason = BLOCK_REASON_CONFLICTED
         elif brain_score < threshold:
             block_reason = BLOCK_REASON_SCORE
-            brain_direction = None  # score failed threshold — block direction
 
         # ── Throttled logging ──────────────────────────────────────────────────
         if self._eval_count % 3 == 0:
@@ -375,6 +439,8 @@ class TradeBrain:
             tier2_score=t2_score,
             tier3_score=t3_score,
         )
+
+
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Tier 1: Directional (HTF bias only, max 50 pts)
@@ -426,56 +492,88 @@ class TradeBrain:
         self, analysis: Dict, ai_confidence: float
     ) -> Tuple[float, float, Dict[str, float]]:
         """
-        Execution quality components using self.t2_weights.
+        Ensemble execution quality scoring matrix (Max 35 points):
+        1. Pure SMC Verification (MSS, FVG, Sweeps) -> Max 15 pts (Tuned via structure & fvg weights)
+        2. Volume & Order Flow (VSA, POC, RVOL, Liquidity) -> Max 7 pts (Tuned via vsa, volume, liquidity weights)
+        3. Statistical Deviation (Linear Regression Z-score) -> Max 5 pts (Tuned via statistical_bounds weight)
+        4. AI Pattern-Learner Classifier Probability -> Max 8 pts (Tuned via ai_confidence weight)
         """
-        w_structure = self.t2_weights.get("structure", 12.0)
-        w_fvg = self.t2_weights.get("fvg", 7.0)
-        w_vsa = self.t2_weights.get("vsa", 10.0)
-        w_volume = self.t2_weights.get("volume", 4.0)
-        w_liquidity = self.t2_weights.get("liquidity", 4.0)
+        # AI Pattern Learner Disaster Veto Gate
+        if ai_confidence < 0.35:
+            analysis["veto_low_confidence"] = True
+            component_map = {
+                "t2_smc": 0.0,
+                "t2_volume": 0.0,
+                "t2_stats": 0.0,
+                "t2_ai_confidence": 0.0,
+            }
+            return 0.0, 0.0, component_map
+
+        w_structure = self.t2_weights.get("structure", 10.0)
+        w_fvg = self.t2_weights.get("fvg", 5.0)
+        w_vsa = self.t2_weights.get("vsa", 4.0)
+        w_volume = self.t2_weights.get("volume", 1.5)
+        w_liquidity = self.t2_weights.get("liquidity", 1.5)
+        w_stats = self.t2_weights.get("statistical_bounds", 5.0)
         w_ai = self.t2_weights.get("ai_confidence", 8.0)
 
-        RAW_MAX = w_structure + w_fvg + w_vsa + w_volume + w_liquidity + w_ai
-        if RAW_MAX <= 0:
-            RAW_MAX = 45.0
-
+        # --- 1. Pure SMC Verification (Max 15 pts) ---
         bull_struct, bear_struct = self._score_structure(analysis)
-        bull_struct = bull_struct * (w_structure / 12.0)
-        bear_struct = bear_struct * (w_structure / 12.0)
+        bull_struct = (bull_struct / 12.0) * w_structure
+        bear_struct = (bear_struct / 12.0) * w_structure
 
-        bull_fvg, bear_fvg       = self._score_fvg(analysis)
-        bull_fvg = bull_fvg * (w_fvg / 7.0)
-        bear_fvg = bear_fvg * (w_fvg / 7.0)
+        bull_fvg, bear_fvg = self._score_fvg(analysis)
+        bull_fvg = (bull_fvg / 7.0) * w_fvg
+        bear_fvg = (bear_fvg / 7.0) * w_fvg
 
-        bull_vsa, bear_vsa       = self._score_vsa(analysis)
-        bull_vsa = bull_vsa * (w_vsa / 10.0)
-        bear_vsa = bear_vsa * (w_vsa / 10.0)
+        smc_bull = float(np.clip(bull_struct + bull_fvg, 0.0, 15.0))
+        smc_bear = float(np.clip(bear_struct + bear_fvg, 0.0, 15.0))
 
-        bull_vp, bear_vp         = self._score_volume_pressure(analysis)
-        bull_vp = bull_vp * (w_volume / 4.0)
-        bear_vp = bear_vp * (w_volume / 4.0)
+        # --- 2. Volume & Order Flow (Max 7 pts) ---
+        bull_vsa, bear_vsa = self._score_vsa(analysis)
+        vsa_bull = (bull_vsa / 10.0) * w_vsa
+        vsa_bear = (bear_vsa / 10.0) * w_vsa
 
-        bull_liq, bear_liq       = self._score_liquidity(analysis)
-        bull_liq = bull_liq * (w_liquidity / 4.0)
-        bear_liq = bear_liq * (w_liquidity / 4.0)
+        bull_vp, bear_vp = self._score_volume_pressure(analysis)
+        vp_bull = (bull_vp / 4.0) * w_volume
+        vp_bear = (bear_vp / 4.0) * w_volume
 
-        ai_pts                   = self._score_ai_confidence(ai_confidence)
-        ai_pts = ai_pts * (w_ai / 8.0)
+        bull_liq, bear_liq = self._score_liquidity(analysis)
+        liq_bull = (bull_liq / 4.0) * w_liquidity
+        liq_bear = (bear_liq / 4.0) * w_liquidity
 
-        bull_raw = bull_struct + bull_fvg + bull_vsa + bull_vp + bull_liq + ai_pts
-        bear_raw = bear_struct + bear_fvg + bear_vsa + bear_vp + bear_liq + ai_pts
+        rvol = float(analysis.get("rvol", 1.0))
+        rvol_pts = 1.0 if rvol > 1.4 else 0.0
 
-        scale = TIER2_MAX / RAW_MAX
-        bull_t2 = float(np.clip(bull_raw * scale, 0.0, TIER2_MAX))
-        bear_t2 = float(np.clip(bear_raw * scale, 0.0, TIER2_MAX))
+        vol_bull = float(np.clip(vsa_bull + vp_bull + liq_bull + rvol_pts, 0.0, 7.0))
+        vol_bear = float(np.clip(vsa_bear + vp_bear + liq_bear + rvol_pts, 0.0, 7.0))
+
+        # --- 3. Statistical Boundary Check (Max 5 pts) ---
+        z_score = float(analysis.get("regression_zscore", 0.0))
+        stat_bull = 5.0
+        stat_bear = 5.0
+        # If overbought, penalize buy setup. If oversold, penalize sell setup.
+        if z_score > 1.0:
+            stat_bull = float(np.clip(5.0 - (z_score - 1.0) * 2.5, 0.0, 5.0))
+        if z_score < -1.0:
+            stat_bear = float(np.clip(5.0 - (-z_score - 1.0) * 2.5, 0.0, 5.0))
+
+        stat_bull = stat_bull * (w_stats / 5.0)
+        stat_bear = stat_bear * (w_stats / 5.0)
+
+        # --- 4. AI Pattern Learner Classifier Probability (Max 8 pts) ---
+        ai_raw = (ai_confidence * 16.0) - 8.0 if ai_confidence >= 0.5 else 0.0
+        ai_pts = float(np.clip(ai_raw * (w_ai / 8.0), 0.0, 8.0))
+
+        # Sum Tier 2 components
+        bull_t2 = float(np.clip(smc_bull + vol_bull + stat_bull + ai_pts, 0.0, TIER2_MAX))
+        bear_t2 = float(np.clip(smc_bear + vol_bear + stat_bear + ai_pts, 0.0, TIER2_MAX))
 
         component_map = {
-            "t2_structure":      round(bull_struct * scale if bull_t2 >= bear_t2 else bear_struct * scale, 2),
-            "t2_fvg":            round(bull_fvg * scale    if bull_t2 >= bear_t2 else bear_fvg * scale,    2),
-            "t2_vsa":            round(bull_vsa * scale    if bull_t2 >= bear_t2 else bear_vsa * scale,    2),
-            "t2_volume":         round(bull_vp * scale     if bull_t2 >= bear_t2 else bear_vp * scale,     2),
-            "t2_liquidity":      round(bull_liq * scale    if bull_t2 >= bear_t2 else bear_liq * scale,    2),
-            "t2_ai_confidence":  round(ai_pts * scale, 2),
+            "t2_smc": round(smc_bull if bull_t2 >= bear_t2 else smc_bear, 2),
+            "t2_volume": round(vol_bull if bull_t2 >= bear_t2 else vol_bear, 2),
+            "t2_stats": round(stat_bull if bull_t2 >= bear_t2 else stat_bear, 2),
+            "t2_ai_confidence": round(ai_pts, 2),
         }
 
         return bull_t2, bear_t2, component_map

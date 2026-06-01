@@ -6,7 +6,25 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 import logging
 from collections import defaultdict
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from core.experience_memory import ExperienceMemory
+
+class PulseViperNeuralNet(nn.Module):
+    def __init__(self, input_dim: int = 8, hidden_dim: int = 16):
+        super(PulseViperNeuralNet, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        return self.network(x)
 
 class KMeansClustering:
     def __init__(self, k: int = 4):
@@ -366,6 +384,12 @@ class PatternLearner:
         self.kmeans = KMeansClustering(k=4)
         self.classifier = NaiveBayesClassifier()
         self.training_stats = {}
+        
+        # PyTorch Neural Net
+        self.nn_model = PulseViperNeuralNet()
+        self.nn_optimizer = optim.Adam(self.nn_model.parameters(), lr=0.01)
+        self.nn_criterion = nn.BCELoss()
+        self.load_nn_model()
         
         # Pattern detection parameters
         self.min_pattern_occurrence = 2
@@ -1145,7 +1169,7 @@ class PatternLearner:
         ])
         cluster_id = self.kmeans.predict(state_point)
 
-        # ── 4. Supervised Win Probability (Naive Bayes) ───────────────────────
+        # ── 4. Supervised Win Probability (PyTorch Neural Net / Naive Bayes Fallback) ──
         h1_bias = current_features.get('active_bias', 0)
         m15_sweep = current_features.get('liq_sweep_type', 0)
         m5_mss = current_features.get('mss_signal', 0)
@@ -1165,7 +1189,18 @@ class PatternLearner:
             'smc_confidence': float(smc_confidence)
         }
 
-        win_prob = self.classifier.predict_probability(disc_feat, cont_feat)
+        win_prob = 0.5
+        try:
+            feat_arr = self.extract_nn_features(current_features)
+            feat_tensor = torch.tensor(feat_arr).unsqueeze(0)
+            with torch.no_grad():
+                win_prob = float(self.nn_model(feat_tensor).item())
+        except Exception as e:
+            self.logger.error(f"Error during neural net prediction: {e}")
+            try:
+                win_prob = self.classifier.predict_probability(disc_feat, cont_feat)
+            except Exception:
+                win_prob = 0.5
 
         # ── 5. SMC pattern confidence boost/penalty ───────────────────────────
         # If SMC patterns align with bias, boost win probability
@@ -1295,3 +1330,102 @@ class PatternLearner:
                 self.logger.info(f"Loaded {sum(len(p) for p in self.patterns.values())} SMC patterns from disk")
             except Exception as e:
                 self.logger.error(f"Failed to load patterns from file: {e}")
+
+    def load_nn_model(self):
+        """Load PyTorch neural network weights if available."""
+        model_path = "models/pulse_viper_base.pth"
+        try:
+            os.makedirs("models", exist_ok=True)
+            if os.path.exists(model_path):
+                state_dict = torch.load(model_path, map_location=torch.device('cpu'))
+                self.nn_model.load_state_dict(state_dict)
+                self.nn_model.eval()
+                self.logger.info("🧠 PyTorch neural net weights loaded successfully.")
+            else:
+                self.logger.warning(f"PyTorch pre-trained weights not found at {model_path}. Running with initialized weights.")
+                self.nn_model.eval()
+        except Exception as e:
+            self.logger.error(f"Error loading PyTorch neural net: {e}")
+            self.nn_model.eval()
+
+    @staticmethod
+    def extract_nn_features(features: dict) -> np.ndarray:
+        """
+        Convert market features dict to an 8-dimensional numpy array for the PyTorch Neural Net.
+        """
+        try:
+            # 1. Bias
+            bias = float(features.get('active_bias', 0.0))
+            
+            # 2. Sweep
+            sweep = float(features.get('liq_sweep_type', 0.0))
+            
+            # 3. MSS
+            mss = float(features.get('mss_signal', 0.0))
+            
+            # 4. FVG Class
+            fvg_class_str = str(features.get('fvg_class', 'none')).lower()
+            fvg_class = 0.0
+            if 'fresh' in fvg_class_str:
+                fvg_class = 1.0
+            elif 'institutional' in fvg_class_str:
+                fvg_class = 0.8
+            elif 'active' in fvg_class_str:
+                fvg_class = 0.6
+            elif 'stale' in fvg_class_str:
+                fvg_class = 0.3
+                
+            # 5. Volatility
+            volatility = float(features.get('volatility', 0.0))
+            
+            # 6. ATR Pct
+            atr_pct = float(features.get('atr_pct', 0.0))
+            
+            # 7. RVOL
+            rvol = float(features.get('rvol', 1.0))
+            
+            # 8. Volume Pressure Pct
+            bp = float(features.get('buy_pressure', 50.0))
+            sp = float(features.get('sell_pressure', 50.0))
+            bp_pct = bp / (bp + sp + 1e-9)
+            
+            return np.array([bias, sweep, mss, fvg_class, volatility, atr_pct, rvol, bp_pct], dtype=np.float32)
+        except Exception:
+            return np.zeros(8, dtype=np.float32)
+
+    def train_incremental(self, trades: List[Dict]):
+        """
+        Run a single optimization epoch on a batch of closed trades to adjust neural net weights.
+        Each trade dict must contain features and the outcome (win: 1 or loss: 0).
+        """
+        try:
+            if not trades:
+                return
+            
+            inputs = []
+            targets = []
+            
+            for t in trades:
+                feat = self.extract_nn_features(t.get('features', {}))
+                inputs.append(feat)
+                outcome = 1.0 if float(t.get('pnl', 0.0)) > 0 else 0.0
+                targets.append([outcome])
+                
+            inputs_tensor = torch.tensor(np.array(inputs, dtype=np.float32))
+            targets_tensor = torch.tensor(np.array(targets, dtype=np.float32))
+            
+            self.nn_model.train()
+            self.nn_optimizer.zero_grad()
+            outputs = self.nn_model(inputs_tensor)
+            loss = self.nn_criterion(outputs, targets_tensor)
+            loss.backward()
+            self.nn_optimizer.step()
+            self.nn_model.eval()
+            
+            # Save updated weights back
+            os.makedirs("models", exist_ok=True)
+            torch.save(self.nn_model.state_dict(), "models/pulse_viper_base.pth")
+            self.logger.info(f"🔄 Online Learning Epoch complete on {len(trades)} samples. Loss: {loss.item():.4f}. Weights saved.")
+        except Exception as e:
+            self.logger.error(f"Error during incremental training: {e}")
+            self.nn_model.eval()
