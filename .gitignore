@@ -1,4 +1,4 @@
-﻿venv/
+venv/
 __pycache__/
 *.pyc
 logs/
@@ -6,3 +6,14 @@ data/*.csv
 models/
 *.pt
 .env
+
+# PyInstaller build files
+build/
+dist/
+*.spec
+
+# Caches and DBs
+data/trade_history.db
+data/experience_memory.pkl
+configs/sentiment_cache.json
+

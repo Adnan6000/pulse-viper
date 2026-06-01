@@ -102,6 +102,57 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             100% { transform: scale(0.95); opacity: 0.8; }
         }
 
+        /* ── Regime Pills & News Lockout Animations ────────── */
+        .regime-pill {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 700;
+            text-align: center;
+            border: 1px solid transparent;
+            box-shadow: 0 0 10px rgba(255, 255, 255, 0.05);
+            transition: all 0.3s ease;
+        }
+        .regime-trending {
+            background: rgba(46, 204, 113, 0.15);
+            color: var(--color-green) !important;
+            border-color: rgba(46, 204, 113, 0.3);
+            box-shadow: 0 0 15px rgba(46, 204, 113, 0.25);
+        }
+        .regime-range {
+            background: rgba(255, 215, 0, 0.15);
+            color: var(--color-gold) !important;
+            border-color: rgba(255, 215, 0, 0.3);
+            box-shadow: 0 0 15px rgba(255, 215, 0, 0.2);
+        }
+        .regime-compression {
+            background: rgba(0, 210, 211, 0.15);
+            color: var(--color-blue) !important;
+            border-color: rgba(0, 210, 211, 0.3);
+            box-shadow: 0 0 15px rgba(0, 210, 211, 0.25);
+        }
+        .regime-chaotic {
+            background: rgba(255, 71, 87, 0.15);
+            color: var(--color-red) !important;
+            border-color: rgba(255, 71, 87, 0.3);
+            box-shadow: 0 0 15px rgba(255, 71, 87, 0.3);
+            animation: pulse-red-scale 1.5s infinite alternate;
+        }
+        @keyframes pulse-red-scale {
+            0% { transform: scale(1.0); }
+            100% { transform: scale(1.05); }
+        }
+        @keyframes pulse-red-bg {
+            0% { border-color: rgba(255, 71, 87, 0.3); box-shadow: 0 0 15px rgba(255, 71, 87, 0.1); }
+            100% { border-color: rgba(255, 71, 87, 0.6); box-shadow: 0 0 25px rgba(255, 71, 87, 0.3); }
+        }
+        @keyframes rotate-warning {
+            0% { transform: scale(1.0); }
+            50% { transform: scale(1.2); }
+            100% { transform: scale(1.0); }
+        }
+
         /* ── Three-Column Main Content Grid ───────────────── */
         .dashboard-container {
             display: grid;
@@ -764,6 +815,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <span class="slider"></span>
                 </label>
             </div>
+            <div class="setting-row">
+                <div class="setting-info">
+                    <span class="setting-name">Dynamic Risk Sizing</span>
+                    <span class="setting-desc">Scale risk dynamically on spread/volatility</span>
+                </div>
+                <label class="switch">
+                    <input type="checkbox" id="toggle-dynamic-risk" onchange="toggleSetting('dynamic_risk_enabled')">
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <div class="setting-row">
+                <div class="setting-info">
+                    <span class="setting-name">Dynamic Regime Filter</span>
+                    <span class="setting-desc">Block entries during chaotic/consolidation phases</span>
+                </div>
+                <label class="switch">
+                    <input type="checkbox" id="toggle-regime-filter" onchange="toggleSetting('dynamic_regime_filter')">
+                    <span class="slider"></span>
+                </label>
+            </div>
             <div class="setting-row" style="margin-top:10px;">
                 <div class="setting-info">
                     <span class="setting-name">Risk Percent</span>
@@ -838,10 +909,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <!-- Session Banner Row with UTC and Local Clocks -->
         <div class="session-banner-row" style="display: flex; align-items: center; justify-content: space-between; background: var(--glass-bg); border: 1px solid var(--glass-border); padding: 8px 16px; border-radius: 12px; margin-bottom: 12px; flex-wrap: wrap; gap: 12px;">
-            <div style="display: flex; align-items: center; gap: 8px;">
-                <span style="font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Active Sessions:</span>
-                <div id="header-sessions" style="display: flex; gap: 6px; align-items: center;">
-                    <span style="color: var(--text-muted); font-size: 11px;">Loading sessions...</span>
+            <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <span style="font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Active Sessions:</span>
+                    <div id="header-sessions" style="display: flex; gap: 6px; align-items: center;">
+                        <span style="color: var(--text-muted); font-size: 11px;">Loading sessions...</span>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 8px; border-left: 1px solid rgba(255,255,255,0.08); padding-left: 16px;">
+                    <span style="font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Session Quality:</span>
+                    <span id="forex-session-badge" style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 5px; padding: 4px 10px; font-size: 11px; font-weight: 700; color: var(--text-muted); display: inline-block;">OFF (0.0 PTS)</span>
                 </div>
             </div>
             <div style="display: flex; align-items: center; gap: 16px;">
@@ -871,6 +948,96 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="ticker-header">📰 NEWS</div>
                 <div class="ticker-wrap" id="news-ticker-wrap">
                     <span class="ticker-item" style="color: var(--text-muted);">No headlines loaded yet. Scraper starting...</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- News Lockout Alert Banner -->
+        <div id="news-lockout-banner" style="display: none; background: linear-gradient(90deg, rgba(255, 71, 87, 0.25), rgba(255, 71, 87, 0.05)); border: 1px solid rgba(255, 71, 87, 0.4); border-radius: 12px; padding: 12px 20px; align-items: center; gap: 15px; margin-bottom: 16px; box-shadow: 0 0 20px rgba(255, 71, 87, 0.2); animation: pulse-red-bg 2s infinite alternate;">
+            <div style="font-size: 20px; animation: rotate-warning 1s infinite linear;">🚨</div>
+            <div style="display: flex; flex-direction: column; gap: 2px; flex: 1;">
+                <span style="font-weight: 700; font-size: 13px; color: var(--color-red); letter-spacing: 0.5px;">ECONOMIC NEWS LOCKOUT GATED ACTIVE</span>
+                <span id="news-lockout-details" style="font-size: 11px; color: var(--text-muted);">US Core CPI YoY @ 12:30 UTC. New setups locked.</span>
+            </div>
+            <div style="font-size: 10px; font-weight: 800; background: var(--color-red); color: white; padding: 4px 8px; border-radius: 6px; text-transform: uppercase;">gated</div>
+        </div>
+
+        <!-- Phase 9: Brain Score Gauge Widget -->
+        <div id="brain-score-widget" style="background: linear-gradient(135deg, rgba(15,20,40,0.95) 0%, rgba(20,15,45,0.95) 100%); border: 1px solid rgba(120, 100, 255, 0.3); border-radius: 14px; padding: 16px 20px; margin-bottom: 16px; box-shadow: 0 0 30px rgba(100, 80, 255, 0.12); position: relative; overflow: hidden;">
+            <!-- Decorative background glow -->
+            <div style="position: absolute; top: -20px; right: -20px; width: 120px; height: 120px; background: radial-gradient(circle, rgba(100,80,255,0.15) 0%, transparent 70%); pointer-events: none;"></div>
+            <div style="position: absolute; bottom: -20px; left: -20px; width: 80px; height: 80px; background: radial-gradient(circle, rgba(0,220,130,0.08) 0%, transparent 70%); pointer-events: none;"></div>
+
+            <div style="display: flex; align-items: center; gap: 20px; position: relative; z-index: 1;">
+                <!-- SVG Arc Gauge -->
+                <div style="flex-shrink: 0; position: relative; width: 110px; height: 75px;">
+                    <svg viewBox="0 0 120 80" width="110" height="75" style="overflow: visible;">
+                        <!-- Track arc (grey) -->
+                        <path d="M 10 70 A 55 55 0 0 1 110 70" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="10" stroke-linecap="round"/>
+                        <!-- Gradient definitions -->
+                        <defs>
+                            <linearGradient id="brainGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                                <stop offset="0%" stop-color="#ff3366"/>
+                                <stop offset="40%" stop-color="#ff8800"/>
+                                <stop offset="70%" stop-color="#ffcc00"/>
+                                <stop offset="100%" stop-color="#00ff88"/>
+                            </linearGradient>
+                        </defs>
+                        <!-- Score arc (colored, animated) -->
+                        <path id="brain-arc" d="M 10 70 A 55 55 0 0 1 110 70" fill="none" stroke="url(#brainGrad)" stroke-width="10" stroke-linecap="round"
+                              stroke-dasharray="172.8" stroke-dashoffset="172.8" style="transition: stroke-dashoffset 0.8s cubic-bezier(0.4, 0, 0.2, 1);"/>
+                        <!-- Threshold marker -->
+                        <circle id="brain-threshold-marker" cx="60" cy="15" r="3" fill="rgba(255,255,255,0.4)" style="transition: all 0.5s;"/>
+                        <!-- Score text -->
+                        <text x="60" y="62" text-anchor="middle" font-family="'Outfit', sans-serif" font-size="22" font-weight="800" fill="white" id="brain-score-text">0</text>
+                        <text x="60" y="74" text-anchor="middle" font-family="'Inter', sans-serif" font-size="7" font-weight="600" fill="rgba(255,255,255,0.4)">/ 100</text>
+                    </svg>
+                    <!-- Label below gauge -->
+                    <div id="brain-label-text" style="text-align: center; font-size: 9px; font-weight: 800; letter-spacing: 1px; margin-top: 2px; color: #ff3366; text-transform: uppercase; transition: color 0.5s;">BLOCKED</div>
+                </div>
+
+                <!-- Brain info panel -->
+                <div style="flex: 1; display: flex; flex-direction: column; gap: 6px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <span style="font-size: 14px;">&#129504;</span>
+                            <span style="font-size: 12px; font-weight: 800; color: rgba(255,255,255,0.9); letter-spacing: 0.5px;">AI BRAIN SCORE</span>
+                        </div>
+                        <div id="brain-direction-badge" style="font-size: 10px; font-weight: 800; padding: 3px 8px; border-radius: 6px; background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.4); border: 1px solid rgba(255,255,255,0.1); letter-spacing: 1px; transition: all 0.4s;">&#8212; IDLE</div>
+                    </div>
+                    <!-- Tier scores -->
+                    <div style="display: flex; flex-direction: column; gap: 4px; margin-top: 1px;">
+                        <div style="display: flex; align-items: center; gap: 6px; font-size: 9px;">
+                            <span style="width: 46px; color: rgba(255,255,255,0.4); font-weight: 700;">DIRECT</span>
+                            <div style="flex:1; height: 5px; background: rgba(255,255,255,0.07); border-radius: 3px; overflow:hidden;">
+                                <div id="brain-tier1-bar" style="height:100%; width:0%; background: #5577ff; border-radius:3px; transition:width 0.7s ease;"></div>
+                            </div>
+                            <span id="brain-tier1-val" style="width: 30px; text-align:right; color: rgba(255,255,255,0.55); font-weight:700;">0/50</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 6px; font-size: 9px;">
+                            <span style="width: 46px; color: rgba(255,255,255,0.4); font-weight: 700;">EXEC</span>
+                            <div style="flex:1; height: 5px; background: rgba(255,255,255,0.07); border-radius: 3px; overflow:hidden;">
+                                <div id="brain-tier2-bar" style="height:100%; width:0%; background: #ffaa00; border-radius:3px; transition:width 0.7s ease;"></div>
+                            </div>
+                            <span id="brain-tier2-val" style="width: 30px; text-align:right; color: rgba(255,255,255,0.55); font-weight:700;">0/35</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 6px; font-size: 9px;">
+                            <span style="width: 46px; color: rgba(255,255,255,0.4); font-weight: 700;">RISK</span>
+                            <div style="flex:1; height: 5px; background: rgba(255,255,255,0.07); border-radius: 3px; overflow:hidden;">
+                                <div id="brain-tier3-bar" style="height:100%; width:0%; background: #00cc88; border-radius:3px; transition:width 0.7s ease;"></div>
+                            </div>
+                            <span id="brain-tier3-val" style="width: 30px; text-align:right; color: rgba(255,255,255,0.55); font-weight:700;">0/15</span>
+                        </div>
+                    </div>
+                    <!-- Threshold + block reason row -->
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-top:1px;">
+                        <div style="font-size: 10px; color: rgba(255,255,255,0.35);">Threshold: <span id="brain-threshold-display" style="color: rgba(255,255,255,0.6); font-weight: 700;">55</span> pts</div>
+                        <div id="brain-block-reason" style="font-size: 9px; font-weight: 700; color: rgba(255,255,255,0.25); letter-spacing: 0.5px;"></div>
+                    </div>
+                    <!-- Component micro-bars -->
+                    <div id="brain-breakdown-bars" style="display: flex; flex-direction: column; gap: 3px; margin-top: 1px;">
+                        <!-- Populated by JS -->
+                    </div>
                 </div>
             </div>
         </div>
@@ -988,6 +1155,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="bias-indicator" id="usd-forecast-card" style="background:rgba(0,168,255,0.05); border:1px solid rgba(0,168,255,0.15); padding:10px 14px; border-radius:10px; display:flex; justify-content:space-between; align-items:center; font-size:12px;">
                     <span class="dial-label" style="color:var(--color-blue); font-weight:700;">USD Forecast Bias</span>
                     <span id="lbl-usd-forecast" style="font-weight:700; padding:2px 8px; border-radius:4px; color:var(--color-blue); border:1px solid var(--color-blue); text-shadow:0 0 5px var(--glow-blue);">NEUTRAL</span>
+                </div>
+
+                <div class="bias-indicator" style="background:rgba(255,255,255,0.02); padding:10px 14px; border-radius:10px; display:flex; flex-direction:column; gap:8px; font-size:12px;">
+                    <div style="display:flex; justify-content:space-between; font-weight:700;">
+                        <span style="color:var(--text-muted);">Resting Liquidity Pools</span>
+                        <span style="color:var(--color-blue);" id="pool-count">0 Active</span>
+                    </div>
+                    <div id="liquidity-pools-container" style="display:flex; flex-direction:column; gap:6px; max-height:120px; overflow-y:auto; margin-top:2px;">
+                        <span style="color:var(--text-muted); font-size:11px; text-align:center;">No active liquidity pools mapped.</span>
+                    </div>
                 </div>
 
                 <div style="font-size:13px; font-weight:600; border-top:1px solid rgba(255,255,255,0.05); padding-top:10px; margin-top:5px;">
@@ -1192,7 +1369,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     
                     <div style="display:flex; flex-direction:column; gap:6px;">
                         <div style="font-size:11px; font-weight:600; color:var(--text-muted);">Execution Skip Logs</div>
-                        <div style="display:grid; grid-template-columns: repeat(2,1fr); gap:6px;">
+                        <div style="display:grid; grid-template-columns: repeat(3,1fr); gap:6px;">
                             <div style="background:rgba(0,0,0,0.1); padding:6px; border-radius:6px; border:1px solid var(--glass-border); text-align:center;">
                                 <div style="font-size:14px; font-weight:700; color:var(--color-red);" id="skip-spread">0</div>
                                 <div style="font-size:9px; color:var(--text-muted);">High Spread</div>
@@ -1200,6 +1377,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             <div style="background:rgba(0,0,0,0.1); padding:6px; border-radius:6px; border:1px solid var(--glass-border); text-align:center;">
                                 <div style="font-size:14px; font-weight:700; color:var(--color-gold);" id="skip-news">0</div>
                                 <div style="font-size:9px; color:var(--text-muted);">News Blocks</div>
+                            </div>
+                            <div style="background:rgba(0,0,0,0.1); padding:6px; border-radius:6px; border:1px solid rgba(100,80,255,0.4); text-align:center;">
+                                <div style="font-size:14px; font-weight:700; color:#7b6dff;" id="skip-brain">0</div>
+                                <div style="font-size:9px; color:var(--text-muted);">Brain Blocks</div>
                             </div>
                         </div>
                     </div>
@@ -1231,6 +1412,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <div style="display:flex; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,0.03); padding-bottom:4px;">
                             <span>Daily Max Trade Limit</span>
                             <span id="diag-daily" style="color:var(--color-green); font-weight:700;">PASSED</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,0.03); padding-bottom:4px;">
+                            <span>Safety Halt Status</span>
+                            <span id="diag-safety-halt" style="color:var(--color-green); font-weight:700;">PASSED</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,0.03); padding-bottom:4px;">
+                            <span>Daily P&L / Drawdown</span>
+                            <span id="diag-daily-pnl" style="color:var(--text-primary); font-weight:700;">$0.00 (0.00%)</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,0.03); padding-bottom:4px;">
+                            <span>Weekly P&L / Drawdown</span>
+                            <span id="diag-weekly-pnl" style="color:var(--text-primary); font-weight:700;">$0.00 (0.00%)</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,0.03); padding-bottom:4px;">
+                            <span>Consecutive Losses</span>
+                            <span id="diag-consec-losses" style="color:var(--text-primary); font-weight:700;">0</span>
                         </div>
                         <div style="display:flex; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,0.03); padding-bottom:4px;">
                             <span>Market Spread Validation</span>
@@ -2421,7 +2618,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 // Skip logs
                 const skipped = data.skipped_stats || {};
                 document.getElementById('skip-spread').innerText = skipped.high_spread || 0;
-                document.getElementById('skip-news').innerText = skipped.news_filter || 0;
+                if (document.getElementById('skip-news'))
+                    document.getElementById('skip-news').innerText = (skipped.news_filter || 0) + (skipped.regime_filter || 0);
+                if (document.getElementById('skip-brain'))
+                    document.getElementById('skip-brain').innerText = skipped.brain_filter || 0;
+
+
 
                 // Positions Table
                 const posBody = document.getElementById('positions-body');
@@ -2520,6 +2722,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('toggle-breakeven').checked = settings.break_even_enabled || false;
                 document.getElementById('toggle-news-filter').checked = settings.news_filter_enabled || false;
                 document.getElementById('toggle-self-learning').checked = settings.self_learning_filter || false;
+                document.getElementById('toggle-dynamic-risk').checked = settings.dynamic_risk_enabled !== false;
+                document.getElementById('toggle-regime-filter').checked = settings.dynamic_regime_filter !== false;
 
                 document.getElementById('input-risk').value = settings.risk_percent || 1.0;
                 document.getElementById('lbl-risk-val').innerText = `${(settings.risk_percent || 1.0).toFixed(2)}%`;
@@ -2629,7 +2833,177 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     2: 'Volatile Chop (Cluster 2)',
                     3: 'Trend Reversal (Cluster 3)'
                 };
-                document.getElementById('pred-regime').innerText = clusters[pred.cluster_id] || 'RANGING';
+                
+                // Update Market Regime (Pill)
+                const regimeEl = document.getElementById('pred-regime');
+                if (regimeEl && pred.market_regime) {
+                    regimeEl.innerText = pred.market_regime;
+                    regimeEl.className = `regime-pill regime-${pred.market_regime.toLowerCase()}`;
+                } else if (regimeEl) {
+                    regimeEl.innerText = clusters[pred.cluster_id] || 'RANGING';
+                    regimeEl.className = '';
+                }
+
+                // Update News Lockout Banner
+                const lockoutBanner = document.getElementById('news-lockout-banner');
+                const lockoutDetails = document.getElementById('news-lockout-details');
+                if (lockoutBanner && lockoutDetails) {
+                    if (pred.news_locked) {
+                        lockoutBanner.style.display = 'flex';
+                        lockoutDetails.innerText = pred.news_lockout_reason || 'High impact economic news active. Gated lockout enforced.';
+                    } else {
+                        lockoutBanner.style.display = 'none';
+                    }
+                }
+
+                // Update Resting Liquidity Pools
+                const poolsContainer = document.getElementById('liquidity-pools-container');
+                const poolCountEl = document.getElementById('pool-count');
+                if (poolsContainer && poolCountEl) {
+                    const pools = pred.resting_pools || [];
+                    poolCountEl.innerText = `${pools.length} Active`;
+                    if (pools.length > 0) {
+                        poolsContainer.innerHTML = pools.map(p => {
+                            const isBuyStop = p.type === 'BUY_STOP';
+                            const badgeColor = isBuyStop ? 'var(--color-green)' : 'var(--color-red)';
+                            const badgeText = isBuyStop ? 'BSL' : 'SSL';
+                            return `
+                                <div style="display:flex; justify-content:space-between; align-items:center; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); padding:6px 10px; border-radius:6px; font-size:11px;">
+                                    <div style="display:flex; align-items:center; gap:6px;">
+                                        <span style="font-size:8px; font-weight:800; padding:2px 4px; border-radius:3px; background:${badgeColor}15; color:${badgeColor}; border:1px solid ${badgeColor}30;">${badgeText}</span>
+                                        <span style="font-weight:600; color:var(--text-primary);">${p.pool_id}</span>
+                                    </div>
+                                    <div style="display:flex; flex-direction:column; align-items:flex-end;">
+                                        <span style="font-family:'Outfit',sans-serif; font-weight:700; color:var(--text-primary);">${p.price.toFixed(2)}</span>
+                                        <span style="font-size:9px; color:var(--text-muted);">${p.touches} touches</span>
+                                    </div>
+                                </div>
+                            `;
+                        }).join('');
+                    } else {
+                        poolsContainer.innerHTML = `<span style="color:var(--text-muted); font-size:11px; text-align:center; padding:5px;">No active liquidity pools mapped.</span>`;
+                    }
+                }
+
+                // ── Phase 9 v2: Brain Score Gauge Update ─────────────────────────────
+                const brainArc = document.getElementById('brain-arc');
+                const brainScoreText = document.getElementById('brain-score-text');
+                const brainLabelText = document.getElementById('brain-label-text');
+                const brainDirectionBadge = document.getElementById('brain-direction-badge');
+                const brainThresholdDisplay = document.getElementById('brain-threshold-display');
+                const brainBreakdownBars = document.getElementById('brain-breakdown-bars');
+                const brainBlockReason = document.getElementById('brain-block-reason');
+
+                if (brainArc && pred.brain_score !== undefined) {
+                    const score = parseFloat(pred.brain_score) || 0;
+                    const threshold = parseFloat(pred.brain_threshold) || 55;
+                    const label = pred.brain_label || 'BLOCKED';
+                    const direction = pred.brain_direction;
+                    const blockReason = pred.brain_block_reason || '';
+                    const t1 = parseFloat(pred.brain_tier1) || 0;
+                    const t2 = parseFloat(pred.brain_tier2) || 0;
+                    const t3 = parseFloat(pred.brain_tier3) || 0;
+
+                    // ── Arc gauge animation ──
+                    const arcLength = 172.8;
+                    const offset = arcLength - (score / 100) * arcLength;
+                    brainArc.style.strokeDashoffset = offset.toFixed(1);
+
+                    // ── Color zone ──
+                    let scoreColor = '#ff3366';
+                    if (score >= 75) scoreColor = '#00ff88';
+                    else if (score >= 55) scoreColor = '#ffcc00';
+                    else if (score >= 40) scoreColor = '#ff8800';
+
+                    // ── Score text + label ──
+                    if (brainScoreText) brainScoreText.textContent = Math.round(score);
+                    if (brainLabelText) { brainLabelText.textContent = label; brainLabelText.style.color = scoreColor; }
+                    if (brainThresholdDisplay) brainThresholdDisplay.textContent = Math.round(threshold);
+
+                    // ── Block reason display ──
+                    if (brainBlockReason) {
+                        const reasonLabel = {
+                            'NEWS_LOCKOUT': 'NEWS LOCK',
+                            'CHAOTIC_REGIME': 'CHAOTIC',
+                            'SCORE_BELOW_THRESHOLD': 'LOW SCORE',
+                            'DIRECTIONAL_CONFLICT': 'CONFLICT',
+                        };
+                        brainBlockReason.textContent = reasonLabel[blockReason] || (direction ? '' : blockReason);
+                        brainBlockReason.style.color = direction ? '#00ff88' : '#ff8800';
+                    }
+
+                    // ── Direction badge ──
+                    if (brainDirectionBadge) {
+                        if (direction === 'BUY') {
+                            brainDirectionBadge.textContent = '\u25b2 BUY';
+                            brainDirectionBadge.style.background = 'rgba(0,220,130,0.15)';
+                            brainDirectionBadge.style.color = '#00dc82';
+                            brainDirectionBadge.style.borderColor = 'rgba(0,220,130,0.4)';
+                        } else if (direction === 'SELL') {
+                            brainDirectionBadge.textContent = '\u25bc SELL';
+                            brainDirectionBadge.style.background = 'rgba(255,51,102,0.15)';
+                            brainDirectionBadge.style.color = '#ff3366';
+                            brainDirectionBadge.style.borderColor = 'rgba(255,51,102,0.4)';
+                        } else {
+                            const badge = blockReason === 'DIRECTIONAL_CONFLICT' ? '\u2296 CONFLICT' : '\u2014 IDLE';
+                            brainDirectionBadge.textContent = badge;
+                            brainDirectionBadge.style.background = 'rgba(255,255,255,0.05)';
+                            brainDirectionBadge.style.color = 'rgba(255,255,255,0.4)';
+                            brainDirectionBadge.style.borderColor = 'rgba(255,255,255,0.1)';
+                        }
+                    }
+
+                    // ── Tier score bars (T1/50, T2/35, T3/15) ──
+                    const tier1Bar = document.getElementById('brain-tier1-bar');
+                    const tier2Bar = document.getElementById('brain-tier2-bar');
+                    const tier3Bar = document.getElementById('brain-tier3-bar');
+                    const tier1Val = document.getElementById('brain-tier1-val');
+                    const tier2Val = document.getElementById('brain-tier2-val');
+                    const tier3Val = document.getElementById('brain-tier3-val');
+                    if (tier1Bar) tier1Bar.style.width = ((t1 / 50) * 100).toFixed(1) + '%';
+                    if (tier2Bar) tier2Bar.style.width = ((t2 / 35) * 100).toFixed(1) + '%';
+                    if (tier3Bar) tier3Bar.style.width = ((t3 / 15) * 100).toFixed(1) + '%';
+                    if (tier1Val) tier1Val.textContent = t1.toFixed(0) + '/50';
+                    if (tier2Val) tier2Val.textContent = t2.toFixed(0) + '/35';
+                    if (tier3Val) tier3Val.textContent = t3.toFixed(0) + '/15';
+
+                    // ── Component micro-bars (v2 key names) ──
+                    if (brainBreakdownBars) {
+                        const reasonMap = pred.brain_reason_map || {};
+                        // v2 reason_map uses t1_*, t2_*, t3_* prefixed keys
+                        const compDefs = [
+                            { key: 't1_d1',           label: 'D1 Bias',   max: 18  },
+                            { key: 't1_h4',           label: 'H4 Bias',   max: 14  },
+                            { key: 't1_h1',           label: 'H1 Bias',   max: 11  },
+                            { key: 't2_structure',    label: 'Structure', max: 12  },
+                            { key: 't2_fvg',          label: 'FVG',       max: 7   },
+                            { key: 't2_vsa',          label: 'VSA',       max: 10  },
+                            { key: 't2_volume',       label: 'Volume',    max: 4   },
+                            { key: 't2_ai_confidence',label: 'AI Conf',   max: 8   },
+                            { key: 't3_regime_quality', label: 'Regime',  max: 15  },
+                            { key: 'strategy_confirm', label: 'Strategy', max: 2   },
+                        ].filter(d => reasonMap[d.key] !== undefined && Math.abs(reasonMap[d.key]) > 0);
+
+                        if (compDefs.length > 0) {
+                            brainBreakdownBars.innerHTML = compDefs.map(d => {
+                                const val = parseFloat(reasonMap[d.key]) || 0;
+                                const absVal = Math.abs(val);
+                                const pct = d.max > 0 ? Math.min(100, (absVal / d.max) * 100) : 0;
+                                const isNeg = val < 0;
+                                const barCol = isNeg ? '#ff3366' : (pct >= 70 ? '#00ff88' : pct >= 35 ? '#ffcc00' : '#5577ff');
+                                return `<div style="display:flex;align-items:center;gap:5px;font-size:9px;">
+                                    <span style="width:48px;color:rgba(255,255,255,0.42);flex-shrink:0;overflow:hidden;white-space:nowrap;">${d.label}</span>
+                                    <div style="flex:1;height:4px;background:rgba(255,255,255,0.07);border-radius:2px;overflow:hidden;">
+                                        <div style="width:${pct.toFixed(1)}%;height:100%;background:${barCol};border-radius:2px;transition:width 0.6s ease;"></div>
+                                    </div>
+                                    <span style="width:24px;text-align:right;color:rgba(255,255,255,0.5);font-weight:700;">${isNeg ? '-' : ''}${absVal.toFixed(0)}</span>
+                                </div>`;
+                            }).join('');
+                        } else {
+                            brainBreakdownBars.innerHTML = '';
+                        }
+                    }
+                }
 
                 const trainStatsEl = document.getElementById('pred-train-stats');
                 if (trainStatsEl) {
@@ -2689,6 +3063,65 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 } else {
                     dailyEl.innerText = 'PASSED 🟢';
                     dailyEl.style.color = 'var(--color-green)';
+                }
+
+                // Update Safety diagnostics elements (Phase 10)
+                const safetyHaltEl = document.getElementById('diag-safety-halt');
+                if (safetyHaltEl) {
+                    if (pred.safety_halt) {
+                        safetyHaltEl.innerText = 'HALTED 🛑';
+                        safetyHaltEl.style.color = 'var(--color-red)';
+                    } else {
+                        safetyHaltEl.innerText = 'PASSED 🟢';
+                        safetyHaltEl.style.color = 'var(--color-green)';
+                    }
+                }
+
+                const sStats = pred.safety_stats || {};
+                const dailyPnlEl = document.getElementById('diag-daily-pnl');
+                if (dailyPnlEl && sStats.daily_pnl !== undefined) {
+                    const dPnl = parseFloat(sStats.daily_pnl) || 0;
+                    const dPct = bal > 0 ? (dPnl / bal) * 100.0 : 0;
+                    dailyPnlEl.innerHTML = `<span style="color:${dPnl >= 0 ? 'var(--color-green)' : 'var(--color-red)'}; font-weight:700;">$${dPnl.toFixed(2)} (${dPnl >= 0 ? '+' : ''}${dPct.toFixed(2)}%)</span>`;
+                }
+
+                const weeklyPnlEl = document.getElementById('diag-weekly-pnl');
+                if (weeklyPnlEl && sStats.weekly_pnl !== undefined) {
+                    const wPnl = parseFloat(sStats.weekly_pnl) || 0;
+                    const wPct = bal > 0 ? (wPnl / bal) * 100.0 : 0;
+                    weeklyPnlEl.innerHTML = `<span style="color:${wPnl >= 0 ? 'var(--color-green)' : 'var(--color-red)'}; font-weight:700;">$${wPnl.toFixed(2)} (${wPnl >= 0 ? '+' : ''}${wPct.toFixed(2)}%)</span>`;
+                }
+
+                const consecLossesEl = document.getElementById('diag-consec-losses');
+                if (consecLossesEl && sStats.consecutive_losses !== undefined) {
+                    const consec = parseInt(sStats.consecutive_losses) || 0;
+                    consecLossesEl.innerText = consec;
+                    consecLossesEl.style.color = consec > 0 ? 'var(--color-red)' : 'var(--text-primary)';
+                }
+
+                // Update Forex Session Badge (Phase 10)
+                const forexSessionBadge = document.getElementById('forex-session-badge');
+                if (forexSessionBadge && pred.session_name) {
+                    const sName = pred.session_name;
+                    const sScore = parseFloat(pred.session_score) || 0;
+                    forexSessionBadge.textContent = `${sName} (${sScore.toFixed(1)} PTS)`;
+                    if (sName === 'OVERLAP') {
+                        forexSessionBadge.style.color = '#00ff88'; // green
+                        forexSessionBadge.style.background = 'rgba(0, 255, 136, 0.15)';
+                        forexSessionBadge.style.borderColor = 'rgba(0, 255, 136, 0.4)';
+                    } else if (sName === 'LONDON' || sName === 'NEW_YORK') {
+                        forexSessionBadge.style.color = '#00a8ff'; // blue
+                        forexSessionBadge.style.background = 'rgba(0, 168, 255, 0.15)';
+                        forexSessionBadge.style.borderColor = 'rgba(0, 168, 255, 0.4)';
+                    } else if (sName === 'ASIAN') {
+                        forexSessionBadge.style.color = '#ffcc00'; // yellow
+                        forexSessionBadge.style.background = 'rgba(255, 204, 0, 0.15)';
+                        forexSessionBadge.style.borderColor = 'rgba(255, 204, 0, 0.4)';
+                    } else {
+                        forexSessionBadge.style.color = 'var(--text-muted)';
+                        forexSessionBadge.style.background = 'rgba(255,255,255,0.05)';
+                        forexSessionBadge.style.borderColor = 'rgba(255,255,255,0.1)';
+                    }
                 }
 
                 const spreadEl = document.getElementById('diag-spread');
@@ -2837,6 +3270,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             else if (key === 'break_even_enabled') chk = document.getElementById('toggle-breakeven').checked;
             else if (key === 'news_filter_enabled') chk = document.getElementById('toggle-news-filter').checked;
             else if (key === 'self_learning_filter') chk = document.getElementById('toggle-self-learning').checked;
+            else if (key === 'dynamic_risk_enabled') chk = document.getElementById('toggle-dynamic-risk').checked;
+            else if (key === 'dynamic_regime_filter') chk = document.getElementById('toggle-regime-filter').checked;
             sendSettingUpdate({ [key]: chk });
         }
 

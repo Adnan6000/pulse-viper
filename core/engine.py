@@ -24,6 +24,9 @@ from utils.volume_analyzer import VolumeAnalyzer
 from utils.sentiment_analyzer import sentiment_analyzer
 from strategies.crt_tbs import CrtTbsStrategy
 from dashboard.web_dashboard import WebDashboardServer
+from core.safety_engine import SafetyEngine
+from core.session_engine import SessionEngine
+from core.brain_calibrator import BrainCalibrator
 
 class AdvancedTradingEngine:
     def __init__(self, symbols=None, strategy_mode='smc', enable_dashboard=True, port=8000):
@@ -84,6 +87,29 @@ class AdvancedTradingEngine:
         self.backtester = AdaptiveBacktester()
         self._last_nightly_date = None  # Track last nightly run date
         
+        # Initialize Phase 8 engines
+        from core.market_regime import MarketRegimeDetector
+        from core.liquidity_map import LiquidityMap
+        from core.risk_engine import DynamicRiskEngine
+        from core.news_engine import NewsIntelligenceEngine
+        
+        self.regime_detector = MarketRegimeDetector()
+        self.liquidity_map = LiquidityMap()
+        self.risk_engine = DynamicRiskEngine()
+        self.news_engine = NewsIntelligenceEngine()
+        self.news_engine.start()
+        
+        # Initialize Phase 9 — AI Brain Layer (Trade Decision Synthesizer)
+        from core.trade_brain import TradeBrain
+        brain_threshold = settings_manager.get("brain_threshold", 55.0)
+        self.trade_brain = TradeBrain(base_threshold=brain_threshold)
+        self.logger.info(f"🧠 TradeBrain initialized (threshold={brain_threshold})")
+
+        # Initialize Phase 10 safety_engine, session_engine, and brain_calibrator
+        self.safety_engine = SafetyEngine()
+        self.session_engine = SessionEngine()
+        self.brain_calibrator = BrainCalibrator()
+        
         # Sync historical performance stats
         self._sync_performance_stats()
 
@@ -112,7 +138,8 @@ class AdvancedTradingEngine:
             "low_confidence": 0,
             "positions_limit": 0,
             "killzone_inactive": 0,
-            "no_fvg": 0
+            "no_fvg": 0,
+            "regime_filter": 0
         }
 
         # Start news sentiment analyzer background thread
@@ -349,6 +376,30 @@ class AdvancedTradingEngine:
                 self.logger.warning(f"Insufficient H1 bars for {symbol}")
                 return None
 
+            # ── 1.5 Phase 8 Core Intelligence Updates ──────────────────────────────
+            # A. News lockout check
+            news_locked = False
+            news_lockout_reason = None
+            if settings_manager.get("news_filter_enabled", True):
+                lockout_mins = settings_manager.get("news_lockout_minutes", 30)
+                cooldown_mins = settings_manager.get("news_cooldown_minutes", 15)
+                current_time_utc = datetime.now(timezone.utc)
+                news_locked, news_lockout_reason = self.news_engine.is_execution_locked(
+                    current_time_utc, lockout_mins, cooldown_mins
+                )
+
+            # B. Update Liquidity Map
+            asian_range = self.get_asian_range(symbol)
+            self.liquidity_map.update_pools(df_d1, df_h1, asian_range=asian_range)
+
+            # C. Market Regime Detection
+            rvol_val = self.volume_cache.get("rvol", 1.0) if hasattr(self, 'volume_cache') and self.volume_cache else 1.0
+            from core.market_regime import RegimeType
+            regime = self.regime_detector.detect_regime(df_m15, rvol_val)
+
+            # D. Session context (Phase 10)
+            session_ctx = self.session_engine.get_session_context()
+
             # ── 2. Compute SMC indicators on all available timeframes ───────────────
             smc = {}
             for tf_name, df in [('D1', df_d1), ('H4', df_h4), ('H1', df_h1),
@@ -576,6 +627,10 @@ class AdvancedTradingEngine:
             if not tick:
                 return None
 
+            # Check sweeps
+            ref_atr = float(latest_m1['atr']) if latest_m1 is not None and 'atr' in latest_m1 else 1.0
+            swept_pools = self.liquidity_map.check_sweeps(tick.bid, ref_atr)
+
             sentiment_payload = dict(self.sentiment_cache)
             sentiment_payload['pdh'] = self.pdh_cache.get(symbol, np.nan)
             sentiment_payload['pdl'] = self.pdl_cache.get(symbol, np.nan)
@@ -630,11 +685,31 @@ class AdvancedTradingEngine:
             except Exception:
                 pass
 
+            # Aggregate VSA signals list for Brain scoring
+            vsa_signals_combined = []
+            for vsa_item in (vsa_m1 or []):
+                sig_name = vsa_item.get('pattern', '') if isinstance(vsa_item, dict) else str(vsa_item)
+                if sig_name:
+                    vsa_signals_combined.append(sig_name)
+            for vsa_item in (vsa_m5 or []):
+                sig_name = vsa_item.get('pattern', '') if isinstance(vsa_item, dict) else str(vsa_item)
+                if sig_name and sig_name not in vsa_signals_combined:
+                    vsa_signals_combined.append(sig_name)
+
+            buy_pressure_val = self.volume_cache.get('buy_pressure', 50.0) if self.volume_cache else 50.0
+            sell_pressure_val = self.volume_cache.get('sell_pressure', 50.0) if self.volume_cache else 50.0
+
             analysis = {
                 'symbol': symbol,
                 'price': tick.bid,
                 'bid': tick.bid,
                 'ask': tick.ask,
+                # Phase 8 Core Intelligence outputs
+                'news_locked': news_locked,
+                'news_lockout_reason': news_lockout_reason,
+                'market_regime': regime.name,
+                'swept_pools': swept_pools,
+                'resting_pools': self.liquidity_map.get_resting_pools(),
                 # 6-TF bias states
                 'htf_bias': htf_bias,
                 'd1_bias': d1_bias,
@@ -659,6 +734,18 @@ class AdvancedTradingEngine:
                 'atr_pct': float(ref_ltf['atr_pct']) if ref_ltf is not None else 0.0,
                 'atr': float(ref_ltf['atr']) if ref_ltf is not None else 1.0,
                 'hour': datetime.now(timezone.utc).hour,
+                # Phase 9 Brain Layer inputs
+                'vsa_signals': vsa_signals_combined,
+                'buy_pressure': buy_pressure_val,
+                'sell_pressure': sell_pressure_val,
+                # Brain score will be populated in evaluate_entry_rules()
+                'brain_score': 0.0,
+                'brain_direction': None,
+                'brain_threshold': settings_manager.get('brain_threshold', 55.0),
+                'brain_reason_map': {},
+                # Session intelligence outputs
+                'session_name': session_ctx['session_name'],
+                'session_score': session_ctx['session_score'],
                 # Strategy outputs
                 'fib_action': fib_action, 'fib_regime': fib_regime,
                 'fib_sl': fib_sl, 'fib_tp': fib_tp, 'fib_metadata': fib_metadata,
@@ -686,7 +773,9 @@ class AdvancedTradingEngine:
                     'volatility': float(ref_ltf['volatility']) if ref_ltf is not None else 0.0,
                     'hour': datetime.now(timezone.utc).hour,
                     'price': tick.bid,
-                    'tf_aligned': tf_alignment.get('aligned', False)
+                    'tf_aligned': tf_alignment.get('aligned', False),
+                    'market_regime': regime.name,
+                    'news_locked': news_locked
                 }
             }
 
@@ -733,6 +822,13 @@ class AdvancedTradingEngine:
             if current_candle == self.last_close_candle.get(symbol, 0):
                 return None
                 
+        # Rule 0.1: Safety Engine Check (consecutive losses / drawdown)
+        allowed, safety_reason = self.safety_engine.check_entry_allowed()
+        if not allowed:
+            self.skipped_stats['safety_halt'] = self.skipped_stats.get('safety_halt', 0) + 1
+            analysis['brain_block_reason'] = "SAFETY_HALT"
+            return None
+
         bid = analysis['bid']
         ask = analysis['ask']
         atr = analysis['atr']
@@ -747,6 +843,33 @@ class AdvancedTradingEngine:
         if not self.is_killzone_active():
             self.skipped_stats['killzone_inactive'] = self.skipped_stats.get('killzone_inactive', 0) + 1
             return None
+
+        # Rule 1.1: News Lockout check
+        if analysis.get('news_locked', False):
+            self.skipped_stats['news_filter'] = self.skipped_stats.get('news_filter', 0) + 1
+            import time
+            current_time = time.time()
+            if not hasattr(self, '_last_news_log_time'):
+                self._last_news_log_time = 0
+            if current_time - self._last_news_log_time >= 60.0:
+                self.logger.warning(f"🚫 Trade entry blocked on {symbol} due to news lockout: {analysis.get('news_lockout_reason')}")
+                self._last_news_log_time = current_time
+            return None
+
+        # Rule 1.2: CHAOTIC regime — hard gate before Brain (defence-in-depth)
+        # COMPRESSION is handled by Brain v2 via raised threshold (65 pts) — NOT hard-blocked here
+        regime_str = analysis.get('market_regime', 'RANGE')
+        if settings_manager.get("dynamic_regime_filter", True):
+            if regime_str == "CHAOTIC":
+                self.skipped_stats['regime_filter'] = self.skipped_stats.get('regime_filter', 0) + 1
+                import time
+                current_time = time.time()
+                if not hasattr(self, '_last_regime_log_time'):
+                    self._last_regime_log_time = 0
+                if current_time - self._last_regime_log_time >= 60.0:
+                    self.logger.warning(f"🚫 Trade entry hard-blocked on {symbol}: CHAOTIC regime (pre-Brain gate)")
+                    self._last_regime_log_time = current_time
+                return None
             
         # Get active risk-reward ratio from mode
         trading_mode = settings_manager.get("trading_mode", "intraday").lower()
@@ -760,7 +883,7 @@ class AdvancedTradingEngine:
         # Allow override from settings
         rr_ratio = settings_manager.get("min_rr_ratio", rr_ratio)
 
-        # Get AI signal confidence/adjustment for logs only
+        # Get AI signal confidence from pattern learner
         ai_signal = self.pattern_learner.get_trading_signal(
             symbol,
             analysis['features'],
@@ -770,6 +893,43 @@ class AdvancedTradingEngine:
         )
         confidence = ai_signal.get('confidence', 0.5)
         adjustment = ai_signal.get('adjustment', 0.0)
+
+        # ── Phase 9 v2: TradeBrain probabilistic scoring gate ─────────────────
+        # Strategy signal passed as advisory — Brain decides direction authoritatively
+        strategy_signal = analysis.get('crt_action') or analysis.get('fib_action')
+        brain_result = self.trade_brain.evaluate(
+            analysis=analysis,
+            strategy_action=strategy_signal,
+            ai_confidence=confidence,
+            session_score=analysis.get('session_score', 0.0),
+        )
+        # Write brain results back into analysis for dashboard consumption
+        analysis['brain_score']      = brain_result.brain_score
+        analysis['brain_direction']  = brain_result.brain_direction
+        analysis['brain_threshold']  = brain_result.threshold
+        analysis['brain_reason_map'] = brain_result.reason_map
+        analysis['brain_label']      = self.trade_brain.get_score_label(brain_result.brain_score)
+        analysis['brain_color']      = self.trade_brain.get_color_zone(brain_result.brain_score)
+        analysis['brain_tier1']      = brain_result.tier1_score
+        analysis['brain_tier2']      = brain_result.tier2_score
+        analysis['brain_tier3']      = brain_result.tier3_score
+        analysis['brain_block_reason'] = brain_result.block_reason
+
+        if not brain_result.passed:
+            self.skipped_stats['brain_filter'] = self.skipped_stats.get('brain_filter', 0) + 1
+            # Log reason at reduced frequency
+            import time as _t
+            _now = _t.time()
+            if not hasattr(self, '_last_brain_block_log'):
+                self._last_brain_block_log = {}
+            if _now - self._last_brain_block_log.get(symbol, 0) >= 15.0:
+                self.logger.info(
+                    f"Brain blocked {symbol}: score={brain_result.brain_score:.1f}/{brain_result.threshold:.0f} "
+                    f"reason={brain_result.block_reason} "
+                    f"T1={brain_result.tier1_score:.0f}/50 T2={brain_result.tier2_score:.0f}/35 T3={brain_result.tier3_score:.0f}/15"
+                )
+                self._last_brain_block_log[symbol] = _now
+            return None
 
         # Position checking helper
         def can_trade_direction(action: str) -> bool:
@@ -786,16 +946,34 @@ class AdvancedTradingEngine:
             
         disabled_setups = settings_manager.get("disabled_setups", [])
         
-        # Priority 1: CRT + TBS Strategy
+        # ── FIX 4 (Brain v2 hierarchy): Brain decided direction above.
+        #    Strategy (CRT/SMC) now confirms EXECUTION QUALITY only — no direction control.
+        #    Hierarchy: Brain decides direction → Strategy confirms entry quality → Engine executes
+        brain_direction = analysis.get('brain_direction')   # authoritative direction from Brain
+
+        # Priority 1: CRT + TBS — execution quality confirmation only
         if active_strategy in ["crt_tbs", "both"]:
             if "CRT_TBS" not in disabled_setups:
                 crt_action = analysis.get('crt_action')
                 if crt_action in ["BUY", "SELL"] and can_trade_direction(crt_action):
-                    crt_sl = analysis.get('crt_sl', 0.0)
-                    crt_tp = analysis.get('crt_tp', 0.0)
-                    if crt_sl > 0.0 and crt_tp > 0.0:
-                        self.logger.info(f"🐢 Candle Range Theory (CRT) + Turtle Body Soup (TBS) setup identified on {symbol} | Action: {crt_action} | SL: {crt_sl:.2f}, TP: {crt_tp:.2f}")
-                        return crt_action, crt_sl, crt_tp, "CRT_TBS"
+                    # Execute if CRT agrees with Brain direction
+                    # (brain_direction is None = conflicted, also blocks here)
+                    if crt_action == brain_direction:
+                        crt_sl = analysis.get('crt_sl', 0.0)
+                        crt_tp = analysis.get('crt_tp', 0.0)
+                        if crt_sl > 0.0 and crt_tp > 0.0:
+                            self.logger.info(
+                                f"CRT+TBS {symbol} | dir={crt_action} | "
+                                f"Brain={analysis.get('brain_score', 0):.1f}/{analysis.get('brain_threshold', 55):.0f} "
+                                f"T1={analysis.get('brain_tier1', 0):.0f} T2={analysis.get('brain_tier2', 0):.0f} "
+                                f"| SL:{crt_sl:.2f} TP:{crt_tp:.2f}"
+                            )
+                            return crt_action, crt_sl, crt_tp, "CRT_TBS"
+                    elif brain_direction is not None:
+                        self.logger.info(
+                            f"CRT_TBS skipped: strategy={crt_action} conflicts Brain={brain_direction} "
+                            f"(score={analysis.get('brain_score', 0):.1f})"
+                        )
                     
         # Priority 2: SMC Strategy
         if active_strategy in ["smc", "both"]:
@@ -854,6 +1032,13 @@ class AdvancedTradingEngine:
                             self._last_block_log_time[symbol] = current_time
                         is_bearish_setup = False
         
+                # FIX 4: Brain v2 hierarchy — only execute in Brain's approved direction
+                # Brain has already decided direction; SMC entry must confirm, not override
+                if is_bullish_setup and brain_direction != "BUY":
+                    is_bullish_setup = False   # Brain did not approve BUY
+                if is_bearish_setup and brain_direction != "SELL":
+                    is_bearish_setup = False   # Brain did not approve SELL
+
                 if is_bullish_setup and can_trade_direction("BUY"):
                     entry_price = ask
                     
@@ -867,8 +1052,12 @@ class AdvancedTradingEngine:
                     # Ensure TP is aligned with major liquidity resistance
                     if analysis['resistance'] > entry_price:
                         tp_price = max(tp_price, analysis['resistance'])
-                        
-                    self.logger.info(f"🟢 BUY SMC setup identified on {symbol} | MSS: 1, Sweep: 1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
+                    
+                    brain_score = analysis.get('brain_score', 0)
+                    self.logger.info(
+                        f"🟢 BUY SMC on {symbol} | MSS:1 Sweep:1 FVG:{fvg_class} | "
+                        f"BrainScore={brain_score:.1f} RR:{rr_ratio:.2f}"
+                    )
                     return "BUY", sl_price, tp_price, setup_type
         
                 if is_bearish_setup and can_trade_direction("SELL"):
@@ -883,8 +1072,12 @@ class AdvancedTradingEngine:
                     
                     if analysis['support'] < entry_price:
                         tp_price = min(tp_price, analysis['support'])
-                        
-                    self.logger.info(f"🔴 SELL SMC setup identified on {symbol} | MSS: -1, Sweep: -1, FVG Class: {fvg_class} | RR: {rr_ratio:.2f}")
+                    
+                    brain_score = analysis.get('brain_score', 0)
+                    self.logger.info(
+                        f"🔴 SELL SMC on {symbol} | MSS:-1 Sweep:-1 FVG:{fvg_class} | "
+                        f"BrainScore={brain_score:.1f} RR:{rr_ratio:.2f}"
+                    )
                     return "SELL", sl_price, tp_price, setup_type
                     
         return None
@@ -926,13 +1119,53 @@ class AdvancedTradingEngine:
             self.last_entry_candle[symbol] = current_candle
             return
             
+        # Calculate dynamic risk percentage if enabled
+        risk_percent = None
+        if settings_manager.get("dynamic_risk_enabled", True):
+            try:
+                # Calculate median ATR over df_ltf
+                df_ltf = analysis.get('df_ltf')
+                if df_ltf is not None and 'atr' in df_ltf.columns:
+                    current_atr = float(df_ltf['atr'].iloc[-1])
+                    median_atr = float(df_ltf['atr'].rolling(window=min(len(df_ltf), 100), min_periods=1).median().iloc[-1])
+                else:
+                    current_atr = analysis.get('atr', 1.0)
+                    median_atr = current_atr
+                
+                # Fetch AI confidence score
+                ai_signal = self.pattern_learner.get_trading_signal(
+                    symbol,
+                    analysis['features'],
+                    df_ltf=analysis.get('df_ltf'),
+                    df_m5=analysis.get('df_m5'),
+                    df_h1=analysis.get('df_h1')
+                )
+                confidence = ai_signal.get('confidence', 0.8)
+                
+                active_positions = len(self.trade_manager.positions)
+                base_risk = settings_manager.get("risk_percent", 1.0)
+                
+                risk_percent = self.risk_engine.calculate_risk_percent(
+                    current_atr=current_atr,
+                    median_atr=median_atr,
+                    current_spread=spread,
+                    max_spread=max_spread,
+                    confidence=confidence,
+                    active_positions=active_positions,
+                    base_risk=base_risk
+                )
+            except Exception as risk_err:
+                self.logger.error(f"Error calculating dynamic risk: {risk_err}")
+                risk_percent = settings_manager.get("risk_percent", 1.0)
+            
         # Open trade via trade manager
         pos = self.trade_manager.open_position(
             symbol=symbol,
             action=action,
             entry_price=entry_price,
             sl_price=sl,
-            tp_price=tp
+            tp_price=tp,
+            risk_percent=risk_percent
         )
         
         # Record the entry candle timestamp to prevent double-entry (do this regardless of success to avoid immediate retry spam)
@@ -942,6 +1175,15 @@ class AdvancedTradingEngine:
         if pos:
             # Store initial entry features in positions for outcome learning
             pos.entry_features = analysis['features']
+            pos.brain_score = analysis.get('brain_score', 0.0)
+            pos.brain_tier1 = analysis.get('brain_tier1', 0.0)
+            pos.brain_tier2 = analysis.get('brain_tier2', 0.0)
+            pos.brain_tier3 = analysis.get('brain_tier3', 0.0)
+            pos.brain_direction = analysis.get('brain_direction')
+            pos.brain_block_reason = analysis.get('brain_block_reason')
+            pos.brain_reason_map = analysis.get('brain_reason_map', {})
+            pos.session = analysis.get('session_name', 'OFF')
+            pos.volatility_regime = analysis.get('market_regime', 'RANGE')
 
     def process_closed_positions(self):
         """Learn from closed positions and update the self-learning DB + trade journal"""
@@ -1035,8 +1277,7 @@ class AdvancedTradingEngine:
                     "entry_price": entry_price,
                     "close_price": close_price,
                     "sl": pos.sl,
-                    "tp1": pos.tp1 if hasattr(pos, 'tp1') else pos.tp,
-                    "tp2": pos.tp2 if hasattr(pos, 'tp2') else pos.tp,
+                    "tp": pos.tp1 if hasattr(pos, 'tp1') else pos.tp,
                     "lot_size": pos.volume,
                     "pnl": round(pos.pnl, 2),
                     "rr_achieved": rr_achieved,
@@ -1045,12 +1286,29 @@ class AdvancedTradingEngine:
                     "setup_type": setup_type,
                     "fvg_class": str(f.get('fvg_class', 'none')).upper(),
                     "bias": bias_label,
-                    "volatility_regime": f.get('volatility_regime', 'NORMAL'),
-                    "spread_at_entry": spread_at_entry
+                    "volatility_regime": getattr(pos, 'volatility_regime', 'NORMAL'),
+                    "spread_at_entry": spread_at_entry,
+                    # Phase 10 TradeBrain fields
+                    "brain_score": getattr(pos, 'brain_score', 0.0),
+                    "brain_tier1": getattr(pos, 'brain_tier1', 0.0),
+                    "brain_tier2": getattr(pos, 'brain_tier2', 0.0),
+                    "brain_tier3": getattr(pos, 'brain_tier3', 0.0),
+                    "brain_direction": getattr(pos, 'brain_direction', None),
+                    "brain_block_reason": getattr(pos, 'brain_block_reason', None),
+                    "session": getattr(pos, 'session', 'OFF'),
+                    "vsa_signals": f.get('vsa_signals', [])
                 }
                 trade_journal.append_trade(journal_record)
+                
+                # Phase 10 feedback loops
+                self.safety_engine.record_trade_result(pos.pnl)
+                self.brain_calibrator.record_outcome(
+                    reason_map=getattr(pos, 'brain_reason_map', {}),
+                    outcome="WIN" if pos.pnl > 0.0 else ("LOSS" if pos.pnl < 0.0 else "BE"),
+                    pnl=pos.pnl
+                )
             except Exception as e:
-                self.logger.error(f"Failed to write trade to journal: {e}")
+                self.logger.error(f"Failed to write trade to journal / calibrator: {e}")
 
             self.logger.info(f"🧠 Closed Position Learnt: {pos.symbol} {pos.action} Ticket #{pos.id} closed due to {pos.close_reason} | PnL: ${pos.pnl:.2f}")
 
@@ -1127,6 +1385,11 @@ class AdvancedTradingEngine:
                 'bid': bid,
                 'ask': ask,
                 'active_sessions': self.get_active_sessions(),
+                # Phase 8 fields
+                'news_locked': bool(analysis.get('news_locked', False)),
+                'news_lockout_reason': analysis.get('news_lockout_reason'),
+                'market_regime': analysis.get('market_regime', 'RANGE'),
+                'resting_pools': analysis.get('resting_pools', []),
                 'setup': None,
                 'action': None,
                 'entry': None,
@@ -1154,7 +1417,24 @@ class AdvancedTradingEngine:
                 # CRT zone metadata for chart
                 'crt_low': float(crt_low) if crt_low else 0.0,
                 'crt_high': float(crt_high) if crt_high else 0.0,
-                'ob_metadata': analysis.get('ob_metadata', {})
+                'ob_metadata': analysis.get('ob_metadata', {}),
+                # Phase 9 v2 Brain Layer fields (populated by evaluate_entry_rules)
+                'brain_score':        float(analysis.get('brain_score', 0.0)),
+                'brain_direction':    analysis.get('brain_direction'),
+                'brain_threshold':    float(analysis.get('brain_threshold', 55.0)),
+                'brain_reason_map':   analysis.get('brain_reason_map', {}),
+                'brain_label':        analysis.get('brain_label', 'BLOCKED'),
+                'brain_color':        analysis.get('brain_color', '#ff3366'),
+                'brain_tier1':        float(analysis.get('brain_tier1', 0.0)),
+                'brain_tier2':        float(analysis.get('brain_tier2', 0.0)),
+                'brain_tier3':        float(analysis.get('brain_tier3', 0.0)),
+                'brain_block_reason': analysis.get('brain_block_reason'),
+                # Phase 10 Safety & Session fields
+                'session_name':       analysis.get('session_name', 'OFF'),
+                'session_score':      float(analysis.get('session_score', 0.0)),
+                'safety_halt':        not self.safety_engine.check_entry_allowed()[0],
+                'safety_halt_reason': self.safety_engine.check_entry_allowed()[1],
+                'safety_stats':       self.safety_engine.get_stats(),
             }
 
             setup = self.evaluate_entry_rules(analysis)
@@ -1176,6 +1456,32 @@ class AdvancedTradingEngine:
             return {}
 
 
+
+    def get_asian_range(self, symbol: str) -> Optional[Tuple[float, float]]:
+        """
+        Calculate Asian Range high and low (00:00 to 09:00 UTC) from the last 40 M15 candles.
+        """
+        try:
+            # Fetch last 40 M15 bars
+            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 40)
+            if rates is None or len(rates) == 0:
+                return None
+            
+            # Find rates that fall into the 00:00 to 09:00 UTC window
+            asian_highs = []
+            asian_lows = []
+            
+            for rate in rates:
+                dt = datetime.fromtimestamp(int(rate['time']), timezone.utc)
+                if 0 <= dt.hour < 9:
+                    asian_highs.append(float(rate['high']))
+                    asian_lows.append(float(rate['low']))
+            
+            if len(asian_highs) > 0:
+                return max(asian_highs), min(asian_lows)
+        except Exception as e:
+            self.logger.error(f"Error calculating Asian range: {e}")
+        return None
 
     def get_active_sessions(self) -> list:
         """Return list of currently active forex market sessions based on UTC hour."""
@@ -1685,6 +1991,11 @@ class AdvancedTradingEngine:
     def _shutdown(self):
         """Safely shut down the connection"""
         self.logger.info("🔒 Shutting down MT5 Connection...")
+        if hasattr(self, 'news_engine') and self.news_engine:
+            try:
+                self.news_engine.stop()
+            except Exception as e:
+                self.logger.error(f"Error stopping news engine: {e}")
         shutdown_mt5()
         self.connected = False
         sentiment_analyzer.stop()

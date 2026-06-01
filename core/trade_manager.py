@@ -78,7 +78,7 @@ class BaseTradeManager:
             return False
         return True
 
-    def calculate_lot_size(self, symbol: str, sl_price: float, entry_price: float, balance: Optional[float] = None) -> float:
+    def calculate_lot_size(self, symbol: str, sl_price: float, entry_price: float, balance: Optional[float] = None, risk_percent: Optional[float] = None) -> float:
         """
         Dynamically calculate standard contract size based on risk percent of balance/equity.
         Formula: Lot Size = (Capital * Risk%) / (SL points * Tick Value)
@@ -89,8 +89,9 @@ class BaseTradeManager:
                 self.logger.error(f"Failed to get symbol info for {symbol}")
                 return 0.01
 
-            from utils.settings_manager import settings_manager
-            risk_percent = settings_manager.get("risk_percent", getattr(self.config, 'RISK_PERCENT', 1.0))
+            if risk_percent is None:
+                from utils.settings_manager import settings_manager
+                risk_percent = settings_manager.get("risk_percent", getattr(self.config, 'RISK_PERCENT', 1.0))
             
             # Apply win streak multiplier if streak >= 3
             streak = self.get_win_streak()
@@ -184,7 +185,8 @@ class PaperTradeManager(BaseTradeManager):
 
     def open_position(self, symbol: str, action: str, entry_price: float, 
                       sl_price: float, tp1_price: Optional[float] = None, 
-                      tp2_price: Optional[float] = None, tp_price: Optional[float] = None) -> Optional[TradePosition]:
+                      tp2_price: Optional[float] = None, tp_price: Optional[float] = None,
+                      risk_percent: Optional[float] = None) -> Optional[TradePosition]:
         """Simulate opening a trade"""
         if tp1_price is None:
             tp1_price = tp_price
@@ -200,7 +202,7 @@ class PaperTradeManager(BaseTradeManager):
         volume_step = symbol_info.volume_step if symbol_info else 0.01
         volume_min = symbol_info.volume_min if symbol_info else 0.01
         
-        lot_size = self.calculate_lot_size(symbol, sl_price, entry_price)
+        lot_size = self.calculate_lot_size(symbol, sl_price, entry_price, risk_percent=risk_percent)
         if lot_size <= 0.0:
             self.logger.warning(f"🚫 Virtual trade blocked: Calculated lot size is 0.0 (possibly due to capital constraints)")
             return None
@@ -438,7 +440,8 @@ class LiveTradeManager(BaseTradeManager):
 
     def open_position(self, symbol: str, action: str, entry_price: float, 
                       sl_price: float, tp1_price: Optional[float] = None, 
-                      tp2_price: Optional[float] = None, tp_price: Optional[float] = None) -> Optional[TradePosition]:
+                      tp2_price: Optional[float] = None, tp_price: Optional[float] = None,
+                      risk_percent: Optional[float] = None) -> Optional[TradePosition]:
         """Open split positions on MT5"""
         if tp1_price is None:
             tp1_price = tp_price
@@ -464,7 +467,7 @@ class LiveTradeManager(BaseTradeManager):
         volume_step = symbol_info.volume_step
         volume_min = symbol_info.volume_min
         
-        lot_size = self.calculate_lot_size(symbol, sl_price, entry_price)
+        lot_size = self.calculate_lot_size(symbol, sl_price, entry_price, risk_percent=risk_percent)
         if lot_size <= 0.0:
             self.logger.warning(f"🚫 Live trade blocked: Calculated lot size is 0.0 (possibly due to capital constraints)")
             return None
