@@ -1,5 +1,5 @@
 # utils/symbol_manager.py
-import MetaTrader5 as mt5
+from utils.mt5_gateway import mt5_gateway as mt5
 from typing import List, Dict, Any
 
 class SymbolManager:

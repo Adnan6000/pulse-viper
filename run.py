@@ -13,11 +13,11 @@ def main():
         sys.stderr.reconfigure(encoding='utf-8')
         
     parser = argparse.ArgumentParser(description='PulseViper Professional Trading Bot')
-    parser.add_argument('--symbols', nargs='+', default=['XAUUSDm'],
+    parser.add_argument('--symbols', nargs='+', default=['XAUUSD'],
                        help='Trading symbols')
     parser.add_argument('--mode', choices=['scalping', 'intraday', 'swing'], 
-                       default='intraday', help='Trading mode')
-    parser.add_argument('--interval', type=int, default=15,
+                       default='scalping', help='Trading mode')
+    parser.add_argument('--interval', type=int, default=1,
                        help='Analysis interval in seconds')
     parser.add_argument('--no-dashboard', action='store_true',
                        help='Disable dashboard')

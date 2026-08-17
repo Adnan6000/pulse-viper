@@ -1,0 +1,14 @@
+{
+    "active": {
+        "model_version": "NN-CHAMPION-V1",
+        "feature_schema_hash": "DEFAULT_HASH",
+        "model_weights_path": "models/champion.pt",
+        "calibrator_params": {
+            "temperature": 1.0
+        },
+        "policy_version": 1,
+        "timestamp": 0.0,
+        "dataset_id": "INITIAL_BOOTSTRAP"
+    },
+    "history": []
+}

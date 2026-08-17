@@ -59,13 +59,18 @@ def init_test_db():
     conn.commit()
     conn.close()
 
+trade_counter = 0
 def insert_test_trade(pnl: float, date_str: str):
+    global trade_counter
+    trade_counter += 1
+    # 2 minutes apart per trade to prevent sibling grouping
+    time_str = f"12:{trade_counter*2:02d}:00"
     conn = sqlite3.connect(TEST_DB)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO trades (date, symbol, pnl)
-        VALUES (?, 'XAUUSDm', ?)
-    """, (date_str, pnl))
+        INSERT INTO trades (date, time, symbol, action, pnl)
+        VALUES (?, ?, 'XAUUSDm', ?, ?)
+    """, (date_str, time_str, f"SELL_{trade_counter}", pnl))
     conn.commit()
     conn.close()
 

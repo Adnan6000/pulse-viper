@@ -9,11 +9,9 @@ class Config:
     RISK_PERCENT = 1.0  # Risk 1.0% of account equity per trade
     MAGIC_NUMBER = 123456
     
-    # Session Times (UTC)
-    # Gold is most active during London and NY sessions.
-    # Format: (Start Hour, End Hour)
-    LONDON_SESSION = (7, 11)
-    NY_SESSION = (12, 16)
+    LONDON_SESSION = (8, 16)
+    NY_SESSION = (13, 21)
+    ASIAN_SESSION = (0, 8)
     
     # Risk Limits
     MAX_SPREAD_POINTS = 60  # Max spread in broker points to allow entry (e.g. 6.0 USD for Gold)

@@ -1,0 +1,86 @@
+[
+  {
+    "day": "Monday",
+    "time_utc": "14:00",
+    "name": "USD ISM Manufacturing PMI",
+    "duration_mins": 5
+  },
+  {
+    "day": "Tuesday",
+    "time_utc": "14:30",
+    "name": "USD JOLTS Job Openings",
+    "duration_mins": 5
+  },
+  {
+    "day": "Tuesday",
+    "time_utc": "19:00",
+    "name": "FOMC Member Speech",
+    "duration_mins": 5
+  },
+  {
+    "day": "Wednesday",
+    "time_utc": "14:15",
+    "name": "USD ADP Non-Farm Employment",
+    "duration_mins": 5
+  },
+  {
+    "day": "Wednesday",
+    "time_utc": "14:30",
+    "name": "USD Trade Balance",
+    "duration_mins": 5
+  },
+  {
+    "day": "Wednesday",
+    "time_utc": "15:00",
+    "name": "USD ISM Non-Manufacturing PMI",
+    "duration_mins": 5
+  },
+  {
+    "day": "Wednesday",
+    "time_utc": "18:00",
+    "name": "FOMC Rate Decision",
+    "duration_mins": 5
+  },
+  {
+    "day": "Wednesday",
+    "time_utc": "18:30",
+    "name": "FOMC Press Conference",
+    "duration_mins": 5
+  },
+  {
+    "day": "Thursday",
+    "time_utc": "14:30",
+    "name": "USD Initial Jobless Claims",
+    "duration_mins": 5
+  },
+  {
+    "day": "Thursday",
+    "time_utc": "14:30",
+    "name": "USD PPI MoM",
+    "duration_mins": 5
+  },
+  {
+    "day": "Friday",
+    "time_utc": "14:30",
+    "name": "USD Non-Farm Payrolls (NFP)",
+    "duration_mins": 5
+  },
+  {
+    "day": "Friday",
+    "time_utc": "14:30",
+    "name": "USD Average Hourly Earnings MoM",
+    "duration_mins": 5
+  },
+  {
+    "day": "Friday",
+    "time_utc": "14:30",
+    "name": "USD Unemployment Rate",
+    "duration_mins": 5
+  },
+  {
+    "day": "Friday",
+    "time_utc": "16:00",
+    "name": "USD Michigan Consumer Sentiment",
+    "duration_mins": 5
+  }
+]

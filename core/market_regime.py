@@ -48,7 +48,7 @@ class MarketRegimeDetector:
             return 50.0
 
     @classmethod
-    def detect_regime(cls, df: pd.DataFrame, rvol_val: float) -> RegimeType:
+    def detect_regime(cls, df: pd.DataFrame, rvol_val: float, symbol: str = "") -> RegimeType:
         """
         Detect current market regime from candles and relative volume.
         We calculate ADX internally if it exists in the features, or fallback to CHOP and ATR ratios.
@@ -63,7 +63,7 @@ class MarketRegimeDetector:
             atr_col = 'atr' if 'atr' in df.columns else None
             if atr_col:
                 current_atr = float(df[atr_col].iloc[-1])
-                median_atr = float(df[atr_col].rolling(100).median().bfill().iloc[-1])
+                median_atr = float(df[atr_col].rolling(100, min_periods=1).median().ffill().iloc[-1])
                 atr_ratio = current_atr / (median_atr if median_atr > 0 else 1.0)
             else:
                 atr_ratio = 1.0
@@ -77,7 +77,13 @@ class MarketRegimeDetector:
             is_trending_ema = (closes[-1] > ema20[-1] > ema50[-1]) or (closes[-1] < ema20[-1] < ema50[-1])
             
             # 1. Chaotic regime (extremely high volatility and high volume, typical of news release)
-            if atr_ratio > 2.2 or (atr_ratio > 1.8 and rvol_val > 2.0):
+            # Gold has higher natural volatility expansion; scale up thresholds to prevent false positives
+            is_gold = "XAU" in symbol.upper()
+            chaotic_threshold = 3.5 if is_gold else 2.2
+            rvol_threshold = 2.8 if is_gold else 1.8
+            rvol_val_threshold = 2.5 if is_gold else 2.0
+            
+            if atr_ratio > chaotic_threshold or (atr_ratio > rvol_threshold and rvol_val > rvol_val_threshold):
                 return RegimeType.CHAOTIC
                 
             # 2. Volatility Compression regime (high choppiness, low volume, consolidating range)

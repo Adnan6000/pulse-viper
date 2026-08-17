@@ -29,7 +29,7 @@ class ExperienceMemory:
         self.load_memory()
         
     def store(self, state: Dict, action: int, reward: float, 
-              next_state: Dict, done: bool, metadata: Dict = None):
+              next_state: Dict, done: bool, metadata: Optional[Dict] = None):
         """Store trading experience with comprehensive tracking"""
         experience = {
             'state': state,           # Market state/features

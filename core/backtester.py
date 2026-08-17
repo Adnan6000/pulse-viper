@@ -11,7 +11,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-import MetaTrader5 as mt5
+from utils.mt5_gateway import mt5_gateway as mt5
 import numpy as np
 import pandas as pd
 
@@ -244,7 +244,7 @@ class AdaptiveBacktester:
                     "tp": round(float(tp), 2),
                     "outcome": round(float(outcome), 4),
                     "rr": round(float(rr_achieved), 2),
-                    "bars_held": int(bars_held),
+                    "bars_held": bars_held,
                     "win": bool(outcome > 0),
                     "setup": "SHARP_TURN" if (ctx_sweep != 0 and ltf_mss != 0) else "MSS_ONLY",
                     "time": str(t)
@@ -399,9 +399,9 @@ class AdaptiveBacktester:
                     days=14,
                     rr_ratio=cfg["rr"],
                     trading_mode=trading_mode,
-                    lookback_sweep=cfg["lookback_sweep"],
-                    lookback_mss=cfg["lookback_mss"],
-                    lookback_fvg=cfg["lookback_fvg"],
+                    lookback_sweep=int(cfg["lookback_sweep"]),
+                    lookback_mss=int(cfg["lookback_mss"]),
+                    lookback_fvg=int(cfg["lookback_fvg"]),
                     verbose=False
                 )
                 
@@ -447,14 +447,15 @@ class AdaptiveBacktester:
             curr_score = results_log.get(curr_key, {}).get("score", 0.0)
             
             if best_score > curr_score or (curr_score == 0 and best_score > 0):
-                settings_manager.set("smc_swing_window", best_cfg["swing_window"])
-                settings_manager.set("smc_lookback_sweep", best_cfg["lookback_sweep"])
-                settings_manager.set("smc_lookback_mss", best_cfg["lookback_mss"])
-                settings_manager.set("smc_fvg_lookback", best_cfg["lookback_fvg"])
-                settings_manager.set("min_rr_ratio", best_cfg["rr"])
-                optimization["applied"] = True
+                # Shadow mode: do not write to settings manager directly
+                # settings_manager.set("smc_swing_window", best_cfg["swing_window"])
+                # settings_manager.set("smc_lookback_sweep", best_cfg["lookback_sweep"])
+                # settings_manager.set("smc_lookback_mss", best_cfg["lookback_mss"])
+                # settings_manager.set("smc_fvg_lookback", best_cfg["lookback_fvg"])
+                # settings_manager.set("min_rr_ratio", best_cfg["rr"])
+                optimization["applied"] = False
                 self.logger.info(
-                    f"🎯 Grid Optimizer applied new settings for {symbol}: "
+                    f"🎯 [SHADOW RECOMMENDATION] Grid Optimizer recommended new settings for {symbol}: "
                     f"swing_window={best_cfg['swing_window']}, sweep={best_cfg['lookback_sweep']}, "
                     f"mss={best_cfg['lookback_mss']}, rr={best_cfg['rr']} (Score: {curr_score:.2f} -> {best_score:.2f})"
                 )

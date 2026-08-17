@@ -1,3 +1,5 @@
-﻿{
-    "python.analysis.typeCheckingMode": "off"
+{
+    "python.analysis.typeCheckingMode": "off",
+    "python.defaultInterpreterPath": "venv/Scripts/python.exe",
+    "python.pyrefly.typeCheckingMode": "basic"
 }

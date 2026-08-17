@@ -18,7 +18,7 @@ class VolumeAnalyzer:
         # Avoid division by zero
         volume_sma_safe = np.where(volume_sma == 0, 1e-9, volume_sma)
         rvol = df['volume'] / volume_sma_safe
-        return rvol.bfill()
+        return rvol.ffill().fillna(1.0)
 
     @staticmethod
     def calculate_rvol_latest(df: pd.DataFrame, period: int = 20) -> float:
@@ -87,7 +87,7 @@ class VolumeAnalyzer:
         return volume * (close - low) / denom, volume * (high - close) / denom
 
     @staticmethod
-    def calculate_volume_profile(df: pd.DataFrame, lookback: int = 100, bins: int = 20) -> Dict[str, Any]:
+    def calculate_volume_profile(df: pd.DataFrame, lookback: int = 300, bins: int = 30) -> Dict[str, Any]:
         """
         Optimized calculation of the Volume Profile (Volume at Price histogram) using numpy views.
         Avoids duplicate dataframe copies via df.tail().
@@ -96,8 +96,15 @@ class VolumeAnalyzer:
         if n == 0:
             return {
                 "poc_price": 0.0,
+                "val_price": 0.0,
+                "vah_price": 0.0,
                 "bin_edges": [],
                 "bin_volumes": [],
+                "buy_volumes": [],
+                "sell_volumes": [],
+                "overall_buy_pct": 50.0,
+                "poc_buy_pct": 50.0,
+                "market_control": "NEUTRAL",
                 "min_price": 0.0,
                 "max_price": 0.0
             }
@@ -147,13 +154,83 @@ class VolumeAnalyzer:
         bin_volumes_matrix = distributed_vol + np.where(fallback_mask, v_arr, 0.0)
         bin_volumes = bin_volumes_matrix.sum(axis=0)
         
+        # Calculate Buying and Selling Volume decomposition per bin
+        denom = highs - lows
+        denom_safe = np.where(denom == 0, 1e-9, denom)
+        buy_ratio_row = np.clip((closes - lows) / denom_safe, 0.0, 1.0)[:, np.newaxis]
+        sell_ratio_row = 1.0 - buy_ratio_row
+        
+        buy_volumes_matrix = bin_volumes_matrix * buy_ratio_row
+        sell_volumes_matrix = bin_volumes_matrix * sell_ratio_row
+        
+        buy_volumes = buy_volumes_matrix.sum(axis=0)
+        sell_volumes = sell_volumes_matrix.sum(axis=0)
+        
         poc_idx = np.argmax(bin_volumes)
         poc_price = (bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2.0
         
+        # Calculate 70% Value Area Low (VAL) and Value Area High (VAH)
+        total_vol = bin_volumes.sum()
+        target_vol = total_vol * 0.70
+        low_idx = poc_idx
+        high_idx = poc_idx
+        accumulated_vol = float(bin_volumes[poc_idx]) if len(bin_volumes) > 0 else 0.0
+        
+        while accumulated_vol < target_vol and (low_idx > 0 or high_idx < len(bin_volumes) - 1):
+            next_low_vol = float(bin_volumes[low_idx - 1]) if low_idx > 0 else -1.0
+            next_high_vol = float(bin_volumes[high_idx + 1]) if high_idx < len(bin_volumes) - 1 else -1.0
+            
+            if next_high_vol >= next_low_vol and high_idx < len(bin_volumes) - 1:
+                high_idx += 1
+                accumulated_vol += next_high_vol
+            elif low_idx > 0:
+                low_idx -= 1
+                accumulated_vol += next_low_vol
+            else:
+                break
+                
+        val_price = (bin_edges[low_idx] + bin_edges[low_idx + 1]) / 2.0
+        vah_price = (bin_edges[high_idx] + bin_edges[high_idx + 1]) / 2.0
+
+        total_buy_vol = buy_volumes.sum()
+        overall_buy_pct = float(total_buy_vol / (total_vol + 1e-9) * 100.0)
+        
+        # More aggressive exponential weighting for recent candles to measure active market control accurately.
+        # The previous `linspace` was too slow; this new `np.logspace` focuses heavily on the last few bars.
+        n_bars = len(closes)
+        if n_bars > 1:
+            weights = np.logspace(start=-2, stop=0, num=n_bars, base=10.0)
+        else:
+            weights = np.array([1.0])
+        weighted_buy = (buy_ratio_row.squeeze() * volumes * weights).sum()
+        weighted_total = (volumes * weights).sum()
+        recent_buy_pct = float(weighted_buy / (weighted_total + 1e-9) * 100.0)
+        
+        # Recent momentum direction check (last 15 bars)
+        momentum_up = (closes[-1] > closes[max(0, n_bars - 15)])
+        
+        # Combine recent buy ratio & price momentum for accurate market control
+        if recent_buy_pct >= 50.0 or (momentum_up and recent_buy_pct >= 45.0):
+            market_control = "BUYERS"
+        else:
+            market_control = "SELLERS"
+
+        poc_buy_vol = float(buy_volumes[poc_idx]) if len(buy_volumes) > poc_idx else 0.0
+        poc_sell_vol = float(sell_volumes[poc_idx]) if len(sell_volumes) > poc_idx else 0.0
+        poc_tot = poc_buy_vol + poc_sell_vol
+        poc_buy_pct = poc_buy_vol / (poc_tot + 1e-9) * 100.0
+
         return {
             "poc_price": float(poc_price),
+            "val_price": float(val_price),
+            "vah_price": float(vah_price),
             "bin_edges": bin_edges.tolist(),
             "bin_volumes": bin_volumes.tolist(),
+            "buy_volumes": buy_volumes.tolist(),
+            "sell_volumes": sell_volumes.tolist(),
+            "overall_buy_pct": round(recent_buy_pct, 1),
+            "poc_buy_pct": round(poc_buy_pct, 1),
+            "market_control": market_control,
             "min_price": float(min_price),
             "max_price": float(max_price)
         }
@@ -169,9 +246,9 @@ class VolumeAnalyzer:
         if n < lookback + 20:
             return signals
 
-        # We look at the last 'lookback' completed candles (excluding the current uncompleted candle at -1)
-        # Completed candles indexes: -lookback-1 to -2
-        for idx in range(-lookback - 1, -1):
+        # We look at the last 'lookback' candles, INCLUDING the current forming candle at -1
+        # so that VSA signals are detected in real-time before the candle closes.
+        for idx in range(-lookback - 1, 0):
             if idx >= 0 or idx < -n:
                 continue
             
@@ -182,7 +259,8 @@ class VolumeAnalyzer:
                 low = float(c['low'])
                 close = float(c['close'])
                 open_p = float(c['open'])
-                vol = float(c.get('volume', c.get('tick_volume', 1.0)))
+                raw_v = c['volume'] if 'volume' in c and pd.notna(c['volume']) else (c['tick_volume'] if 'tick_volume' in c else 1.0)
+                vol = float(raw_v)
                 
                 # Candle spread (range)
                 spread = high - low
@@ -304,6 +382,58 @@ class VolumeAnalyzer:
                         "price": close
                     })
                     continue
+
+                # 8. EFFORT VS RESULT BULLISH (Buying effort met with absorption/demand)
+                if rvol >= 1.7 and spread < 0.7 * atr and close_pos >= 0.5:
+                    signals.append({
+                        "pattern": "EFFORT_VS_RESULT_BULLISH",
+                        "index": idx,
+                        "direction": 1,
+                        "confidence": 0.85,
+                        "rvol": rvol,
+                        "price": close
+                    })
+                    continue
+
+                # 9. EFFORT VS RESULT BEARISH (Selling effort met with absorption/supply)
+                if rvol >= 1.7 and spread < 0.7 * atr and close_pos <= 0.5:
+                    signals.append({
+                        "pattern": "EFFORT_VS_RESULT_BEARISH",
+                        "index": idx,
+                        "direction": -1,
+                        "confidence": 0.85,
+                        "rvol": rvol,
+                        "price": close
+                    })
+                    continue
+
+                # 10. TEST OF SUPPLY (Sweep low on low volume, closes high)
+                if close_pos >= 0.6 and rvol < 0.8:
+                    prev_lows = df['low'].values[max(0, n + idx - 5):n + idx]
+                    if len(prev_lows) > 0 and low < np.min(prev_lows):
+                        signals.append({
+                            "pattern": "TEST_OF_SUPPLY",
+                            "index": idx,
+                            "direction": 1,
+                            "confidence": 0.80,
+                            "rvol": rvol,
+                            "price": close
+                        })
+                        continue
+
+                # 11. TEST OF DEMAND (Sweep high on low volume, closes low)
+                if close_pos <= 0.4 and rvol < 0.8:
+                    prev_highs = df['high'].values[max(0, n + idx - 5):n + idx]
+                    if len(prev_highs) > 0 and high > np.max(prev_highs):
+                        signals.append({
+                            "pattern": "TEST_OF_DEMAND",
+                            "index": idx,
+                            "direction": -1,
+                            "confidence": 0.80,
+                            "rvol": rvol,
+                            "price": close
+                        })
+                        continue
             except Exception:
                 pass
                 

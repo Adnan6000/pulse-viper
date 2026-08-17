@@ -15,5 +15,31 @@ dist/
 # Caches and DBs
 data/trade_history.db
 data/experience_memory.pkl
+data/*.db
+data/*.pkl
 configs/sentiment_cache.json
+
+# Sensitive & Local Data Files
+data/
+*.bak
+*.pkl
+*.db
+scratch/
+Books/
+
+# Sensitive Config Files
+configs/settings.json
+configs/settings_audit.json
+configs/sentiment_cache.json
+
+# API Keys & Credentials
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 

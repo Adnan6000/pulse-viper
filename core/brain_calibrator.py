@@ -120,36 +120,16 @@ class BrainCalibrator:
             for key in DEFAULT_T1_WEIGHTS.keys():
                 t1_updated[key] = self._calibrate_component_regime(f"t1_{key}", self._weights[r_key]["tier1"][key], regime_trades)
             
-            # Normalize Tier 1 (must sum to 50.0)
-            t1_sum = sum(t1_updated.values())
-            if t1_sum > 0:
-                for k in t1_updated:
-                    target_w = (t1_updated[k] / t1_sum) * 50.0
-                    default_w = DEFAULT_T1_WEIGHTS[k]
-                    # Bound between 85% and 115% of default weight to prevent over-optimization
-                    self._weights[r_key]["tier1"][k] = float(max(default_w * 0.85, min(default_w * 1.15, target_w)))
-
-            # Re-normalize Tier 1 after bounding to ensure it is exactly 50.0
-            t1_sum_bounded = sum(self._weights[r_key]["tier1"].values())
-            for k in self._weights[r_key]["tier1"]:
-                self._weights[r_key]["tier1"][k] = float(round((self._weights[r_key]["tier1"][k] / t1_sum_bounded) * 50.0, 2))
+            # Normalize and bound Tier 1
+            self._weights[r_key]["tier1"] = self._allocate_constrained_weights(t1_updated, DEFAULT_T1_WEIGHTS, 50.0)
 
             # 2. Update Tier 2 weights
             t2_updated = {}
             for key in DEFAULT_T2_WEIGHTS.keys():
                 t2_updated[key] = self._calibrate_component_regime(f"t2_{key}", self._weights[r_key]["tier2"][key], regime_trades)
 
-            # Normalize Tier 2 (must sum to 35.0 raw max)
-            t2_sum = sum(t2_updated.values())
-            if t2_sum > 0:
-                for k in t2_updated:
-                    target_w = (t2_updated[k] / t2_sum) * 35.0
-                    default_w = DEFAULT_T2_WEIGHTS[k]
-                    self._weights[r_key]["tier2"][k] = float(max(default_w * 0.85, min(default_w * 1.15, target_w)))
-
-            t2_sum_bounded = sum(self._weights[r_key]["tier2"].values())
-            for k in self._weights[r_key]["tier2"]:
-                self._weights[r_key]["tier2"][k] = float(round((self._weights[r_key]["tier2"][k] / t2_sum_bounded) * 35.0, 2))
+            # Normalize and bound Tier 2
+            self._weights[r_key]["tier2"] = self._allocate_constrained_weights(t2_updated, DEFAULT_T2_WEIGHTS, 35.0)
 
         # Save results
         self._save_weights()
@@ -188,3 +168,28 @@ class BrainCalibrator:
         # Apply EMA
         new_weight = current_weight * (1.0 - EMA_ALPHA) + updated_weight * EMA_ALPHA
         return new_weight
+
+    def _allocate_constrained_weights(
+        self, target_weights: Dict[str, float], default_weights: Dict[str, float], total_target_sum: float
+    ) -> Dict[str, float]:
+        """Iteratively updates weights to satisfy bounds and sum constraints precisely."""
+        weights = {k: v for k, v in target_weights.items()}
+        for _ in range(10): # Iterative convergence loop
+            current_sum = sum(weights.values())
+            if abs(current_sum - total_target_sum) < 1e-4:
+                break
+            scaling_factor = total_target_sum / current_sum if current_sum > 0 else 1.0
+            
+            for k in weights:
+                weights[k] *= scaling_factor
+                min_w = default_weights[k] * 0.85
+                max_w = default_weights[k] * 1.15
+                weights[k] = max(min_w, min(max_w, weights[k]))
+                
+        rounded_weights = {k: round(v, 2) for k, v in weights.items()}
+        diff = total_target_sum - sum(rounded_weights.values())
+        if abs(diff) > 0.001:
+            largest_key = max(rounded_weights, key=rounded_weights.get)
+            rounded_weights[largest_key] = round(rounded_weights[largest_key] + diff, 2)
+            
+        return rounded_weights

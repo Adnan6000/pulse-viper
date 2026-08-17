@@ -150,3 +150,61 @@ class LiquidityMap:
     def get_resting_pools(self) -> List[Dict]:
         """Get list of active pools for dashboard display"""
         return [{"pool_id": k, **v} for k, v in self.pools.items()]
+
+    def calculate_order_flow_imbalance(self, symbol: str, lookback_seconds: int = 300) -> float:
+        """
+        Constructs an Order Flow Imbalance (OFI) proxy using MT5's copy_ticks_from.
+        Calculates the delta between aggressive buyers (ticks at Ask) and aggressive sellers (ticks at Bid).
+        Returns an imbalance ratio between -1.0 (heavy selling) and 1.0 (heavy buying).
+        """
+        from utils.mt5_gateway import mt5_gateway as mt5
+        from datetime import datetime, timedelta
+        
+        try:
+            # Query recent ticks from 5 minutes lookback
+            date_from = datetime.now() - timedelta(seconds=lookback_seconds)
+            ticks = mt5.copy_ticks_from(symbol, date_from, 1000, mt5.COPY_TICKS_ALL)
+            
+            if ticks is None or len(ticks) == 0:
+                return 0.0
+                
+            buy_volume = 0.0
+            sell_volume = 0.0
+            
+            # Loop through ticks and accumulate buying/selling pressure
+            for tick in ticks:
+                flags = int(tick['flags'])
+                vol = float(tick['volume'] or 1.0)
+                
+                # MT5 flags: TICK_FLAG_BUY = 32, TICK_FLAG_SELL = 64
+                if flags & 32:
+                    buy_volume += vol
+                elif flags & 64:
+                    sell_volume += vol
+                else:
+                    # Fallback to proximity
+                    last = float(tick['last'])
+                    bid = float(tick['bid'])
+                    ask = float(tick['ask'])
+                    if last > 0:
+                        if last >= ask:
+                            buy_volume += vol
+                        elif last <= bid:
+                            sell_volume += vol
+                    else:
+                        # Fallback to quote change flags
+                        if flags & 4:    # TICK_FLAG_ASK (ask changed/increased)
+                            buy_volume += vol
+                        elif flags & 2:  # TICK_FLAG_BID (bid changed/decreased)
+                            sell_volume += vol
+                            
+            total_volume = buy_volume + sell_volume
+            if total_volume < 1e-9:
+                return 0.0
+                
+            imbalance = (buy_volume - sell_volume) / total_volume
+            return float(np.clip(imbalance, -1.0, 1.0))
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating Order Flow Imbalance: {e}")
+            return 0.0

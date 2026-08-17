@@ -20,7 +20,9 @@ CSV_FIELDS = [
     "duration_mins", "setup_type", "fvg_class", "bias", "volatility_regime",
     "spread_at_entry", "classification", "classification_reason",
     "brain_score", "brain_tier1", "brain_tier2", "brain_tier3",
-    "brain_direction", "brain_block_reason", "session", "vsa_signals"
+    "brain_direction", "brain_block_reason", "session", "vsa_signals",
+    "entry_features", "audit_id", "strategy_name", "entry_pattern",
+    "decision_id", "decision_snapshot", "cycle_id", "execution_id"
 ]
 
 
@@ -38,45 +40,96 @@ class TradeJournal:
         os.makedirs("data", exist_ok=True)
         os.makedirs("logs", exist_ok=True)
         os.makedirs("logs/daily_reports", exist_ok=True)
-
+        
         # Initialize SQLite DB
         conn = sqlite3.connect(JOURNAL_DB)
         cursor = conn.cursor()
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT,
-                time TEXT,
-                symbol TEXT,
-                action TEXT,
-                entry_price REAL,
-                close_price REAL,
-                sl REAL,
-                tp REAL,
-                lot_size REAL,
-                pnl REAL,
-                rr_achieved REAL,
-                close_reason TEXT,
-                duration_mins REAL,
-                setup_type TEXT,
-                fvg_class TEXT,
-                bias INTEGER,
-                volatility_regime TEXT,
-                spread_at_entry REAL,
-                classification TEXT,
-                classification_reason TEXT,
-                brain_score REAL,
-                brain_tier1 REAL,
-                brain_tier2 REAL,
-                brain_tier3 REAL,
-                brain_direction TEXT,
-                brain_block_reason TEXT,
-                session TEXT,
-                vsa_signals TEXT
-            )
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            time TEXT,
+            symbol TEXT,
+            action TEXT,
+            entry_price REAL,
+            close_price REAL,
+            sl REAL,
+            tp REAL,
+            lot_size REAL,
+            pnl REAL,
+            rr_achieved REAL,
+            close_reason TEXT,
+            duration_mins REAL,
+            setup_type TEXT,
+            fvg_class TEXT,
+            bias INTEGER,
+            volatility_regime TEXT,
+            spread_at_entry REAL,
+            classification TEXT,
+            classification_reason TEXT,
+            brain_score REAL,
+            brain_tier1 REAL,
+            brain_tier2 REAL,
+            brain_tier3 REAL,
+            brain_direction TEXT,
+            brain_block_reason TEXT,
+            session TEXT,
+            vsa_signals TEXT,
+            entry_features TEXT,
+            audit_id INTEGER,
+            strategy_name TEXT,
+            entry_pattern TEXT
+        )
         """)
+        
+        # Schema migration checks: check if decision_id and decision_snapshot columns exist, add if missing
+        cursor.execute("PRAGMA table_info(trades)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "decision_id" not in columns:
+            try:
+                cursor.execute("ALTER TABLE trades ADD COLUMN decision_id TEXT")
+            except Exception as e:
+                self.logger.error(f"Migration failed adding decision_id: {e}")
+        if "decision_snapshot" not in columns:
+            try:
+                cursor.execute("ALTER TABLE trades ADD COLUMN decision_snapshot TEXT")
+            except Exception as e:
+                self.logger.error(f"Migration failed adding decision_snapshot: {e}")
+        if "cycle_id" not in columns:
+            try:
+                cursor.execute("ALTER TABLE trades ADD COLUMN cycle_id TEXT")
+            except Exception as e:
+                self.logger.error(f"Migration failed adding cycle_id: {e}")
+        if "execution_id" not in columns:
+            try:
+                cursor.execute("ALTER TABLE trades ADD COLUMN execution_id TEXT")
+            except Exception as e:
+                self.logger.error(f"Migration failed adding execution_id: {e}")
+                
         conn.commit()
         conn.close()
+
+        # Migrate database structure if needed (ensure columns exist)
+        try:
+            conn = sqlite3.connect(JOURNAL_DB)
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(trades)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "entry_features" not in columns:
+                cursor.execute("ALTER TABLE trades ADD COLUMN entry_features TEXT")
+                conn.commit()
+            if "audit_id" not in columns:
+                cursor.execute("ALTER TABLE trades ADD COLUMN audit_id INTEGER")
+                conn.commit()
+            if "strategy_name" not in columns:
+                cursor.execute("ALTER TABLE trades ADD COLUMN strategy_name TEXT")
+                conn.commit()
+            if "entry_pattern" not in columns:
+                cursor.execute("ALTER TABLE trades ADD COLUMN entry_pattern TEXT")
+                conn.commit()
+            conn.close()
+        except Exception as e:
+            self.logger.error(f"Failed to migrate trade_history schema: {e}")
 
         # Initialize CSV Header if CSV doesn't exist
         if not os.path.exists(JOURNAL_CSV):
@@ -111,13 +164,15 @@ class TradeJournal:
             reasons.append("Quick profitable exit")
         if pnl > 0 and brain_score >= 75.0:
             reasons.append(f"High conviction Brain ({brain_score:.0f} pts)")
+        if pnl > 0 and close_reason == "SL":
+            reasons.append("Trailed SL in profit")
 
         # --- BAD trade criteria ---
-        if close_reason == "SL":
+        if close_reason == "SL" and pnl <= 0:
             bad_reasons.append("Stopped out")
         if 0 < rr < 0.5 and close_reason == "TP":
             bad_reasons.append("Weak RR despite TP")
-        if spread > 30.0:  # 30 points (3 pips) for Gold is typical warning
+        if spread > 30.0 and pnl <= 0:  # Only penalize spread if the trade ended in a loss
             bad_reasons.append(f"High spread at entry ({spread:.1f} pts)")
         if setup in ("SWEEP_ONLY", "CONTINUATION") and pnl < 0:
             bad_reasons.append(f"Weak setup type ({setup})")
@@ -149,6 +204,16 @@ class TradeJournal:
             vsa_data = ",".join(vsa_data)
         record["vsa_signals"] = vsa_data
 
+        # Serialize entry_features to JSON string
+        entry_feats = record.get("entry_features", {})
+        if isinstance(entry_feats, dict):
+            try:
+                record["entry_features"] = json.dumps(entry_feats)
+            except Exception:
+                record["entry_features"] = "{}"
+        elif not isinstance(entry_feats, str):
+            record["entry_features"] = "{}"
+
         classification, reason = self._classify_trade(record)
         record["classification"] = classification
         record["classification_reason"] = reason
@@ -159,12 +224,7 @@ class TradeJournal:
             cursor = conn.cursor()
             query = f"""
                 INSERT INTO trades (
-                    date, time, symbol, action, entry_price, close_price,
-                    sl, tp, lot_size, pnl, rr_achieved, close_reason,
-                    duration_mins, setup_type, fvg_class, bias, volatility_regime,
-                    spread_at_entry, classification, classification_reason,
-                    brain_score, brain_tier1, brain_tier2, brain_tier3,
-                    brain_direction, brain_block_reason, session, vsa_signals
+                    {','.join(CSV_FIELDS)}
                 ) VALUES ({','.join(['?'] * len(CSV_FIELDS))})
             """
             values = tuple(record.get(field, None) for field in CSV_FIELDS)
@@ -176,9 +236,12 @@ class TradeJournal:
 
         # Sync to CSV
         try:
+            write_header = not os.path.exists(JOURNAL_CSV) or os.path.getsize(JOURNAL_CSV) == 0
             row = {field: record.get(field, "") for field in CSV_FIELDS}
             with open(JOURNAL_CSV, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+                if write_header:
+                    writer.writeheader()
                 writer.writerow(row)
         except Exception as e:
             self.logger.error(f"Failed to write trade journal CSV: {e}")
@@ -218,7 +281,7 @@ class TradeJournal:
             self.logger.error(f"Failed to query SQLite by date: {e}")
             return []
 
-    def get_daily_summary(self, target_date: date = None) -> Dict:
+    def get_daily_summary(self, target_date: Optional[date] = None) -> Dict:
         """
         Compute statistics for a given day. Defaults to today.
         """

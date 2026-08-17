@@ -108,20 +108,22 @@ class DailyAnalyzer:
         newly_enabled = []
 
         for setup_name, stats in setup_stats.items():
-            if stats["count"] < 3:
-                continue  # Not enough data
-            wr = stats["wins"] / stats["count"]
-            if wr < 0.30 and setup_name not in disabled_setups:
+            if stats["count"] < 15:
+                continue  # Insufficient data
+            
+            smoothed_wr = (stats["wins"] + 1) / (stats["count"] + 2)
+            if smoothed_wr < 0.30 and setup_name not in disabled_setups:
                 disabled_setups.append(setup_name)
                 newly_disabled.append(setup_name)
-                adjustments.append(f"  ⛔ Disabled setup: {setup_name} (WR={wr*100:.0f}%)")
-            elif wr >= 0.60 and setup_name in disabled_setups:
+                adjustments.append(f"  ⛔ [RECOMMENDED RECOMMENDATION] Disable setup: {setup_name} (Smoothed WR={smoothed_wr*100:.1f}%)")
+            elif smoothed_wr >= 0.60 and setup_name in disabled_setups:
                 disabled_setups.remove(setup_name)
                 newly_enabled.append(setup_name)
-                adjustments.append(f"  ✅ Re-enabled setup: {setup_name} (WR={wr*100:.0f}%)")
+                adjustments.append(f"  ✅ [RECOMMENDED RECOMMENDATION] Re-enable setup: {setup_name} (Smoothed WR={smoothed_wr*100:.1f}%)")
 
-        if newly_disabled or newly_enabled:
-            settings_manager.set("disabled_setups", disabled_setups)
+        # Shadow mode: do not write to settings manager directly
+        # if newly_disabled or newly_enabled:
+        #     settings_manager.set("disabled_setups", disabled_setups)
 
         # Auto-adjust min_rr_ratio if avg achieved RR differs significantly
         avg_rr = summary.get("avg_rr", 2.0)
@@ -129,8 +131,9 @@ class DailyAnalyzer:
         if summary.get("wins", 0) >= 3 and abs(avg_rr - current_rr) > 0.4:
             new_rr = round(max(1.5, min(3.5, (avg_rr + current_rr) / 2)), 1)
             if new_rr != current_rr:
-                settings_manager.set("min_rr_ratio", new_rr)
-                adjustments.append(f"  📐 Adjusted min_rr_ratio: {current_rr} → {new_rr} (avg achieved={avg_rr:.2f}R)")
+                # Shadow mode: do not write to settings manager directly
+                # settings_manager.set("min_rr_ratio", new_rr)
+                adjustments.append(f"  📐 [RECOMMENDED RECOMMENDATION] Adjust min_rr_ratio: {current_rr} → {new_rr} (avg achieved={avg_rr:.2f}R)")
 
         if not adjustments:
             lines.append("  No auto-adjustments needed today.")

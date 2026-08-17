@@ -35,7 +35,7 @@ def main():
     try:
         engine = AdvancedTradingEngine(
             symbols=["XAUUSDm"],
-            strategy_mode="intraday",
+            strategy_mode="scalping",
             enable_dashboard=False
         )
         
@@ -79,6 +79,15 @@ def main():
             print(f"  SMC Win Prob: {ai_signal.get('win_prob')}")
             print(f"  Adjusted Win Prob: {ai_signal.get('adjusted_win_prob')}")
             print(f"  Confidence: {ai_signal.get('confidence')}")
+            
+            # Test evaluate entry rules
+            print("\nTesting evaluate_entry_rules...")
+            engine.evaluate_entry_rules(analysis)
+            print("Evaluation completed without crash.")
+            print(f"TradeBrain Result:")
+            print(f"  Score: {analysis.get('brain_score')}")
+            print(f"  Direction: {analysis.get('brain_direction')}")
+            print(f"  Block Reason: {analysis.get('brain_block_reason')}")
             
         else:
             print("FAILED! Analysis returned None.")
