@@ -1,2219 +1,6308 @@
-# core/pattern_learner.py
-import os
+from __future__ import annotations
+
+import copy
 import json
-from core.feature_extractor import FeatureExtractor
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional, Tuple, Any
 import logging
+import math
+import os
+import threading
 from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
 from core.experience_memory import ExperienceMemory
+from core.feature_extractor import FeatureExtractor
+
 
 class PulseViperNeuralNet(nn.Module):
+    """Production-compatible probability network."""
+
     def __init__(self, input_dim: int = 30, hidden_dim: int = 32):
-        super(PulseViperNeuralNet, self).__init__()
+        super().__init__()
+
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
+
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
+
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
+
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
-        
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 1:
             x = x.unsqueeze(0)
             return self.network(x).squeeze(0)
+
         return self.network(x)
 
+
 class KMeansClustering:
+    """
+    Small deterministic K-Means.
+
+    Used only for descriptive regime/cluster IDs.
+    It is NOT a production probability model.
+    """
+
     def __init__(self, k: int = 4):
-        self.k = k
-        self.centroids: float | np.ndarray | List = []
-        
-    def fit(self, X: np.ndarray, max_iters: int = 20):
+        self.k = max(1, int(k))
+
+        self.centroids: np.ndarray = np.empty(
+            (0, 0),
+            dtype=float,
+        )
+
+    def fit(
+        self,
+        X: np.ndarray,
+        max_iters: int = 20,
+    ) -> None:
+
+        X = np.asarray(
+            X,
+            dtype=float,
+        )
+
+        if X.ndim != 2 or len(X) == 0:
+            self.centroids = np.empty(
+                (0, 0),
+                dtype=float,
+            )
+            return
+
+        finite_mask = np.isfinite(
+            X
+        ).all(axis=1)
+
+        X = X[
+            finite_mask
+        ]
+
         if len(X) == 0:
+            self.centroids = np.empty(
+                (0, 0),
+                dtype=float,
+            )
             return
+
         if len(X) < self.k:
-            self.centroids = np.array([X[i] for i in range(len(X))] + [[0.0] * X.shape[1]] * (self.k - len(X)))
+            pad = np.repeat(
+                X[-1:, :],
+                self.k - len(X),
+                axis=0,
+            )
+
+            self.centroids = np.concatenate(
+                [
+                    X.copy(),
+                    pad,
+                ],
+                axis=0,
+            )
+
             return
-        
-        # Initialize centroids randomly
-        indices = np.random.choice(X.shape[0], self.k, replace=False)
-        self.centroids = X[indices].copy()
-        
-        for _ in range(max_iters):
-            clusters = [[] for _ in range(self.k)]
-            for point in X:
-                distances = np.linalg.norm(self.centroids - point, axis=1)
-                cluster_idx = np.argmin(distances)
-                clusters[cluster_idx].append(point)
-                
-            new_centroids = []
-            for idx in range(self.k):
-                if len(clusters[idx]) > 0:
-                    new_centroids.append(np.mean(clusters[idx], axis=0))
-                else:
-                    new_centroids.append(self.centroids[idx])
-            self.centroids = np.array(new_centroids)
-            
-    def predict(self, point: np.ndarray) -> int:
-        if isinstance(self.centroids, np.ndarray) and self.centroids.size == 0:
+
+        # Deterministic initialization.
+        # No random promotion/training behavior.
+        seed_indices = np.linspace(
+            0,
+            len(X) - 1,
+            self.k,
+            dtype=int,
+        )
+
+        centroids = X[
+            seed_indices
+        ].copy()
+
+        for _ in range(
+            max(
+                1,
+                int(
+                    max_iters
+                ),
+            )
+        ):
+            distances = np.linalg.norm(
+                (
+                    X[
+                        :,
+                        None,
+                        :,
+                    ]
+                    - centroids[
+                        None,
+                        :,
+                        :,
+                    ]
+                ),
+                axis=2,
+            )
+
+            labels = np.argmin(
+                distances,
+                axis=1,
+            )
+
+            updated = (
+                centroids.copy()
+            )
+
+            for cluster_idx in range(
+                self.k
+            ):
+                members = X[
+                    labels
+                    == cluster_idx
+                ]
+
+                if len(members):
+                    updated[
+                        cluster_idx
+                    ] = np.mean(
+                        members,
+                        axis=0,
+                    )
+
+            if np.allclose(
+                updated,
+                centroids,
+                atol=1e-12,
+                rtol=0.0,
+            ):
+                centroids = (
+                    updated
+                )
+                break
+
+            centroids = (
+                updated
+            )
+
+        self.centroids = (
+            centroids
+        )
+
+    def predict(
+        self,
+        point: np.ndarray,
+    ) -> int:
+
+        point = np.asarray(
+            point,
+            dtype=float,
+        )
+
+        if (
+            self.centroids.size == 0
+            or point.ndim != 1
+            or self.centroids.ndim != 2
+            or self.centroids.shape[
+                1
+            ]
+            != point.shape[
+                0
+            ]
+            or not np.isfinite(
+                point
+            ).all()
+        ):
             return 0
-        if isinstance(self.centroids, list) and len(self.centroids) == 0:
-            return 0
-        distances = np.linalg.norm(self.centroids - point, axis=1)
-        return int(np.argmin(distances))
+
+        distances = np.linalg.norm(
+            (
+                self.centroids
+                - point
+            ),
+            axis=1,
+        )
+
+        return int(
+            np.argmin(
+                distances
+            )
+        )
+
 
 class NaiveBayesClassifier:
+    """
+    Legacy research classifier.
+
+    It remains available so old code importing the class does not break.
+
+    IMPORTANT:
+        PatternLearner never uses this classifier as a production
+        confidence source anymore.
+
+    Production confidence must come from an active ModelRegistry champion.
+    """
+
     def __init__(self):
-        self.class_priors = {0: 0.5, 1: 0.5}
-        self.discrete_conds = {}
-        self.continuous_conds = {}
-        
-    def fit(self, X_discrete: List[Dict[str, str]], X_continuous: List[Dict[str, float]], y: List[int]):
-        n = len(y)
-        if n < 5:
+        self.class_priors = {
+            0: 0.5,
+            1: 0.5,
+        }
+
+        self.discrete_conds: Dict[
+            int,
+            Dict[
+                str,
+                Dict[
+                    str,
+                    float,
+                ],
+            ],
+        ] = {}
+
+        self.continuous_conds: Dict[
+            int,
+            Dict[
+                str,
+                Tuple[
+                    float,
+                    float,
+                ],
+            ],
+        ] = {}
+
+    def fit(
+        self,
+        X_discrete: List[
+            Dict[str, str]
+        ],
+        X_continuous: List[
+            Dict[str, float]
+        ],
+        y: List[int],
+    ) -> None:
+
+        n = len(
+            y
+        )
+
+        if (
+            n < 20
+            or len(
+                X_discrete
+            )
+            != n
+            or len(
+                X_continuous
+            )
+            != n
+        ):
             return
-            
-        classes = [0, 1]
-        self.class_priors[1] = sum(y) / n
-        self.class_priors[0] = 1.0 - self.class_priors[1]
-        
-        # Discrete conditional probabilities
-        self.discrete_conds = {c: {} for c in classes}
-        discrete_keys = X_discrete[0].keys() if X_discrete else []
+
+        classes = (
+            0,
+            1,
+        )
+
+        positives = int(
+            sum(
+                int(
+                    value
+                )
+                for value
+                in y
+            )
+        )
+
+        self.class_priors[
+            1
+        ] = (
+            positives
+            / n
+        )
+
+        self.class_priors[
+            0
+        ] = (
+            1.0
+            - self.class_priors[
+                1
+            ]
+        )
+
+        # -------------------------------------------------------------
+        # DISCRETE FEATURES
+        # -------------------------------------------------------------
+
+        self.discrete_conds = {
+            c: {}
+            for c
+            in classes
+        }
+
+        discrete_keys = (
+            list(
+                X_discrete[
+                    0
+                ].keys()
+            )
+            if X_discrete
+            else []
+        )
+
         for key in discrete_keys:
+
+            vocabulary = sorted(
+                {
+                    str(
+                        row.get(
+                            key,
+                            "",
+                        )
+                    )
+                    for row
+                    in X_discrete
+                }
+            )
+
+            vocab_size = max(
+                1,
+                len(
+                    vocabulary
+                ),
+            )
+
             for c in classes:
-                matching_y = [i for i, val in enumerate(y) if val == c]
-                total_c = len(matching_y)
-                values_in_c = [X_discrete[i][key] for i in matching_y]
-                
-                counts = defaultdict(int)
-                for val in values_in_c:
-                    counts[val] += 1
-                
-                unique_vals = set(counts.keys())
-                self.discrete_conds[c][key] = {}
-                for val in unique_vals:
-                    self.discrete_conds[c][key][val] = (counts[val] + 1) / (total_c + len(unique_vals) + 1e-9)
-                    
-        # Continuous conditionals (Gaussian parameters)
-        self.continuous_conds = {c: {} for c in classes}
-        continuous_keys = X_continuous[0].keys() if X_continuous else []
+
+                indices = [
+                    i
+                    for i, label
+                    in enumerate(
+                        y
+                    )
+                    if int(
+                        label
+                    )
+                    == c
+                ]
+
+                denominator = (
+                    len(
+                        indices
+                    )
+                    + vocab_size
+                )
+
+                counts: Dict[
+                    str,
+                    int,
+                ] = defaultdict(
+                    int
+                )
+
+                for i in indices:
+                    counts[
+                        str(
+                            X_discrete[
+                                i
+                            ].get(
+                                key,
+                                "",
+                            )
+                        )
+                    ] += 1
+
+                self.discrete_conds[
+                    c
+                ][
+                    key
+                ] = {
+                    value: (
+                        (
+                            counts[
+                                value
+                            ]
+                            + 1.0
+                        )
+                        / max(
+                            1.0,
+                            denominator,
+                        )
+                    )
+                    for value
+                    in vocabulary
+                }
+
+        # -------------------------------------------------------------
+        # CONTINUOUS FEATURES
+        # -------------------------------------------------------------
+
+        self.continuous_conds = {
+            c: {}
+            for c
+            in classes
+        }
+
+        continuous_keys = (
+            list(
+                X_continuous[
+                    0
+                ].keys()
+            )
+            if X_continuous
+            else []
+        )
+
         for key in continuous_keys:
+
             for c in classes:
-                matching_y = [i for i, val in enumerate(y) if val == c]
-                values_in_c = [X_continuous[i][key] for i in matching_y]
-                if len(values_in_c) > 1:
-                    mean = float(np.mean(values_in_c))
-                    std = float(np.std(values_in_c)) + 1e-5
+
+                values = []
+
+                for i, label in enumerate(
+                    y
+                ):
+                    if int(
+                        label
+                    ) != c:
+                        continue
+
+                    try:
+                        value = float(
+                            X_continuous[
+                                i
+                            ].get(
+                                key,
+                                0.0,
+                            )
+                        )
+
+                        if math.isfinite(
+                            value
+                        ):
+                            values.append(
+                                value
+                            )
+
+                    except Exception:
+                        continue
+
+                if len(
+                    values
+                ) >= 2:
+
+                    mean = float(
+                        np.mean(
+                            values
+                        )
+                    )
+
+                    std = max(
+                        float(
+                            np.std(
+                                values
+                            )
+                        ),
+                        1e-5,
+                    )
+
+                elif values:
+
+                    mean = float(
+                        values[
+                            0
+                        ]
+                    )
+
+                    std = 1.0
+
                 else:
                     mean = 0.0
                     std = 1.0
-                self.continuous_conds[c][key] = (mean, std)
-                
-    def predict_probability(self, x_discrete: Dict[str, str], x_continuous: Dict[str, float]) -> float:
-        posteriors = {}
-        for c in [0, 1]:
-            prior = self.class_priors[c]
-            prob = np.log(prior + 1e-9)
-            
-            for key, val in x_discrete.items():
-                if c in self.discrete_conds and key in self.discrete_conds[c] and val in self.discrete_conds[c][key]:
-                    prob += np.log(self.discrete_conds[c][key][val] + 1e-9)
-                else:
-                    prob += np.log(0.1)
-                    
-            for key, val in x_continuous.items():
-                if c in self.continuous_conds and key in self.continuous_conds[c]:
-                    mean, std = self.continuous_conds[c][key]
-                    exponent = np.exp(-((val - mean) ** 2) / (2 * (std ** 2) + 1e-9))
-                    pdf = (1 / (np.sqrt(2 * np.pi) * std + 1e-9)) * exponent
-                    prob += np.log(pdf + 1e-9)
-                    
-            posteriors[c] = prob
-            
-        max_val = max(posteriors[0], posteriors[1])
-        e0 = np.exp(posteriors[0] - max_val)
-        e1 = np.exp(posteriors[1] - max_val)
-        return float(e1 / (e0 + e1 + 1e-9))
+
+                self.continuous_conds[
+                    c
+                ][
+                    key
+                ] = (
+                    mean,
+                    std,
+                )
+
+    def predict_probability(
+        self,
+        x_discrete: Dict[
+            str,
+            str,
+        ],
+        x_continuous: Dict[
+            str,
+            float,
+        ],
+    ) -> float:
+
+        posteriors: Dict[
+            int,
+            float,
+        ] = {}
+
+        for c in (
+            0,
+            1,
+        ):
+            score = math.log(
+                max(
+                    self.class_priors.get(
+                        c,
+                        0.5,
+                    ),
+                    1e-12,
+                )
+            )
+
+            for key, value in x_discrete.items():
+
+                table = (
+                    self.discrete_conds
+                    .get(
+                        c,
+                        {},
+                    )
+                    .get(
+                        key,
+                        {},
+                    )
+                )
+
+                score += math.log(
+                    max(
+                        table.get(
+                            str(
+                                value
+                            ),
+                            1e-3,
+                        ),
+                        1e-12,
+                    )
+                )
+
+            for key, raw_value in x_continuous.items():
+
+                params = (
+                    self.continuous_conds
+                    .get(
+                        c,
+                        {},
+                    )
+                    .get(
+                        key
+                    )
+                )
+
+                if params is None:
+                    continue
+
+                value = float(
+                    raw_value
+                )
+
+                mean, std = (
+                    params
+                )
+
+                exponent = -(
+                    (
+                        value
+                        - mean
+                    )
+                    ** 2
+                ) / (
+                    2.0
+                    * std
+                    * std
+                )
+
+                pdf = math.exp(
+                    exponent
+                ) / (
+                    math.sqrt(
+                        2.0
+                        * math.pi
+                    )
+                    * std
+                )
+
+                score += math.log(
+                    max(
+                        pdf,
+                        1e-12,
+                    )
+                )
+
+            posteriors[
+                c
+            ] = score
+
+        max_score = max(
+            posteriors.values()
+        )
+
+        p0 = math.exp(
+            posteriors[
+                0
+            ]
+            - max_score
+        )
+
+        p1 = math.exp(
+            posteriors[
+                1
+            ]
+            - max_score
+        )
+
+        return float(
+            p1
+            / max(
+                p0 + p1,
+                1e-12,
+            )
+        )
 
 
 class ChartPatternDetector:
     """
-    Institutional SMC Chart Pattern Detector.
-    Detects patterns from M1/M5/H1 dataframes and returns confidence scores.
+    Causal chart-pattern detector.
 
-    Patterns detected:
-      ORDER_BLOCK      — Last bearish/bullish candle before a strong impulsive move
-      FVG              — Fair Value Gap (imbalance between candle[-2].high and candle[0].low)
-      BREAKER_BLOCK    — Previously broken OB that flipped to opposite polarity
-      LIQUIDITY_SWEEP  — Wick beyond prior swing H/L with body close back inside
-      MSS              — Market Structure Shift: first close beyond internal swing
-      DISPLACEMENT     — Series of 3+ strong directional closes
-      INDUCEMENT       — Small false break before real reversal move
-      CRT_MANIPULATION — Candle that sweeps both high AND low within the range then closes inside
+    Only candles already present in supplied frames are inspected.
+
+    No pattern is confirmed using candles after the decision candle.
     """
 
     @staticmethod
-    def detect(df_m1: pd.DataFrame,
-               df_m5: Optional[pd.DataFrame] = None,
-               df_h1: Optional[pd.DataFrame] = None,
-               window: int = 5) -> Dict:
-        """
-        Detect all SMC patterns across available timeframes.
-        Returns dict: {pattern_name: {'detected': bool, 'confidence': float, 'level': float|None}}
-        """
-        results = {}
+    def _empty(
+        name: str,
+    ) -> Dict[
+        str,
+        Any,
+    ]:
 
-        def _score(conditions: list) -> float:
-            """Return normalized confidence from a list of bool conditions."""
-            if not conditions:
-                return 0.0
-            return round(sum(conditions) / len(conditions), 3)
+        return {
+            "detected": False,
+            "confidence": 0.0,
+            "level": None,
+            "name": name,
+        }
+
+    @staticmethod
+    def detect(
+        df_m1: pd.DataFrame,
+        df_m5: Optional[
+            pd.DataFrame
+        ] = None,
+        df_h1: Optional[
+            pd.DataFrame
+        ] = None,
+        window: int = 5,
+    ) -> Dict[
+        str,
+        Dict[
+            str,
+            Any,
+        ],
+    ]:
+
+        names = (
+            "ORDER_BLOCK_BULL",
+            "ORDER_BLOCK_BEAR",
+            "FVG_BULL",
+            "FVG_BEAR",
+            "LIQUIDITY_SWEEP_LOW",
+            "LIQUIDITY_SWEEP_HIGH",
+            "MSS_BULLISH",
+            "MSS_BEARISH",
+            "DISPLACEMENT_BULL",
+            "DISPLACEMENT_BEAR",
+        )
+
+        results = {
+            name: (
+                ChartPatternDetector
+                ._empty(
+                    name
+                )
+            )
+            for name
+            in names
+        }
 
         try:
-            # ── ORDER BLOCK (H1 preferred, fallback M5) ────────────────────────
-            ob_df = df_h1 if (df_h1 is not None and len(df_h1) >= 10) else df_m5
-            if ob_df is not None and len(ob_df) >= 10:
-                closes = ob_df['close'].values
-                opens = ob_df['open'].values
-                highs = ob_df['high'].values
-                lows = ob_df['low'].values
-                # OB: last bearish candle (close<open) before 3 bullish candles
-                ob_bull_level = None
-                ob_bear_level = None
-                for i in range(len(closes) - 4, max(0, len(closes) - 15), -1):
-                    # Bullish OB: bearish candle[i] → 3 bullish candles after
-                    if closes[i] < opens[i]:
-                        subsequent = closes[i+1:i+4] if i+4 <= len(closes) else closes[i+1:]
-                        if len(subsequent) >= 2 and all(subsequent > opens[i+1:i+1+len(subsequent)]):
-                            ob_bull_level = highs[i]
-                            break
-                    # Bearish OB: bullish candle[i] → 3 bearish candles after
-                    if closes[i] > opens[i]:
-                        subsequent = closes[i+1:i+4] if i+4 <= len(closes) else closes[i+1:]
-                        if len(subsequent) >= 2 and all(subsequent < opens[i+1:i+1+len(subsequent)]):
-                            ob_bear_level = lows[i]
-                            break
-                results['ORDER_BLOCK_BULL'] = {
-                    'detected': ob_bull_level is not None,
-                    'confidence': 0.80 if ob_bull_level is not None else 0.0,
-                    'level': ob_bull_level
-                }
-                results['ORDER_BLOCK_BEAR'] = {
-                    'detected': ob_bear_level is not None,
-                    'confidence': 0.80 if ob_bear_level is not None else 0.0,
-                    'level': ob_bear_level
-                }
+            if (
+                df_m1 is None
+                or len(
+                    df_m1
+                ) < 5
+            ):
+                return results
 
-            # ── FVG (M1-level for precision) ──────────────────────────────────
-            if df_m1 is not None and len(df_m1) >= 5:
-                highs_m1 = df_m1['high'].values
-                lows_m1 = df_m1['low'].values
-                fvg_bull = None
-                fvg_bear = None
-                for i in range(len(highs_m1) - 3, max(0, len(highs_m1) - 20), -1):
-                    # Bullish FVG: candle[i-1].high < candle[i+1].low
-                    if i + 1 < len(highs_m1) and highs_m1[i-1] < lows_m1[i+1]:
-                        fvg_bull = (highs_m1[i-1] + lows_m1[i+1]) / 2
+            m1 = df_m1
+
+            highs = (
+                m1[
+                    "high"
+                ]
+                .astype(
+                    float
+                )
+                .to_numpy()
+            )
+
+            lows = (
+                m1[
+                    "low"
+                ]
+                .astype(
+                    float
+                )
+                .to_numpy()
+            )
+
+            opens = (
+                m1[
+                    "open"
+                ]
+                .astype(
+                    float
+                )
+                .to_numpy()
+            )
+
+            closes = (
+                m1[
+                    "close"
+                ]
+                .astype(
+                    float
+                )
+                .to_numpy()
+            )
+
+            # ---------------------------------------------------------
+            # FVG
+            # ---------------------------------------------------------
+
+            if len(
+                m1
+            ) >= 3:
+
+                if highs[
+                    -3
+                ] < lows[
+                    -1
+                ]:
+
+                    level = float(
+                        (
+                            highs[
+                                -3
+                            ]
+                            + lows[
+                                -1
+                            ]
+                        )
+                        / 2.0
+                    )
+
+                    results[
+                        "FVG_BULL"
+                    ] = {
+                        "detected": True,
+                        "confidence": 0.75,
+                        "level": level,
+                        "name": "FVG_BULL",
+                    }
+
+                if lows[
+                    -3
+                ] > highs[
+                    -1
+                ]:
+
+                    level = float(
+                        (
+                            lows[
+                                -3
+                            ]
+                            + highs[
+                                -1
+                            ]
+                        )
+                        / 2.0
+                    )
+
+                    results[
+                        "FVG_BEAR"
+                    ] = {
+                        "detected": True,
+                        "confidence": 0.75,
+                        "level": level,
+                        "name": "FVG_BEAR",
+                    }
+
+            # ---------------------------------------------------------
+            # SWEEP / MSS
+            # ---------------------------------------------------------
+
+            lookback = max(
+                3,
+                min(
+                    int(
+                        window
+                    )
+                    + 5,
+                    len(
+                        m1
+                    )
+                    - 1,
+                ),
+            )
+
+            if lookback >= 3:
+
+                prior_high = float(
+                    np.max(
+                        highs[
+                            -lookback:
+                            -1
+                        ]
+                    )
+                )
+
+                prior_low = float(
+                    np.min(
+                        lows[
+                            -lookback:
+                            -1
+                        ]
+                    )
+                )
+
+                if (
+                    lows[
+                        -1
+                    ]
+                    < prior_low
+                    and closes[
+                        -1
+                    ]
+                    > prior_low
+                ):
+
+                    results[
+                        "LIQUIDITY_SWEEP_LOW"
+                    ] = {
+                        "detected": True,
+                        "confidence": 0.8,
+                        "level": prior_low,
+                        "name": (
+                            "LIQUIDITY_SWEEP_LOW"
+                        ),
+                    }
+
+                if (
+                    highs[
+                        -1
+                    ]
+                    > prior_high
+                    and closes[
+                        -1
+                    ]
+                    < prior_high
+                ):
+
+                    results[
+                        "LIQUIDITY_SWEEP_HIGH"
+                    ] = {
+                        "detected": True,
+                        "confidence": 0.8,
+                        "level": prior_high,
+                        "name": (
+                            "LIQUIDITY_SWEEP_HIGH"
+                        ),
+                    }
+
+                if closes[
+                    -1
+                ] > prior_high:
+
+                    results[
+                        "MSS_BULLISH"
+                    ] = {
+                        "detected": True,
+                        "confidence": 0.7,
+                        "level": prior_high,
+                        "name": "MSS_BULLISH",
+                    }
+
+                if closes[
+                    -1
+                ] < prior_low:
+
+                    results[
+                        "MSS_BEARISH"
+                    ] = {
+                        "detected": True,
+                        "confidence": 0.7,
+                        "level": prior_low,
+                        "name": "MSS_BEARISH",
+                    }
+
+            # ---------------------------------------------------------
+            # DISPLACEMENT
+            # ---------------------------------------------------------
+
+            ranges = (
+                highs
+                - lows
+            )
+
+            if len(
+                ranges
+            ) >= 10:
+
+                baseline = float(
+                    np.median(
+                        ranges[
+                            -10:
+                            -1
+                        ]
+                    )
+                )
+
+                last_range = float(
+                    ranges[
+                        -1
+                    ]
+                )
+
+                if (
+                    baseline > 0.0
+                    and last_range
+                    >= 1.5
+                    * baseline
+                ):
+
+                    if closes[
+                        -1
+                    ] > opens[
+                        -1
+                    ]:
+
+                        results[
+                            "DISPLACEMENT_BULL"
+                        ] = {
+                            "detected": True,
+                            "confidence": 0.7,
+                            "level": float(
+                                closes[
+                                    -1
+                                ]
+                            ),
+                            "name": (
+                                "DISPLACEMENT_BULL"
+                            ),
+                        }
+
+                    elif closes[
+                        -1
+                    ] < opens[
+                        -1
+                    ]:
+
+                        results[
+                            "DISPLACEMENT_BEAR"
+                        ] = {
+                            "detected": True,
+                            "confidence": 0.7,
+                            "level": float(
+                                closes[
+                                    -1
+                                ]
+                            ),
+                            "name": (
+                                "DISPLACEMENT_BEAR"
+                            ),
+                        }
+
+            # ---------------------------------------------------------
+            # ORDER-BLOCK CONTEXT
+            # ---------------------------------------------------------
+
+            ob_df = (
+                df_h1
+                if (
+                    df_h1 is not None
+                    and len(
+                        df_h1
+                    ) >= 5
+                )
+                else df_m5
+            )
+
+            if (
+                ob_df is not None
+                and len(
+                    ob_df
+                ) >= 5
+            ):
+
+                recent = (
+                    ob_df.iloc[
+                        -8:
+                    ]
+                    .copy()
+                )
+
+                o = (
+                    recent[
+                        "open"
+                    ]
+                    .astype(
+                        float
+                    )
+                    .to_numpy()
+                )
+
+                c = (
+                    recent[
+                        "close"
+                    ]
+                    .astype(
+                        float
+                    )
+                    .to_numpy()
+                )
+
+                h = (
+                    recent[
+                        "high"
+                    ]
+                    .astype(
+                        float
+                    )
+                    .to_numpy()
+                )
+
+                l = (
+                    recent[
+                        "low"
+                    ]
+                    .astype(
+                        float
+                    )
+                    .to_numpy()
+                )
+
+                for idx in range(
+                    len(
+                        recent
+                    )
+                    - 2,
+                    0,
+                    -1,
+                ):
+
+                    if (
+                        c[
+                            idx - 1
+                        ]
+                        < o[
+                            idx - 1
+                        ]
+                        and c[
+                            idx
+                        ]
+                        > o[
+                            idx
+                        ]
+                    ):
+
+                        results[
+                            "ORDER_BLOCK_BULL"
+                        ] = {
+                            "detected": True,
+                            "confidence": 0.65,
+                            "level": float(
+                                l[
+                                    idx - 1
+                                ]
+                            ),
+                            "name": (
+                                "ORDER_BLOCK_BULL"
+                            ),
+                        }
+
                         break
-                for i in range(len(lows_m1) - 3, max(0, len(lows_m1) - 20), -1):
-                    # Bearish FVG: candle[i-1].low > candle[i+1].high
-                    if i + 1 < len(lows_m1) and lows_m1[i-1] > highs_m1[i+1]:
-                        fvg_bear = (lows_m1[i-1] + highs_m1[i+1]) / 2
+
+                for idx in range(
+                    len(
+                        recent
+                    )
+                    - 2,
+                    0,
+                    -1,
+                ):
+
+                    if (
+                        c[
+                            idx - 1
+                        ]
+                        > o[
+                            idx - 1
+                        ]
+                        and c[
+                            idx
+                        ]
+                        < o[
+                            idx
+                        ]
+                    ):
+
+                        results[
+                            "ORDER_BLOCK_BEAR"
+                        ] = {
+                            "detected": True,
+                            "confidence": 0.65,
+                            "level": float(
+                                h[
+                                    idx - 1
+                                ]
+                            ),
+                            "name": (
+                                "ORDER_BLOCK_BEAR"
+                            ),
+                        }
+
                         break
-                results['FVG_BULL'] = {
-                    'detected': fvg_bull is not None,
-                    'confidence': 0.75 if fvg_bull is not None else 0.0,
-                    'level': fvg_bull
-                }
-                results['FVG_BEAR'] = {
-                    'detected': fvg_bear is not None,
-                    'confidence': 0.75 if fvg_bear is not None else 0.0,
-                    'level': fvg_bear
-                }
 
-            # ── LIQUIDITY SWEEP (M1) ──────────────────────────────────────────
-            if df_m1 is not None and len(df_m1) >= 10:
-                m1_h = df_m1['high'].values
-                m1_l = df_m1['low'].values
-                m1_c = df_m1['close'].values
-                # Find prior swing high/low over last window bars
-                lookback = min(window + 5, len(m1_h) - 3)
-                prior_high = max(m1_h[-lookback:-3])
-                prior_low = min(m1_l[-lookback:-3])
-                last_high = m1_h[-2]
-                last_low = m1_l[-2]
-                last_close = m1_c[-2]
-                sweep_high = last_high > prior_high and last_close < prior_high
-                sweep_low = last_low < prior_low and last_close > prior_low
-                results['LIQUIDITY_SWEEP_HIGH'] = {
-                    'detected': sweep_high,
-                    'confidence': _score([sweep_high, last_high > prior_high * 1.001]),
-                    'level': prior_high if sweep_high else None
-                }
-                results['LIQUIDITY_SWEEP_LOW'] = {
-                    'detected': sweep_low,
-                    'confidence': _score([sweep_low, last_low < prior_low * 0.999]),
-                    'level': prior_low if sweep_low else None
-                }
-
-            # ── MSS (Market Structure Shift) on M1 ───────────────────────────
-            if df_m1 is not None and len(df_m1) >= 15:
-                m1_c = df_m1['close'].values
-                m1_h = df_m1['high'].values
-                m1_l = df_m1['low'].values
-                # Internal swing high broken by close above it = bullish MSS
-                internal_swing_high = max(m1_h[-12:-4])
-                internal_swing_low = min(m1_l[-12:-4])
-                last_c = m1_c[-2]
-                mss_bull = last_c > internal_swing_high
-                mss_bear = last_c < internal_swing_low
-                results['MSS_BULLISH'] = {
-                    'detected': mss_bull,
-                    'confidence': 0.72 if mss_bull else 0.0,
-                    'level': internal_swing_high if mss_bull else None
-                }
-                results['MSS_BEARISH'] = {
-                    'detected': mss_bear,
-                    'confidence': 0.72 if mss_bear else 0.0,
-                    'level': internal_swing_low if mss_bear else None
-                }
-
-            # ── DISPLACEMENT (3+ consecutive strong closes in one direction) ─
-            if df_m1 is not None and len(df_m1) >= 8:
-                closes_m1 = df_m1['close'].values
-                opens_m1 = df_m1['open'].values
-                bodies = closes_m1[-6:] - opens_m1[-6:]
-                bull_displacement = all(bodies[-3:] > 0) and sum(bodies[-3:]) > 0
-                bear_displacement = all(bodies[-3:] < 0) and sum(bodies[-3:]) < 0
-                results['DISPLACEMENT_BULL'] = {
-                    'detected': bull_displacement,
-                    'confidence': 0.65 if bull_displacement else 0.0,
-                    'level': None
-                }
-                results['DISPLACEMENT_BEAR'] = {
-                    'detected': bear_displacement,
-                    'confidence': 0.65 if bear_displacement else 0.0,
-                    'level': None
-                }
-
-            # ── CRT MANIPULATION (sweeps both high and low then closes inside) 
-            if df_m1 is not None and len(df_m1) >= 10:
-                # The CRT manipulation candle sweeps the range high AND low
-                crt_ref_high = max(df_m1['high'].values[-10:-3])
-                crt_ref_low = min(df_m1['low'].values[-10:-3])
-                last_m1 = df_m1.iloc[-2]
-                crt_manip = (last_m1['high'] > crt_ref_high and
-                             last_m1['low'] < crt_ref_low and
-                             crt_ref_low < last_m1['close'] < crt_ref_high)
-                results['CRT_MANIPULATION'] = {
-                    'detected': crt_manip,
-                    'confidence': 0.90 if crt_manip else 0.0,
-                    'level': (crt_ref_high + crt_ref_low) / 2 if crt_manip else None
-                }
-
-            # ── VSA PATTERNS (using detect_vsa_signals) ──────────────────────
-            from utils.volume_analyzer import VolumeAnalyzer
-            vsa_signals = []
-            if df_m1 is not None and 'atr' in df_m1.columns:
-                vsa_signals += VolumeAnalyzer.detect_vsa_signals(df_m1, df_m1['atr'], lookback=5)
-            if df_m5 is not None and 'atr' in df_m5.columns:
-                vsa_signals += VolumeAnalyzer.detect_vsa_signals(df_m5, df_m5['atr'], lookback=5)
-                
-            vsa_patterns_list = [
-                'VSA_SPRING', 'VSA_UPTHRUST', 'VSA_STOPPING_VOLUME',
-                'VSA_NO_SUPPLY', 'VSA_NO_DEMAND', 'VSA_BUYING_CLIMAX', 'VSA_SELLING_CLIMAX'
-            ]
-            for pat in vsa_patterns_list:
-                results[pat] = {'detected': False, 'confidence': 0.0, 'level': None}
-                
-            for sig in vsa_signals:
-                pat_name = f"VSA_{sig['pattern']}"
-                results[pat_name] = {
-                    'detected': True,
-                    'confidence': sig['confidence'],
-                    'level': sig['price']
-                }
-
-        except Exception as e:
-            pass  # Fail silently — pattern detection is advisory only
+        except Exception:
+            return results
 
         return results
 
     @staticmethod
-    def get_summary(detected: Dict) -> Tuple[List[str], float, Optional[str]]:
-        """
-        Summarize detected patterns into:
-        - List of detected pattern names
-        - Overall confidence (max of detected confidences)
-        - Directional bias ('bullish', 'bearish', None)
-        """
-        bull_patterns = {'ORDER_BLOCK_BULL', 'FVG_BULL', 'LIQUIDITY_SWEEP_LOW',
-                         'MSS_BULLISH', 'DISPLACEMENT_BULL',
-                         'VSA_SPRING', 'VSA_STOPPING_VOLUME', 'VSA_NO_SUPPLY', 'VSA_SELLING_CLIMAX'}
-        bear_patterns = {'ORDER_BLOCK_BEAR', 'FVG_BEAR', 'LIQUIDITY_SWEEP_HIGH',
-                         'MSS_BEARISH', 'DISPLACEMENT_BEAR',
-                         'VSA_UPTHRUST', 'VSA_NO_DEMAND', 'VSA_BUYING_CLIMAX'}
+    def get_summary(
+        detected: Dict[
+            str,
+            Dict[
+                str,
+                Any,
+            ],
+        ],
+    ) -> Tuple[
+        List[str],
+        float,
+        Optional[str],
+    ]:
 
-        found = [k for k, v in detected.items() if v.get('detected')]
+        bull_patterns = {
+            "ORDER_BLOCK_BULL",
+            "FVG_BULL",
+            "LIQUIDITY_SWEEP_LOW",
+            "MSS_BULLISH",
+            "DISPLACEMENT_BULL",
+        }
+
+        bear_patterns = {
+            "ORDER_BLOCK_BEAR",
+            "FVG_BEAR",
+            "LIQUIDITY_SWEEP_HIGH",
+            "MSS_BEARISH",
+            "DISPLACEMENT_BEAR",
+        }
+
+        found = [
+            name
+            for name, payload
+            in detected.items()
+            if bool(
+                payload.get(
+                    "detected"
+                )
+            )
+        ]
+
         if not found:
-            return [], 0.0, None
+            return (
+                [],
+                0.0,
+                None,
+            )
 
-        max_conf = max(detected[k]['confidence'] for k in found)
-        bull_count = sum(1 for p in found if p in bull_patterns)
-        bear_count = sum(1 for p in found if p in bear_patterns)
+        confidence = max(
+            float(
+                detected[
+                    name
+                ].get(
+                    "confidence",
+                    0.0,
+                )
+            )
+            for name
+            in found
+        )
 
-        direction = None
+        bull_count = sum(
+            name
+            in bull_patterns
+            for name
+            in found
+        )
+
+        bear_count = sum(
+            name
+            in bear_patterns
+            for name
+            in found
+        )
+
+        direction: Optional[
+            str
+        ] = None
+
         if bull_count > bear_count:
-            direction = 'bullish'
-        elif bear_count > bull_count:
-            direction = 'bearish'
+            direction = (
+                "bullish"
+            )
 
-        return found, round(max_conf, 3), direction
+        elif bear_count > bull_count:
+            direction = (
+                "bearish"
+            )
+
+        return (
+            found,
+            round(
+                confidence,
+                3,
+            ),
+            direction,
+        )
+
+
+@dataclass(frozen=True)
+class _CausalSample:
+    feature_vector: np.ndarray
+
+    target: float
+    realized_r: float
+
+    decision_index: int
+    label_end_index: int
+
+    decision_time_utc: str
+
+    outcome_type: str
+    split: str
 
 
 class PatternLearner:
-    def __init__(self, memory: ExperienceMemory):
+    """
+    Causal, shadow-first PatternLearner.
+
+    Production confidence comes ONLY from the active ModelRegistry champion.
+
+    Historical training methods create causal shadow datasets.
+
+    They never:
+        - overwrite the live neural network
+        - save challenger as champion
+        - fit synthetic outcomes into production confidence
+        - use still-open higher-timeframe candles
+        - let training labels cross validation/holdout boundaries
+    """
+
+    CAUSAL_LABEL_VERSION = (
+        "v5.0-causal"
+    )
+
+    TRAIN_FRACTION = 0.70
+    VALIDATION_FRACTION = 0.15
+
+    DEFAULT_MAX_HOLDING_BARS = (
+        100
+    )
+
+    def __init__(
+        self,
+        memory: ExperienceMemory,
+    ):
         self.memory = memory
-        self.patterns = defaultdict(list)
-        self.market_regimes = {}
-        self.logger = logging.getLogger('PulseViper.PatternLearner')
-        
-        # Supervised & Unsupervised Models
-        self.kmeans = KMeansClustering(k=4)
-        self.classifier = NaiveBayesClassifier()
-        self.training_stats = {}
-        
-        # PyTorch Neural Net & Threading Lock
-        import threading
-        self.model_lock = threading.Lock()
-        self.nn_ready = False
-        
-        self.nn_model = PulseViperNeuralNet()
-        self.nn_optimizer = optim.Adam(self.nn_model.parameters(), lr=0.003, weight_decay=1e-4)
-        self.nn_criterion = nn.BCELoss()
-        self.load_nn_model()
-        
-        # Pattern detection parameters
-        self.min_pattern_occurrence = 2
-        self.confidence_threshold = 0.5
-        
-        # Load saved models and patterns
-        self.load_patterns()
-        
-    @property
-    def nb_ready(self) -> bool:
-        """Dynamic readiness check for Naive Bayes classifier."""
-        return len(self.classifier.discrete_conds) > 0
-        
-    def detect_visual_patterns(self, df: pd.DataFrame) -> List[str]:
-        """
-        Scan recent candles to locate structural and candlestick patterns:
-        - DOUBLE_TOP / DOUBLE_BOTTOM
-        - BULLISH_ENGULFING / BEARISH_ENGULFING
-        - PIN_BAR (Hammer / Shooting Star)
-        - INSIDE_BAR
-        - LIQUIDITY_SWEEP (high/low wick sweeps)
-        """
-        patterns = []
-        if len(df) < 5:
-            return patterns
-            
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        last_range = last['high'] - last['low']
-        if last_range > 0:
-            last_body = abs(last['close'] - last['open'])
-            upper_wick = last['high'] - max(last['open'], last['close'])
-            lower_wick = min(last['open'], last['close']) - last['low']
-            
-            # Pin Bar Hammer
-            if lower_wick / last_range >= 0.45 and last_body / last_range <= 0.4:
-                patterns.append("PIN_BAR_BULLISH")
-            # Pin Bar Shooting Star
-            elif upper_wick / last_range >= 0.45 and last_body / last_range <= 0.4:
-                patterns.append("PIN_BAR_BEARISH")
-                
-            # Inside Bar
-            if last['high'] < prev['high'] and last['low'] > prev['low']:
-                patterns.append("INSIDE_BAR")
-                
-        # Engulfing pattern
-        prev_body_dir = prev['close'] - prev['open']
-        last_body_dir = last['close'] - last['open']
-        if prev_body_dir < 0 and last_body_dir > 0:
-            if last['close'] >= prev['open'] and last['open'] <= prev['close']:
-                patterns.append("BULLISH_ENGULFING")
-        elif prev_body_dir > 0 and last_body_dir < 0:
-            if last['close'] <= prev['open'] and last['open'] >= prev['close']:
-                patterns.append("BEARISH_ENGULFING")
-                
-        # Swings detection (swing high / swing low)
-        swing_highs = []
-        swing_lows = []
-        window = 3
-        highs = df['high'].values
-        lows = df['low'].values
-        n = len(df)
-        
-        for i in range(window, n - window):
-            is_sh = True
-            for w in range(1, window + 1):
-                if highs[i] < highs[i - w] or highs[i] < highs[i + w]:
-                    is_sh = False
-                    break
-            if is_sh:
-                swing_highs.append(float(highs[i]))
-                
-            is_sl = True
-            for w in range(1, window + 1):
-                if lows[i] > lows[i - w] or lows[i] > lows[i + w]:
-                    is_sl = False
-                    break
-            if is_sl:
-                swing_lows.append(float(lows[i]))
-                
-        # Double Top / Double Bottom
-        if len(swing_highs) >= 2:
-            h1, h2 = swing_highs[-1], swing_highs[-2]
-            if abs(h1 - h2) / ((h1 + h2)/2) < 0.0015:
-                patterns.append("DOUBLE_TOP")
-        if len(swing_lows) >= 2:
-            l1, l2 = swing_lows[-1], swing_lows[-2]
-            if abs(l1 - l2) / ((l1 + l2)/2) < 0.0015:
-                patterns.append("DOUBLE_BOTTOM")
-                
-        # Liquidity Sweep
-        if len(swing_highs) > 0 and last['high'] > swing_highs[-1] and last['close'] < swing_highs[-1]:
-            patterns.append("LIQUIDITY_SWEEP_HIGH")
-        if len(swing_lows) > 0 and last['low'] < swing_lows[-1] and last['close'] > swing_lows[-1]:
-            patterns.append("LIQUIDITY_SWEEP_LOW")
-            
-        return patterns
 
-    def detect_visual_patterns_numpy(self, opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray) -> List[str]:
-        """Fast numpy-based visual pattern detection from sliced arrays."""
-        patterns = []
-        n = len(closes)
-        if n < 5:
-            return patterns
-            
-        last_high = highs[-1]
-        last_low = lows[-1]
-        last_open = opens[-1]
-        last_close = closes[-1]
-        
-        prev_high = highs[-2]
-        prev_low = lows[-2]
-        prev_open = opens[-2]
-        prev_close = closes[-2]
-        
-        last_range = last_high - last_low
-        last_body = abs(last_close - last_open)
-        upper_wick = last_high - max(last_open, last_close)
-        lower_wick = min(last_open, last_close) - last_low
-        
-        if last_range > 0:
-            # Pin Bar Hammer
-            if lower_wick / last_range >= 0.45 and last_body / last_range <= 0.4:
-                patterns.append("PIN_BAR_BULLISH")
-            # Pin Bar Shooting Star
-            elif upper_wick / last_range >= 0.45 and last_body / last_range <= 0.4:
-                patterns.append("PIN_BAR_BEARISH")
-                
-            # Inside Bar
-            if last_high < prev_high and last_low > prev_low:
-                patterns.append("INSIDE_BAR")
-                
-        # Engulfing pattern
-        prev_body_dir = prev_close - prev_open
-        last_body_dir = last_close - last_open
-        if prev_body_dir < 0 and last_body_dir > 0:
-            if last_close >= prev_open and last_open <= prev_close:
-                patterns.append("BULLISH_ENGULFING")
-        elif prev_body_dir > 0 and last_body_dir < 0:
-            if last_close <= prev_open and last_open >= prev_close:
-                patterns.append("BEARISH_ENGULFING")
-                
-        # Swings detection (swing high / swing low)
-        swing_highs = []
-        swing_lows = []
-        window = 3
-        
-        for i in range(window, n - window):
-            is_sh = True
-            for w in range(1, window + 1):
-                if highs[i] < highs[i - w] or highs[i] < highs[i + w]:
-                    is_sh = False
-                    break
-            if is_sh:
-                swing_highs.append(float(highs[i]))
-                
-            is_sl = True
-            for w in range(1, window + 1):
-                if lows[i] > lows[i - w] or lows[i] > lows[i + w]:
-                    is_sl = False
-                    break
-            if is_sl:
-                swing_lows.append(float(lows[i]))
-                
-        # Double Top / Double Bottom
-        if len(swing_highs) >= 2:
-            h1, h2 = swing_highs[-1], swing_highs[-2]
-            if abs(h1 - h2) / ((h1 + h2)/2) < 0.0015:
-                patterns.append("DOUBLE_TOP")
-        if len(swing_lows) >= 2:
-            l1, l2 = swing_lows[-1], swing_lows[-2]
-            if abs(l1 - l2) / ((l1 + l2)/2) < 0.0015:
-                patterns.append("DOUBLE_BOTTOM")
-                
-        # Liquidity Sweep
-        if len(swing_highs) > 0 and last_high > swing_highs[-1] and last_close < swing_highs[-1]:
-            patterns.append("LIQUIDITY_SWEEP_HIGH")
-        if len(swing_lows) > 0 and last_low < swing_lows[-1] and last_close > swing_lows[-1]:
-            patterns.append("LIQUIDITY_SWEEP_LOW")
-            
-        return patterns
+        self.logger = logging.getLogger(
+            "PulseViper.PatternLearner"
+        )
 
-    def _quantize_smc_state(self, features: Dict) -> str:
-        """Quantize SMC features for simple dictionary pattern lookups"""
-        quantized = {}
-        bias_val = features.get('active_bias', 0)
-        quantized['bias'] = 'BULLISH' if bias_val == 1 else ('BEARISH' if bias_val == -1 else 'NEUTRAL')
-        
-        price = features.get('price', features.get('close', 0.0))
-        support = features.get('support', 0.0)
-        resistance = features.get('resistance', 0.0)
-        if resistance > support and support > 0:
-            pct = (price - support) / (resistance - support)
-            if pct < 0.35: quantized['zone'] = 'DISCOUNT'
-            elif pct > 0.65: quantized['zone'] = 'PREMIUM'
-            else: quantized['zone'] = 'EQUILIBRIUM'
-        else:
-            quantized['zone'] = 'EQUILIBRIUM'
-            
-        quantized['fvg'] = str(features.get('fvg_class', 'none')).upper()
-        
-        had_sweep = features.get('liq_sweep_type', 0) != 0
-        had_mss = features.get('mss_signal', 0) != 0
-        if had_sweep and had_mss: quantized['setup'] = 'SHARP_TURN'
-        elif had_mss: quantized['setup'] = 'MSS_ONLY'
-        elif had_sweep: quantized['setup'] = 'SWEEP_ONLY'
-        else: quantized['setup'] = 'CONTINUATION'
-        
-        return str(sorted(quantized.items()))
+        self.patterns: Dict[
+            str,
+            List[
+                Dict[
+                    str,
+                    Any,
+                ]
+            ],
+        ] = defaultdict(
+            list
+        )
 
-    def train_on_history(self, symbol: str, df_htf: pd.DataFrame, df_context: pd.DataFrame, df_ltf: pd.DataFrame):
-        """Historical auto-training scanning: detects patterns, fits K-Means and trains Naive Bayes"""
-        self.logger.info(f"⏳ Starting visual & ML historical training on {symbol}...")
-        
-        from utils.settings_manager import settings_manager
-        swing_window = settings_manager.get("smc_swing_window", 3)
-        
-        from utils.smc_indicators import SMCIndicators
-        df_htf_feat = SMCIndicators.compute_smc_features(df_htf, window=swing_window)
-        df_context_feat = SMCIndicators.compute_smc_features(df_context, window=swing_window)
-        df_ltf_feat = SMCIndicators.compute_smc_features(df_ltf, window=swing_window)
-        
-        # Shift swing-dependent columns to prevent lookahead leakage
-        leakage_cols = [
-            'is_swing_high', 'is_swing_low', 'is_sth', 'is_stl', 'is_ith', 'is_itl',
-            'support', 'resistance', 'liq_sweep_type', 'liq_sweep_level', 'mss_signal',
-            'active_bias', 'ob_reaction_signal', 'sr_reaction_signal', 'retest_pullback_signal',
-            'trend_shift_signal'
-        ]
-        for col in leakage_cols:
-            if col in df_ltf_feat.columns:
-                df_ltf_feat[col] = df_ltf_feat[col].shift(swing_window).fillna(0)
-            if col in df_context_feat.columns:
-                df_context_feat[col] = df_context_feat[col].shift(swing_window).fillna(0)
-            if col in df_htf_feat.columns:
-                df_htf_feat[col] = df_htf_feat[col].shift(swing_window).fillna(0)
-        
-        n_ltf = len(df_ltf_feat)
-        recorded_wins = 0
-        recorded_losses = 0
-        
-        htf_indices = df_htf_feat.index
-        context_indices = df_context_feat.index
+        self.market_regimes: Dict[
+            str,
+            Dict[
+                str,
+                Any,
+            ],
+        ] = {}
 
-        # Pre-convert raw M1 candles columns to numpy arrays for speed
-        ltf_opens = df_ltf['open'].values
-        ltf_highs = df_ltf['high'].values
-        ltf_lows = df_ltf['low'].values
-        ltf_closes = df_ltf['close'].values
+        self.training_stats: Dict[
+            str,
+            Dict[
+                str,
+                Any,
+            ],
+        ] = {}
 
-        # Convert feature dataframes to numpy arrays for lightning fast indexing
-        htf_biases = df_htf_feat['active_bias'].values
-        context_sweeps = df_context_feat['liq_sweep_type'].values
-        
-        ltf_mss_signals = df_ltf_feat['mss_signal'].values
-        ltf_lows_feat = df_ltf_feat['low'].values
-        ltf_highs_feat = df_ltf_feat['high'].values
-        ltf_closes_feat = df_ltf_feat['close'].values
-        ltf_atrs = df_ltf_feat['atr'].values
-        ltf_volatilities = df_ltf_feat['volatility'].values
-        ltf_supports = df_ltf_feat['support'].values
-        ltf_resistances = df_ltf_feat['resistance'].values
-        ltf_fvg_classes = df_ltf_feat['fvg_class'].values
-        
-        # Pre-convert timestamps to list/array to avoid index slicing overhead
-        ltf_timestamps = df_ltf_feat.index
-
-        training_data_discrete = []
-        training_data_continuous = []
-        outcomes = []
-        cluster_feature_matrix = []
-        nn_inputs = []
-        nn_targets = []
-
-        # Extract swing legs from df_ltf using window=5 for clean swings
-        df_ltf_swings = SMCIndicators.detect_swing_points(df_ltf, window=5)
-        
-        swing_points = []
-        ltf_highs_sw = df_ltf_swings['high'].values
-        ltf_lows_sw = df_ltf_swings['low'].values
-        is_sh = df_ltf_swings['is_swing_high'].values
-        is_sl = df_ltf_swings['is_swing_low'].values
-        ltf_timestamps_sw = df_ltf_swings.index
-        
-        for idx in range(len(df_ltf_swings)):
-            if is_sh[idx]:
-                swing_points.append({'type': 'HIGH', 'price': ltf_highs_sw[idx], 'time': ltf_timestamps_sw[idx]})
-            if is_sl[idx]:
-                swing_points.append({'type': 'LOW', 'price': ltf_lows_sw[idx], 'time': ltf_timestamps_sw[idx]})
-                
-        # Alternate HIGH and LOW points
-        alternating = []
-        for pt in swing_points:
-            if not alternating:
-                alternating.append(pt)
-                continue
-            last = alternating[-1]
-            if last['type'] == pt['type']:
-                if pt['type'] == 'HIGH':
-                    if pt['price'] > last['price']:
-                        alternating[-1] = pt
-                else:
-                    if pt['price'] < last['price']:
-                        alternating[-1] = pt
-            else:
-                alternating.append(pt)
-                
-        # Create swing legs
-        legs = []
-        for k in range(len(alternating) - 1):
-            p1 = alternating[k]
-            p2 = alternating[k+1]
-            legs.append({
-                'type': 'BULLISH' if p1['type'] == 'LOW' else 'BEARISH',
-                'start_price': p1['price'],
-                'end_price': p2['price'],
-                'start_time': p1['time'],
-                'end_time': p2['time']
-            })
-            
-        self.logger.info(f"Identified {len(legs)} swing legs for pattern mining.")
-
-        for leg_idx, leg in enumerate(legs):
-            t_start = leg['end_time']
-            
-            # Find LTF index where pullback starts
-            start_idx = ltf_timestamps.searchsorted(t_start)
-            if start_idx >= len(df_ltf_feat):
-                continue
-                
-            L_swing = leg['start_price']
-            H_swing = leg['end_price']
-            
-            end_idx = len(df_ltf_feat) - 50
-            for idx in range(start_idx, len(df_ltf_feat)):
-                price = ltf_closes_feat[idx]
-                if leg['type'] == 'BULLISH':
-                    if price > H_swing:
-                        end_idx = idx
-                        break
-                    if price < L_swing:
-                        end_idx = idx
-                        break
-                else: # BEARISH
-                    if price < H_swing:
-                        end_idx = idx
-                        break
-                    if price > L_swing:
-                        end_idx = idx
-                        break
-                        
-            if end_idx <= start_idx:
-                continue
-                
-            # Limit to one trigger per swing leg to prevent duplication
-            triggered_in_leg = False
-            
-            for i in range(start_idx, end_idx):
-                if triggered_in_leg:
-                    break
-                    
-                t = ltf_timestamps[i]
-                entry_price = ltf_closes_feat[i]
-                
-                l_sw = float(L_swing)
-                h_sw = float(H_swing)
-                swing_min = min(l_sw, h_sw)
-                swing_max = max(l_sw, h_sw)
-                swing_mid = swing_min + 0.5 * (swing_max - swing_min)
-                
-                in_zone = False
-                if leg['type'] == 'BULLISH':
-                    if entry_price <= swing_mid:
-                        in_zone = True
-                else:
-                    if entry_price >= swing_mid:
-                        in_zone = True
-                        
-                if not in_zone:
-                    continue
-                    
-                idx_htf = htf_indices.searchsorted(t, side='right')
-                idx_context = context_indices.searchsorted(t, side='right')
-                
-                if idx_htf == 0 or idx_context == 0:
-                    continue
-                    
-                htf_bias = htf_biases[idx_htf - 1]
-                
-                # Context sweeps
-                context_sweep = 0
-                for k in range(idx_context - 1, max(-1, idx_context - 20), -1):
-                    sweep_val = context_sweeps[k]
-                    if sweep_val != 0:
-                        context_sweep = int(sweep_val)
-                        break
-                        
-                # LTF MSS
-                ltf_mss = 0
-                for k in range(i, max(-1, i - 10), -1):
-                    mss_val = ltf_mss_signals[k]
-                    if mss_val != 0:
-                        ltf_mss = int(mss_val)
-                        break
-                        
-                atr_val = ltf_atrs[i]
-                support_val = ltf_supports[i]
-                resistance_val = ltf_resistances[i]
-                volatility_val = ltf_volatilities[i]
-                fvg_class_val = ltf_fvg_classes[i]
-                
-                action = None
-                is_bullish = (htf_bias == 1) and (context_sweep == 1 or ltf_mss == 1)
-                is_bearish = (htf_bias == -1) and (context_sweep == -1 or ltf_mss == -1)
-                
-                if is_bullish and leg['type'] == 'BULLISH':
-                    action = "BUY"
-                elif is_bearish and leg['type'] == 'BEARISH':
-                    action = "SELL"
-                    
-                if action is None:
-                    continue
-                    
-                # Unsupervised clustering feature collection
-                cluster_feature_matrix.append([
-                    float(volatility_val),
-                    float(abs(entry_price - (support_val if not np.isnan(support_val) else entry_price)) / (entry_price + 1e-9)),
-                    float(atr_val / (entry_price + 1e-9))
-                ])
-                
-                # Swing patterns detection
-                start_idx_vis = max(0, i - 20)
-                end_idx_vis = i + 1
-                visual_patterns = self.detect_visual_patterns_numpy(
-                    ltf_opens[start_idx_vis:end_idx_vis],
-                    ltf_highs[start_idx_vis:end_idx_vis],
-                    ltf_lows[start_idx_vis:end_idx_vis],
-                    ltf_closes[start_idx_vis:end_idx_vis]
-                )
-                pattern_str = "|".join(visual_patterns) if visual_patterns else "NONE"
-                
-                # StopLoss/TakeProfit with proper ATR buffer (min 1.5 * ATR)
-                raw_sl_dist = abs(entry_price - (L_swing if action == "BUY" else H_swing))
-                sl_dist = max(raw_sl_dist, 1.5 * atr_val)
-                if action == "BUY":
-                    sl_price = entry_price - sl_dist
-                    tp_price = entry_price + (1.5 * sl_dist)
-                else:
-                    sl_price = entry_price + sl_dist
-                    tp_price = entry_price - (1.5 * sl_dist)
-                
-                pnl = 0.0
-                resolved = False
-                max_lookahead = min(n_ltf, i + 600)
-                for j in range(i + 1, max_lookahead):
-                    future_low = ltf_lows_feat[j]
-                    future_high = ltf_highs_feat[j]
-                    if action == "BUY":
-                        if future_low <= sl_price:
-                            pnl = -1.0
-                            resolved = True
-                            break
-                        elif future_high >= tp_price:
-                            pnl = 1.5
-                            resolved = True
-                            break
-                    elif action == "SELL":
-                        if future_high >= sl_price:
-                            pnl = -1.0
-                            resolved = True
-                            break
-                        elif future_low <= tp_price:
-                            pnl = 1.5
-                            resolved = True
-                            break
-                            
-                if resolved:
-                    disc_feat = {
-                        'bias': 'BULLISH' if htf_bias == 1 else ('BEARISH' if htf_bias == -1 else 'NEUTRAL'),
-                        'setup': 'SHARP_TURN' if (context_sweep != 0 and ltf_mss != 0) else 'MSS_OR_SWEEP',
-                        'fvg': str(fvg_class_val).upper(),
-                        'visual_patterns': pattern_str
-                    }
-                    cont_feat = {
-                        'volatility': float(volatility_val),
-                        'atr_pct': float(atr_val / (entry_price + 1e-9))
-                    }
-                    
-                    training_data_discrete.append(disc_feat)
-                    training_data_continuous.append(cont_feat)
-                    outcomes.append(1 if pnl > 0 else 0)
-                    
-                    # Extract features for PyTorch Neural Network
-                    nn_feat_dict = {
-                        'active_bias': htf_bias,
-                        'liq_sweep_type': context_sweep,
-                        'mss_signal': ltf_mss,
-                        'fvg_class': str(fvg_class_val),
-                        'volatility': float(volatility_val),
-                        'atr_pct': atr_val / (entry_price + 1e-9),
-                        'rvol': 1.0,
-                        'buy_pressure': 50.0,
-                        'sell_pressure': 50.0,
-                        'timestamp': float(pd.Timestamp(t).timestamp() if hasattr(t, 'timestamp') else (t.value // 10**9 if hasattr(t, 'value') else i))
-                    }
-                    nn_inputs.append(self.extract_nn_features(nn_feat_dict))
-                    nn_targets.append(1.0 if pnl > 0 else 0.0)
-                    
-                    # Quantized dictionary storage
-                    q_id = self._quantize_smc_state({
-                        'active_bias': htf_bias,
-                        'price': entry_price,
-                        'support': support_val if not np.isnan(support_val) else entry_price,
-                        'resistance': resistance_val if not np.isnan(resistance_val) else entry_price,
-                        'fvg_class': fvg_class_val,
-                        'liq_sweep_type': context_sweep,
-                        'mss_signal': ltf_mss
-                    })
-                    
-                    record = {
-                        'pattern': q_id,
-                        'outcome': pnl,
-                        'timestamp': str(t)
-                    }
-                    if pnl > 0:
-                        self.patterns[f"{symbol}_winning"].append(record)
-                        recorded_wins += 1
-                    else:
-                        self.patterns[f"{symbol}_losing"].append(record)
-                        recorded_losses += 1
-                        
-                    triggered_in_leg = True
- 
-        # Fit Unsupervised K-Means
-        if cluster_feature_matrix:
-            X_clust = np.array(cluster_feature_matrix)
-            self.kmeans.fit(X_clust)
-            self.logger.info(f"Unsupervised K-Means centroids fitted with {self.kmeans.k} clusters.")
-            
-        # Fit Supervised Naive Bayes Classifier
-        if training_data_discrete and outcomes:
-            self.classifier.fit(training_data_discrete, training_data_continuous, outcomes)
-            self.logger.info(f"Supervised Naive Bayes Classifier fitted on {len(outcomes)} sample trades.")
-            
-        # Fit PyTorch Neural Network model
-        if nn_inputs and nn_targets:
-            try:
-                inputs_tensor = torch.tensor(np.array(nn_inputs, dtype=np.float32))
-                targets_tensor = torch.tensor(np.array(nn_targets, dtype=np.float32)).unsqueeze(1)
-                
-                self.nn_model.train()
-                for epoch in range(10):
-                    self.nn_optimizer.zero_grad()
-                    outputs = self.nn_model(inputs_tensor)
-                    loss = self.nn_criterion(outputs, targets_tensor)
-                    loss.backward()
-                    self.nn_optimizer.step()
-                self.nn_model.eval()
-                
-                self.save_nn_model()
-                self.nn_ready = True
-                self.logger.info(f"🧠 PyTorch neural net trained on {len(nn_inputs)} history samples. Final loss: {loss.item():.4f}")
-            except Exception as ex:
-                self.logger.error(f"Failed to train PyTorch neural net on history: {ex}")
-                self.nn_model.eval()
-            
-        self.training_stats[symbol] = {
-            "wins": recorded_wins,
-            "losses": recorded_losses,
-            "total_samples": len(outcomes),
-            "win_rate": round(recorded_wins / len(outcomes) * 100.0, 1) if outcomes else 0.0,
-            "last_train_time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        self.save_patterns()
-        self.logger.info(f"✅ ML Historical training completed for {symbol}! Wins={recorded_wins}, Losses={recorded_losses}")
-
-    def train_multi_strategy(self, symbol: str = "XAUUSDm", dfs: Optional[Dict[str, Any]] = None):
-        """
-        Train the Naive Bayes and PyTorch Neural Network models on historical data
-        by evaluating Raja, ICT, Bank-to-Bank, VSA, AVC, and M1 Scalping setups
-        over a rolling window of history and resolving their trade outcomes.
-        """
-        self.logger.info(f"⏳ Starting multi-strategy training pipeline for {symbol}...")
-        
-        dfs_dict: Dict[str, Any] = {}
-        if dfs is None:
-            from utils.mt5_data import fetch_ohlcv
-            from utils.mt5_gateway import mt5_gateway as mt5
-            dfs_dict = {
-                'D1': fetch_ohlcv(symbol, mt5.TIMEFRAME_D1, 300),
-                'H4': fetch_ohlcv(symbol, mt5.TIMEFRAME_H4, 300),
-                'H1': fetch_ohlcv(symbol, mt5.TIMEFRAME_H1, 300),
-                'M30': fetch_ohlcv(symbol, mt5.TIMEFRAME_M30, 200),
-                'M15': fetch_ohlcv(symbol, mt5.TIMEFRAME_M15, 200),
-                'M5': fetch_ohlcv(symbol, mt5.TIMEFRAME_M5, 200),
-                'M1': fetch_ohlcv(symbol, mt5.TIMEFRAME_M1, 300)
-            }
-        else:
-            dfs_dict = dfs
-        
-        df_d1 = dfs_dict.get('D1')
-        df_h4 = dfs_dict.get('H4')
-        df_h1 = dfs_dict.get('H1')
-        df_m30 = dfs_dict.get('M30')
-        df_m15 = dfs_dict.get('M15')
-        df_m5 = dfs_dict.get('M5')
-        df_m1 = dfs_dict.get('M1')
-
-        if df_m1 is None or len(df_m1) < 120:
-            self.logger.error("Insufficient M1 data for multi-strategy training")
-            return
-
-        # Compute indicators on M1 once with 3-bar shift to prevent leakage
-        from utils.smc_indicators import SMCIndicators
-        df_m1_feat = SMCIndicators.compute_smc_features(df_m1, window=3)
-        leakage_cols = [
-            'is_swing_high', 'is_swing_low', 'is_sth', 'is_stl', 'is_ith', 'is_itl',
-            'support', 'resistance', 'liq_sweep_type', 'liq_sweep_level', 'mss_signal',
-            'active_bias', 'ob_reaction_signal', 'sr_reaction_signal', 'retest_pullback_signal',
-            'trend_shift_signal'
-        ]
-        for col in leakage_cols:
-            if col in df_m1_feat.columns:
-                df_m1_feat[col] = df_m1_feat[col].shift(3).fillna(0)
-                
-        # Calculate historical volume metrics
-        from utils.volume_analyzer import VolumeAnalyzer
-        rvol_series = VolumeAnalyzer.calculate_rvol(df_m1, period=20)
-        bp_series, sp_series = VolumeAnalyzer.calculate_buying_selling_pressure(df_m1)
-
-        from strategies.raja_strategy import RajaStrategy
-        from strategies.ict_strategy import IctStrategy
-        from strategies.bank_strategy import BankStrategy
-        from strategies.vsa_strategy import VsaStrategy
-        from strategies.avc_strategy import AvcStrategy
-        from strategies.m1_scalping_strategy import M1ScalpingStrategy
-        from strategies.smc_concepts_strategy import SmcConceptsStrategy
-        
-        timestamps = df_m1.index
-        n_samples = len(df_m1)
-        
-        recorded_wins = 0
-        recorded_losses = 0
-        
-        training_data_discrete = []
-        training_data_continuous = []
-        outcomes = []
-        nn_inputs = []
-        nn_targets = []
-        
-        for i in range(100, n_samples - 600, 5):
-            t = timestamps[i]
-            
-            sub_m1 = df_m1.loc[:t]
-            sub_m5 = df_m5.loc[:t] if df_m5 is not None else None
-            sub_m15 = df_m15.loc[:t] if df_m15 is not None else None
-            sub_m30 = df_m30.loc[:t] if df_m30 is not None else None
-            sub_h1 = df_h1.loc[:t] if df_h1 is not None else None
-            sub_h4 = df_h4.loc[:t] if df_h4 is not None else None
-            sub_d1 = df_d1.loc[:t] if df_d1 is not None else None
-
-            if len(sub_m1) < 50:
-                continue
-                
-            current_price = float(sub_m1['close'].iloc[-1])
-            atr_val = float(sub_m1['atr'].iloc[-1]) if 'atr' in sub_m1.columns else 1.5
-            
-            current_rvol = float(rvol_series.iloc[i]) if not np.isnan(rvol_series.iloc[i]) else 1.0
-            current_bp = float(bp_series.iloc[i]) if not np.isnan(bp_series.iloc[i]) else 50.0
-            current_sp = float(sp_series.iloc[i]) if not np.isnan(sp_series.iloc[i]) else 50.0
-            volume_cache = {
-                "profile": {
-                    "poc_price": float(sub_h1['close'].rolling(50).mean().iloc[-1]) if sub_h1 is not None and len(sub_h1) >= 50 else current_price,
-                    "hvn_prices": []
-                },
-                "rvol": current_rvol,
-                "buy_pressure": current_bp,
-                "sell_pressure": current_sp,
-                "ofi": 0.0
-            }
-            
-            actions = {}
-            
-            # Raja Strategy
-            try:
-                act, sl, tp, meta = RajaStrategy.evaluate_raja(sub_m15, sub_m30, sub_h1, sub_h4, current_price, atr_val, volume_cache)
-                if act:
-                    if act in ["BUY", "SELL"] and sl > 0 and tp > 0:
-                        actions["RAJA"] = (act, sl, tp, meta)
-                    else:
-                        self.logger.warning(f"[STRATEGY_UNDERSTANDING_ERROR] RajaStrategy returned invalid output: action={act}, sl={sl}, tp={tp}")
-            except Exception as e:
-                self.logger.error(f"[STRATEGY_UNDERSTANDING_ERROR] RajaStrategy evaluation failed at index {i}: {e}")
-            
-            # ICT Strategy
-            try:
-                act, sl, tp, meta = IctStrategy.evaluate_ict(sub_m1, sub_m5, sub_m15, sub_h1, sub_h4, current_price, atr_val, 0, volume_cache)
-                if act:
-                    if act in ["BUY", "SELL"] and sl > 0 and tp > 0:
-                        actions["ICT"] = (act, sl, tp, meta)
-                    else:
-                        self.logger.warning(f"[STRATEGY_UNDERSTANDING_ERROR] IctStrategy returned invalid output: action={act}, sl={sl}, tp={tp}")
-            except Exception as e:
-                self.logger.error(f"[STRATEGY_UNDERSTANDING_ERROR] IctStrategy evaluation failed at index {i}: {e}")
-            
-            # Bank Strategy
-            try:
-                act, sl, tp, meta = BankStrategy.evaluate_bank(sub_m1, sub_m5, sub_m15, sub_h1, sub_h4, current_price, atr_val, volume_cache)
-                if act:
-                    if act in ["BUY", "SELL"] and sl > 0 and tp > 0:
-                        actions["BANK"] = (act, sl, tp, meta)
-                    else:
-                        self.logger.warning(f"[STRATEGY_UNDERSTANDING_ERROR] BankStrategy returned invalid output: action={act}, sl={sl}, tp={tp}")
-            except Exception as e:
-                self.logger.error(f"[STRATEGY_UNDERSTANDING_ERROR] BankStrategy evaluation failed at index {i}: {e}")
-            
-            # VSA Strategy
-            try:
-                act, sl, tp, meta = VsaStrategy.evaluate_vsa(sub_m1, sub_m5, sub_h1, current_price, atr_val, volume_cache)
-                if act:
-                    if act in ["BUY", "SELL"] and sl > 0 and tp > 0:
-                        actions["VSA"] = (act, sl, tp, meta)
-                    else:
-                        self.logger.warning(f"[STRATEGY_UNDERSTANDING_ERROR] VsaStrategy returned invalid output: action={act}, sl={sl}, tp={tp}")
-            except Exception as e:
-                self.logger.error(f"[STRATEGY_UNDERSTANDING_ERROR] VsaStrategy evaluation failed at index {i}: {e}")
-            
-            # AVC Strategy
-            try:
-                act, sl, tp, meta = AvcStrategy.evaluate_avc(sub_m1, sub_m5, sub_m15, current_price, atr_val, volume_cache)
-                if act:
-                    if act in ["BUY", "SELL"] and sl > 0 and tp > 0:
-                        actions["AVC"] = (act, sl, tp, meta)
-                    else:
-                        self.logger.warning(f"[STRATEGY_UNDERSTANDING_ERROR] AvcStrategy returned invalid output: action={act}, sl={sl}, tp={tp}")
-            except Exception as e:
-                self.logger.error(f"[STRATEGY_UNDERSTANDING_ERROR] AvcStrategy evaluation failed at index {i}: {e}")
-            
-            # M1 Scalping Strategy
-            try:
-                act, sl, tp, meta = M1ScalpingStrategy.evaluate_m1_scalping(sub_m1, sub_m5, sub_m15, current_price, atr_val, volume_cache)
-                if act:
-                    if act in ["BUY", "SELL"] and sl > 0 and tp > 0:
-                        actions["M1_SCALPING"] = (act, sl, tp, meta)
-                    else:
-                        self.logger.warning(f"[STRATEGY_UNDERSTANDING_ERROR] M1ScalpingStrategy returned invalid output: action={act}, sl={sl}, tp={tp}")
-            except Exception as e:
-                self.logger.error(f"[STRATEGY_UNDERSTANDING_ERROR] M1ScalpingStrategy evaluation failed at index {i}: {e}")
-
-            # SMC Concepts Strategy
-            try:
-                act, sl, tp, meta = SmcConceptsStrategy.evaluate_smc(sub_m1, sub_m5, sub_m15, sub_h1, sub_h4, current_price, atr_val, 0, volume_cache, "RANGE")
-                if act:
-                    if act in ["BUY", "SELL"] and sl > 0 and tp > 0:
-                        actions["SMC_CONCEPTS"] = (act, sl, tp, meta)
-                    else:
-                        self.logger.warning(f"[STRATEGY_UNDERSTANDING_ERROR] SmcConceptsStrategy returned invalid output: action={act}, sl={sl}, tp={tp}")
-            except Exception as e:
-                self.logger.error(f"[STRATEGY_UNDERSTANDING_ERROR] SmcConceptsStrategy evaluation failed at index {i}: {e}")
-            
-            if not actions:
-                continue
-                
-            for setup_type, (action, sl_price, tp_price, meta) in actions.items():
-                pnl = 0.0
-                resolved = False
-                
-                max_lookahead = min(n_samples, i + 600)
-                for j in range(i + 1, max_lookahead):
-                    future_low = float(df_m1['low'].iloc[j])
-                    future_high = float(df_m1['high'].iloc[j])
-                    if action == "BUY":
-                        if future_low <= sl_price:
-                            pnl = -1.0
-                            resolved = True
-                            break
-                        elif future_high >= tp_price:
-                            pnl = 1.5
-                            resolved = True
-                            break
-                    elif action == "SELL":
-                        if future_high >= sl_price:
-                            pnl = -1.0
-                            resolved = True
-                            break
-                        elif future_low <= tp_price:
-                            pnl = 1.5
-                            resolved = True
-                            break
-                            
-                if resolved:
-                    disc_feat = {
-                        'bias': 'BULLISH' if action == "BUY" else 'BEARISH',
-                        'setup': setup_type,
-                        'fvg': meta.get('trigger', 'unknown'),
-                        'visual_patterns': setup_type
-                    }
-                    cont_feat = {
-                        'volatility': float(sub_m1['volatility'].iloc[-1]) if 'volatility' in sub_m1.columns else 0.0,
-                        'atr_pct': atr_val / (current_price + 1e-9)
-                    }
-                    
-                    training_data_discrete.append(disc_feat)
-                    training_data_continuous.append(cont_feat)
-                    outcomes.append(1 if pnl > 0 else 0)
-                    
-                    nn_feat_dict = {
-                        'active_bias': 1 if action == "BUY" else -1,
-                        'liq_sweep_type': float(df_m1_feat['liq_sweep_type'].iloc[i]),
-                        'mss_signal': float(df_m1_feat['mss_signal'].iloc[i]),
-                        'fvg_class': setup_type,
-                        'volatility': float(df_m1_feat['volatility'].iloc[i]),
-                        'atr_pct': float(df_m1_feat['atr_pct'].iloc[i]),
-                        'rvol': current_rvol,
-                        'buy_pressure': current_bp,
-                        'sell_pressure': current_sp,
-                        'ob_reaction_signal': float(df_m1_feat.get('ob_reaction_signal', pd.Series(0.0, index=df_m1_feat.index)).iloc[i]),
-                        'sr_reaction_signal': float(df_m1_feat.get('sr_reaction_signal', pd.Series(0.0, index=df_m1_feat.index)).iloc[i]),
-                        'retest_pullback_signal': float(df_m1_feat.get('retest_pullback_signal', pd.Series(0.0, index=df_m1_feat.index)).iloc[i]),
-                        'trend_shift_signal': float(df_m1_feat.get('trend_shift_signal', pd.Series(0.0, index=df_m1_feat.index)).iloc[i]),
-                        'timestamp': float(pd.Timestamp(t).timestamp() if hasattr(t, 'timestamp') else i)
-                    }
-                    nn_inputs.append(self.extract_nn_features(nn_feat_dict))
-                    nn_targets.append(1.0 if pnl > 0 else 0.0)
-                    
-                    if pnl > 0:
-                        recorded_wins += 1
-                    else:
-                        recorded_losses += 1
-
-        if training_data_discrete and outcomes:
-            self.classifier.fit(training_data_discrete, training_data_continuous, outcomes)
-            self.logger.info(f"Naive Bayes Classifier fitted on {len(outcomes)} multi-strategy sample trades.")
-
-        if nn_inputs and nn_targets:
-            try:
-                import torch
-                inputs_tensor = torch.tensor(np.array(nn_inputs, dtype=np.float32))
-                targets_tensor = torch.tensor(np.array(nn_targets, dtype=np.float32)).unsqueeze(1)
-                
-                self.nn_model.train()
-                for epoch in range(15):
-                    self.nn_optimizer.zero_grad()
-                    outputs = self.nn_model(inputs_tensor)
-                    loss = self.nn_criterion(outputs, targets_tensor)
-                    loss.backward()
-                    self.nn_optimizer.step()
-                self.nn_model.eval()
-                
-                self.save_nn_model()
-                self.nn_ready = True
-                self.logger.info(f"🧠 Neural network trained on {len(nn_inputs)} multi-strategy samples. Final loss: {loss.item():.4f}")
-            except Exception as ex:
-                self.logger.error(f"Failed to train PyTorch neural net: {ex}")
-                self.nn_model.eval()
-
-        self.training_stats[symbol] = {
-            "wins": self.training_stats.get(symbol, {}).get("wins", 0) + recorded_wins,
-            "losses": self.training_stats.get(symbol, {}).get("losses", 0) + recorded_losses,
-            "total_samples": self.training_stats.get(symbol, {}).get("total_samples", 0) + len(outcomes),
-            "win_rate": round(recorded_wins / (len(outcomes) + 1e-9) * 100.0, 1) if outcomes else 0.0,
-            "last_train_time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        self.save_patterns()
-        self.logger.info(f"✅ Multi-strategy training completed! wins={recorded_wins}, losses={recorded_losses}")
-
-    def train_on_single_timeframe(self, symbol: str, df: pd.DataFrame):
-        """Historical auto-training on a single timeframe DataFrame (e.g. downloaded 10-year CSV)"""
-        self.logger.info(f"⏳ Starting single-timeframe training on {symbol} with {len(df)} bars...")
-        
-        if len(df) < 100:
-            self.logger.error("Insufficient data for training on single timeframe")
-            return
-            
-        from utils.settings_manager import settings_manager
-        swing_window = settings_manager.get("smc_swing_window", 3)
-        
-        from utils.smc_indicators import SMCIndicators
-        df_feat = SMCIndicators.compute_smc_features(df, window=swing_window)
-        n = len(df_feat)
-        
-        opens = df['open'].values
-        highs = df['high'].values
-        lows = df['low'].values
-        closes = df['close'].values
-        
-        biases = df_feat['active_bias'].values
-        sweeps = df_feat['liq_sweep_type'].values
-        mss_signals = df_feat['mss_signal'].values
-        atrs = df_feat['atr'].values
-        volatilities = df_feat['volatility'].values
-        supports = df_feat['support'].values
-        resistances = df_feat['resistance'].values
-        fvg_classes = df_feat['fvg_class'].values
-        timestamps = df_feat.index
-        
-        training_data_discrete = []
-        training_data_continuous = []
-        outcomes = []
-        cluster_feature_matrix = []
-        
-        recorded_wins = 0
-        recorded_losses = 0
-        
-        for i in range(50, n - 50):
-            t = timestamps[i]
-            bias = biases[i]
-            
-            # Find context sweep
-            sweep = 0
-            for k in range(i, max(-1, i - 20), -1):
-                if sweeps[k] != 0:
-                    sweep = int(sweeps[k])
-                    break
-                    
-            # Find MSS signal
-            mss = 0
-            for k in range(i, max(-1, i - 10), -1):
-                if mss_signals[k] != 0:
-                    mss = int(mss_signals[k])
-                    break
-                    
-            entry_price = closes[i]
-            atr_val = atrs[i]
-            support_val = supports[i]
-            resistance_val = resistances[i]
-            volatility_val = volatilities[i]
-            fvg_class_val = fvg_classes[i]
-            
-            cluster_feature_matrix.append([
-                float(volatility_val),
-                float(abs(entry_price - support_val) / (entry_price + 1e-9)),
-                float(atr_val / (entry_price + 1e-9))
-            ])
-            
-            # Detect visual patterns using sliding window
-            start_idx = max(0, i - 20)
-            end_idx = i + 1
-            visual_patterns = self.detect_visual_patterns_numpy(
-                opens[start_idx:end_idx],
-                highs[start_idx:end_idx],
-                lows[start_idx:end_idx],
-                closes[start_idx:end_idx]
+        self.kmeans = (
+            KMeansClustering(
+                k=4
             )
-            pattern_str = "|".join(visual_patterns) if visual_patterns else "NONE"
-            
-            action = None
-            sl_price = 0.0
-            tp_price = 0.0
-            
-            is_bullish = (bias == 1) and (sweep == 1 or mss == 1)
-            is_bearish = (bias == -1) and (sweep == -1 or mss == -1)
-            
-            if is_bullish:
-                action = "BUY"
-                sl_price = support_val - (1.5 * atr_val)
-                tp_price = entry_price + 1.5 * (entry_price - sl_price)
-            elif is_bearish:
-                action = "SELL"
-                sl_price = resistance_val + (1.5 * atr_val)
-                tp_price = entry_price - 1.5 * (sl_price - entry_price)
-                
-            if action is None:
-                continue
-                
-            pnl = 0.0
-            resolved = False
-            max_lookahead = min(n, i + 600)
-            for j in range(i + 1, max_lookahead):
-                future_low = lows[j]
-                future_high = highs[j]
-                if action == "BUY":
-                    if future_low <= sl_price:
-                        pnl = -1.0
-                        resolved = True
-                        break
-                    elif future_high >= tp_price:
-                        pnl = 1.5
-                        resolved = True
-                        break
-                elif action == "SELL":
-                    if future_high >= sl_price:
-                        pnl = -1.0
-                        resolved = True
-                        break
-                    elif future_low <= tp_price:
-                        pnl = 1.5
-                        resolved = True
-                        break
-                        
-            if resolved:
-                disc_feat = {
-                    'bias': 'BULLISH' if bias == 1 else ('BEARISH' if bias == -1 else 'NEUTRAL'),
-                    'setup': 'SHARP_TURN' if (sweep != 0 and mss != 0) else 'MSS_OR_SWEEP',
-                    'fvg': str(fvg_class_val).upper(),
-                    'visual_patterns': pattern_str
-                }
-                cont_feat = {
-                    'volatility': float(volatility_val),
-                    'atr_pct': float(atr_val / (entry_price + 1e-9))
-                }
-                
-                training_data_discrete.append(disc_feat)
-                training_data_continuous.append(cont_feat)
-                outcomes.append(1 if pnl > 0 else 0)
-                
-                q_id = self._quantize_smc_state({
-                    'active_bias': bias,
-                    'price': entry_price,
-                    'support': support_val,
-                    'resistance': resistance_val,
-                    'fvg_class': fvg_class_val,
-                    'liq_sweep_type': sweep,
-                    'mss_signal': mss
-                })
-                
-                record = {
-                    'pattern': q_id,
-                    'outcome': pnl,
-                    'timestamp': str(t)
-                }
-                if pnl > 0:
-                    self.patterns[f"{symbol}_winning"].append(record)
-                    recorded_wins += 1
-                else:
-                    self.patterns[f"{symbol}_losing"].append(record)
-                    recorded_losses += 1
-                    
-        # Fit models
-        if cluster_feature_matrix:
-            X_clust = np.array(cluster_feature_matrix)
-            self.kmeans.fit(X_clust)
-            self.logger.info(f"K-Means fitted with {self.kmeans.k} clusters.")
-            
-        if training_data_discrete and outcomes:
-            self.classifier.fit(training_data_discrete, training_data_continuous, outcomes)
-            self.logger.info(f"Naive Bayes fitted on {len(outcomes)} single-timeframe samples.")
-            
-        self.training_stats[symbol] = {
-            "wins": self.training_stats.get(symbol, {}).get("wins", 0) + recorded_wins,
-            "losses": self.training_stats.get(symbol, {}).get("losses", 0) + recorded_losses,
-            "total_samples": self.training_stats.get(symbol, {}).get("total_samples", 0) + len(outcomes),
-            "win_rate": round(recorded_wins / len(outcomes) * 100.0, 1) if outcomes else 0.0,
-            "last_train_time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        self.save_patterns()
-        self.logger.info(f"✅ Single-timeframe training complete for {symbol}! Wins={recorded_wins}, Losses={recorded_losses}")
+        )
 
-    def train_on_synthetic_idealized_patterns(self, symbol: str, n_samples_per_pattern: int = 500):
-        """
-        Generate mathematically perfect ("imaginary") representation profiles for standard patterns
-        and train the Naive Bayes and KMeans classifiers on them to pre-populate pattern recognition priors.
-        """
-        self.logger.info(f"⏳ Generating synthetic ('imaginary') pattern templates for {symbol}...")
-        
-        training_data_discrete = []
-        training_data_continuous = []
-        outcomes = []
-        cluster_feature_matrix = []
-        
-        # Define the set of patterns to train on
-        patterns_to_train = [
-            ("PIN_BAR_BULLISH", "BULLISH", "SHARP_TURN", "PFVG", 1), # winning setup
-            ("PIN_BAR_BEARISH", "BEARISH", "SHARP_TURN", "PFVG", 1),
-            ("BULLISH_ENGULFING", "BULLISH", "MSS_OR_SWEEP", "RFVG", 1),
-            ("BEARISH_ENGULFING", "BEARISH", "MSS_OR_SWEEP", "RFVG", 1),
-            ("DOUBLE_BOTTOM", "BULLISH", "SHARP_TURN", "NONE", 1),
-            ("DOUBLE_TOP", "BEARISH", "SHARP_TURN", "NONE", 1),
-            ("LIQUIDITY_SWEEP_LOW", "BULLISH", "MSS_OR_SWEEP", "NONE", 1),
-            ("LIQUIDITY_SWEEP_HIGH", "BEARISH", "MSS_OR_SWEEP", "NONE", 1),
-            
-            # Opposing / failing setups (leading to loss)
-            ("PIN_BAR_BULLISH", "BEARISH", "CONTINUATION", "NONE", 0), # opposing bias
-            ("PIN_BAR_BEARISH", "BULLISH", "CONTINUATION", "NONE", 0),
-            ("NONE", "NEUTRAL", "CONTINUATION", "NONE", 0)
-        ]
-        
-        np.random.seed(42)
-        recorded_wins = 0
-        recorded_losses = 0
-        
-        for pat_name, bias, setup, fvg, target_outcome in patterns_to_train:
-            for _ in range(n_samples_per_pattern):
-                # Add slight variations to continuous features
-                # Volatility
-                base_vol = 0.0020 if pat_name != "NONE" else 0.0008
-                volatility = base_vol + np.random.normal(0, 0.0003)
-                volatility = max(0.0001, volatility)
-                
-                # ATR %
-                base_atr = 0.0015 if pat_name != "NONE" else 0.0007
-                atr_pct = base_atr + np.random.normal(0, 0.0002)
-                atr_pct = max(0.0001, atr_pct)
-                
-                # S/R distance ratio
-                dist_ratio = 0.0010 + np.random.normal(0, 0.0003)
-                dist_ratio = max(0.0001, dist_ratio)
-                
-                disc_feat = {
-                    'bias': bias,
-                    'setup': setup,
-                    'fvg': fvg,
-                    'visual_patterns': pat_name
-                }
-                cont_feat = {
-                    'volatility': volatility,
-                    'atr_pct': atr_pct
-                }
-                
-                training_data_discrete.append(disc_feat)
-                training_data_continuous.append(cont_feat)
-                outcomes.append(target_outcome)
-                
-                cluster_feature_matrix.append([
-                    volatility,
-                    dist_ratio,
-                    atr_pct
-                ])
-                
-                # Save synthetic record to winning/losing databases
-                q_id = f"[('bias', '{bias}'), ('fvg', '{fvg}'), ('setup', '{setup}'), ('zone', 'DISCOUNT' if target_outcome == 1 else 'PREMIUM')]"
-                record = {
-                    'pattern': q_id,
-                    'outcome': 1.5 if target_outcome == 1 else -1.0,
-                    'timestamp': "synthetic"
-                }
-                
-                if target_outcome == 1:
-                    self.patterns[f"{symbol}_winning"].append(record)
-                    recorded_wins += 1
-                else:
-                    self.patterns[f"{symbol}_losing"].append(record)
-                    recorded_losses += 1
-                    
-        # Fit K-Means
-        if cluster_feature_matrix:
-            X_clust = np.array(cluster_feature_matrix)
-            self.kmeans.fit(X_clust)
-            
-        # Fit Naive Bayes
-        if training_data_discrete and outcomes:
-            self.classifier.fit(training_data_discrete, training_data_continuous, outcomes)
-            
-        self.training_stats[symbol] = {
-            "wins": self.training_stats.get(symbol, {}).get("wins", 0) + recorded_wins,
-            "losses": self.training_stats.get(symbol, {}).get("losses", 0) + recorded_losses,
-            "total_samples": self.training_stats.get(symbol, {}).get("total_samples", 0) + len(outcomes),
-            "win_rate": round(recorded_wins / len(outcomes) * 100.0, 1) if outcomes else 0.0,
-            "last_train_time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        
-        self.save_patterns()
-        self.logger.info(f"✅ Synthetic ('imaginary') pattern training complete for {symbol}! Samples generated={len(outcomes)}")
+        # Legacy classifier retained for import/API compatibility only.
+        self.classifier = (
+            NaiveBayesClassifier()
+        )
 
-    def learn_from_trade(self, trade_data: Dict):
-        """Learn from trade closed PnL. Re-fits supervised classifier dynamically."""
-        symbol = trade_data.get('symbol', 'UNKNOWN')
-        outcome = trade_data.get('outcome', 0.0)
-        features = trade_data.get('features', {})
-        
-        if not features:
-            return
-            
-        q_id = self._quantize_smc_state(features)
-        
-        record = {
-            'pattern': q_id,
-            'outcome': outcome,
-            'timestamp': str(pd.Timestamp.now())
-        }
-        
-        if outcome > 0:
-            self.patterns[f"{symbol}_winning"].append(record)
-            self.logger.info(f"📚 ML Learner: Recorded WIN for {symbol}")
-        else:
-            self.patterns[f"{symbol}_losing"].append(record)
-            self.logger.info(f"📚 ML Learner: Recorded LOSS for {symbol}")
-            
-        # Cap size to avoid bloating
-        self.patterns[f"{symbol}_winning"] = self.patterns[f"{symbol}_winning"][-200:]
-        self.patterns[f"{symbol}_losing"] = self.patterns[f"{symbol}_losing"][-200:]
-        
-        # Dynamically retrain classifier on all loaded history
-        self._update_market_regime(symbol, features)
-        self.save_patterns()
-        
-    def get_trading_signal(self, symbol: str, current_features: Dict,
-                           df_ltf: Optional[pd.DataFrame] = None,
-                           df_m5: Optional[pd.DataFrame] = None,
-                           df_h1: Optional[pd.DataFrame] = None,
-                           candidate_strategy: Optional[str] = None,
-                           candidate_action: Optional[str] = None) -> Dict:
-        """
-        Evaluate current market state and output Win Probability (AI Confidence).
-        Now integrates ChartPatternDetector for institutional SMC pattern recognition.
-        """
-        # ── 1. Legacy visual patterns (simple candle patterns) ───────────────
-        visual_patterns = []
-        if df_ltf is not None:
-            visual_patterns = self.detect_visual_patterns(df_ltf)
+        self._nb_production_enabled = (
+            False
+        )
 
-        # ── 2. Advanced SMC chart pattern detection ───────────────────────────
-        smc_patterns = {}
-        smc_found = []
-        smc_confidence = 0.0
-        smc_direction = None
-        if df_ltf is not None:
-            try:
-                smc_patterns = ChartPatternDetector.detect(
-                    df_m1=df_ltf,
-                    df_m5=df_m5,
-                    df_h1=df_h1
+        self.model_lock = (
+            threading.RLock()
+        )
+
+        self._append_lock = (
+            threading.RLock()
+        )
+
+        self._shadow_lock = (
+            threading.RLock()
+        )
+
+        self.nn_model = (
+            PulseViperNeuralNet(
+                input_dim=len(
+                    FeatureExtractor
+                    .FEATURE_NAMES
                 )
-                smc_found, smc_confidence, smc_direction = ChartPatternDetector.get_summary(smc_patterns)
-            except Exception:
-                pass
+            )
+        )
 
-        # Merge all detected patterns for display
-        all_patterns = visual_patterns + smc_found
-        pattern_str = "|".join(all_patterns) if all_patterns else "NONE"
+        self.nn_optimizer = (
+            optim.Adam(
+                self.nn_model.parameters(),
+                lr=0.003,
+                weight_decay=1e-4,
+            )
+        )
 
-        # ── 3. Unsupervised Cluster Regime Prediction ────────────────────────
-        volatility = current_features.get('volatility', 0.0)
-        price = current_features.get('price', 0.0)
-        support = current_features.get('support', 0.0)
-        atr_pct = current_features.get('atr_pct', 0.0)
+        self.nn_criterion = (
+            nn.BCELoss()
+        )
 
-        state_point = np.array([
-            float(volatility),
-            float(abs(price - support) / (price + 1e-9)),
-            float(atr_pct)
-        ])
-        cluster_id = self.kmeans.predict(state_point)
+        self.nn_ready = False
 
-        # ── 4. Supervised Win Probability (PyTorch Neural Net / Naive Bayes Fallback) ──
-        h1_bias = current_features.get('active_bias', 0)
-        m15_sweep = current_features.get('liq_sweep_type', 0)
-        m5_mss = current_features.get('mss_signal', 0)
-        fvg_class = current_features.get('fvg_class', 'none')
-        tf_aligned = current_features.get('tf_aligned', False)
+        self.active_model_version: Optional[
+            str
+        ] = None
 
-        disc_feat = {
-            'bias': 'BULLISH' if h1_bias == 1 else ('BEARISH' if h1_bias == -1 else 'NEUTRAL'),
-            'setup': 'SHARP_TURN' if (m15_sweep != 0 and m5_mss != 0) else 'MSS_OR_SWEEP',
-            'fvg': str(fvg_class).upper(),
-            'visual_patterns': pattern_str,
-            'tf_aligned': 'YES' if tf_aligned else 'NO'
+        self._last_shadow_candidate = (
+            None
+        )
+
+        self._last_causal_dataset: Dict[
+            str,
+            Any,
+        ] = {}
+
+        self._last_training_result: Dict[
+            str,
+            Any,
+        ] = {}
+
+        self.min_pattern_occurrence = (
+            2
+        )
+
+        self.confidence_threshold = (
+            0.5
+        )
+
+        self.load_patterns()
+        self.load_nn_model()
+
+    # =========================================================================
+    # READINESS
+    # =========================================================================
+
+    @property
+    def nb_ready(
+        self,
+    ) -> bool:
+        """
+        Legacy Naive Bayes is explicitly non-production.
+        """
+
+        return False
+
+    # =========================================================================
+    # FRAME NORMALIZATION
+    # =========================================================================
+
+    @staticmethod
+    def _normalize_frame(
+        frame: Optional[
+            pd.DataFrame
+        ],
+    ) -> Optional[
+        pd.DataFrame
+    ]:
+
+        if (
+            frame is None
+            or len(
+                frame
+            )
+            == 0
+        ):
+            return None
+
+        required = {
+            "open",
+            "high",
+            "low",
+            "close",
         }
-        if candidate_strategy is not None:
-            disc_feat['candidate_strategy'] = candidate_strategy.upper()
-        if candidate_action is not None:
-            disc_feat['candidate_action'] = candidate_action.upper()
 
-        cont_feat = {
-            'volatility': float(volatility),
-            'atr_pct': float(atr_pct),
-            'smc_confidence': smc_confidence
-        }
+        if not required.issubset(
+            frame.columns
+        ):
+            return None
 
-        # Safe feature deepcopy to inject candidate specific parameters
-        import copy
-        features_copy = copy.deepcopy(current_features)
-        if candidate_strategy is not None:
-            features_copy['candidate_strategy'] = candidate_strategy
-        if candidate_action is not None:
-            features_copy['candidate_action'] = candidate_action
+        df = (
+            frame.copy()
+        )
 
-        win_prob = None
-        model_source = "NO_VALID_MODEL"
         try:
-            if self.nn_ready:
-                with self.model_lock:
-                    feat_arr = self.extract_nn_features(features_copy)
-                    feat_tensor = torch.tensor(feat_arr).unsqueeze(0)
-                    with torch.no_grad():
-                        win_prob = float(self.nn_model(feat_tensor).item())
-                    model_source = "NN_CHAMPION"
-            elif self.nb_ready:
-                win_prob = self.classifier.predict_probability(disc_feat, cont_feat)
-                model_source = "NAIVE_BAYES"
-        except Exception as e:
-            self.logger.error(f"Error during neural net prediction: {e}")
-            
-        # Try Naive Bayes fallback if preferred model fails/is missing
-        if win_prob is None and self.nb_ready:
+            index = pd.to_datetime(
+                df.index,
+                utc=True,
+            )
+
+        except Exception:
+            return None
+
+        df.index = (
+            index
+        )
+
+        df = (
+            df[
+                ~df.index.duplicated(
+                    keep="last"
+                )
+            ]
+            .sort_index()
+        )
+
+        for column in required:
+
+            df[
+                column
+            ] = pd.to_numeric(
+                df[
+                    column
+                ],
+                errors="coerce",
+            )
+
+        df = df.dropna(
+            subset=list(
+                required
+            )
+        )
+
+        if len(
+            df
+        ) < 3:
+            return None
+
+        return df
+
+    @staticmethod
+    def _infer_bar_seconds(
+        df: pd.DataFrame,
+    ) -> Optional[int]:
+
+        if (
+            df is None
+            or len(
+                df
+            ) < 3
+        ):
+            return None
+
+        deltas = (
+            np.diff(
+                df.index.view(
+                    "int64"
+                )
+            )
+            / 1_000_000_000.0
+        )
+
+        deltas = deltas[
+            np.isfinite(
+                deltas
+            )
+            & (
+                deltas
+                > 0.0
+            )
+        ]
+
+        if len(
+            deltas
+        ) == 0:
+            return None
+
+        seconds = int(
+            round(
+                float(
+                    np.median(
+                        deltas
+                    )
+                )
+            )
+        )
+
+        return (
+            seconds
+            if seconds > 0
+            else None
+        )
+
+    @classmethod
+    def _closed_frame(
+        cls,
+        frame: Optional[
+            pd.DataFrame
+        ],
+    ) -> Optional[
+        pd.DataFrame
+    ]:
+
+        df = cls._normalize_frame(
+            frame
+        )
+
+        if df is None:
+            return None
+
+        seconds = cls._infer_bar_seconds(
+            df
+        )
+
+        if seconds is None:
+            return None
+
+        now_ns = pd.Timestamp.now(
+            tz="UTC"
+        ).value
+
+        available_ns = (
+            df.index.view(
+                "int64"
+            )
+            + (
+                seconds
+                * 1_000_000_000
+            )
+        )
+
+        mask = (
+            available_ns
+            <= now_ns
+        )
+
+        df = df.loc[
+            mask
+        ]
+
+        return (
+            df
+            if len(
+                df
+            ) >= 3
+            else None
+        )
+
+    @staticmethod
+    def _last_nonzero(
+        values: Sequence[
+            Any
+        ],
+        end_index: int,
+        lookback: int,
+    ) -> int:
+
+        start = max(
+            0,
+            (
+                end_index
+                - max(
+                    1,
+                    int(
+                        lookback
+                    ),
+                )
+                + 1
+            ),
+        )
+
+        for idx in range(
+            end_index,
+            start - 1,
+            -1,
+        ):
             try:
-                win_prob = self.classifier.predict_probability(disc_feat, cont_feat)
-                model_source = "NAIVE_BAYES"
+                value = int(
+                    values[
+                        idx
+                    ]
+                )
+
             except Exception:
-                pass
-                
-        # ── 5. SMC pattern confidence boost/penalty (DISABLED in shadow/hardened mode) ───
-        # Note: Do not modify model-calibrated probability after inference.
-        
-        # ── 6. Signal action ──────────────────────────────────────────────────
-        signal_action = 'HOLD'
-        adjustment = 0.0
-        if win_prob is not None:
-            if win_prob >= 0.58:
-                if h1_bias == 1:
-                    signal_action = 'BUY'
-                elif h1_bias == -1:
-                    signal_action = 'SELL'
-                adjustment = (win_prob - 0.5) * 0.8
+                continue
+
+            if value != 0:
+                return value
+
+        return 0
+
+    @staticmethod
+    def _finite(
+        value: Any,
+    ) -> Optional[
+        float
+    ]:
+
+        try:
+            result = float(
+                value
+            )
+
+            if math.isfinite(
+                result
+            ):
+                return result
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            pass
+
+        return None
+
+    # =========================================================================
+    # VISUAL PATTERNS
+    # =========================================================================
+
+    def detect_visual_patterns(
+        self,
+        df: pd.DataFrame,
+    ) -> List[str]:
+
+        if (
+            df is None
+            or len(
+                df
+            ) < 2
+        ):
+            return []
+
+        try:
+            detected = (
+                ChartPatternDetector
+                .detect(
+                    df
+                )
+            )
+
+            (
+                found,
+                _,
+                _,
+            ) = (
+                ChartPatternDetector
+                .get_summary(
+                    detected
+                )
+            )
+
+            last = df.iloc[
+                -1
+            ]
+
+            prev = df.iloc[
+                -2
+            ]
+
+            body_last = float(
+                last[
+                    "close"
+                ]
+                - last[
+                    "open"
+                ]
+            )
+
+            body_prev = float(
+                prev[
+                    "close"
+                ]
+                - prev[
+                    "open"
+                ]
+            )
+
+            if (
+                body_prev < 0.0
+                and body_last > 0.0
+                and float(
+                    last[
+                        "close"
+                    ]
+                )
+                >= float(
+                    prev[
+                        "open"
+                    ]
+                )
+                and float(
+                    last[
+                        "open"
+                    ]
+                )
+                <= float(
+                    prev[
+                        "close"
+                    ]
+                )
+            ):
+
+                found.append(
+                    "BULLISH_ENGULFING"
+                )
+
+            elif (
+                body_prev > 0.0
+                and body_last < 0.0
+                and float(
+                    last[
+                        "close"
+                    ]
+                )
+                <= float(
+                    prev[
+                        "open"
+                    ]
+                )
+                and float(
+                    last[
+                        "open"
+                    ]
+                )
+                >= float(
+                    prev[
+                        "close"
+                    ]
+                )
+            ):
+
+                found.append(
+                    "BEARISH_ENGULFING"
+                )
+
+            return sorted(
+                set(
+                    found
+                )
+            )
+
+        except Exception:
+            return []
+
+    def detect_visual_patterns_numpy(
+        self,
+        opens: np.ndarray,
+        highs: np.ndarray,
+        lows: np.ndarray,
+        closes: np.ndarray,
+    ) -> List[str]:
+
+        if len(
+            closes
+        ) < 2:
+            return []
+
+        frame = pd.DataFrame(
+            {
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+            }
+        )
+
+        return (
+            self.detect_visual_patterns(
+                frame
+            )
+        )
+
+    # =========================================================================
+    # FEATURE HELPERS
+    # =========================================================================
+
+    def _quantize_smc_state(
+        self,
+        features: Dict[
+            str,
+            Any,
+        ],
+    ) -> str:
+
+        bias_val = int(
+            features.get(
+                "active_bias",
+                0,
+            )
+            or 0
+        )
+
+        price = float(
+            features.get(
+                "price",
+                features.get(
+                    "close",
+                    0.0,
+                ),
+            )
+            or 0.0
+        )
+
+        support = float(
+            features.get(
+                "support",
+                0.0,
+            )
+            or 0.0
+        )
+
+        resistance = float(
+            features.get(
+                "resistance",
+                0.0,
+            )
+            or 0.0
+        )
+
+        if (
+            resistance > support
+            and support > 0.0
+        ):
+
+            pct = (
+                (
+                    price
+                    - support
+                )
+                / max(
+                    (
+                        resistance
+                        - support
+                    ),
+                    1e-12,
+                )
+            )
+
+            if pct < 0.35:
+                zone = (
+                    "DISCOUNT"
+                )
+
+            elif pct > 0.65:
+                zone = (
+                    "PREMIUM"
+                )
+
+            else:
+                zone = (
+                    "EQUILIBRIUM"
+                )
+
         else:
-            signal_action = 'HOLD'
-            adjustment = 0.0
-            
-        return {
-            'signal': signal_action,
-            'confidence': round(win_prob, 4) if win_prob is not None else None,
-            'adjustment': adjustment,
-            'cluster_id': cluster_id,
-            'detected_patterns': all_patterns,
-            'smc_patterns': smc_found,
-            'smc_confidence': smc_confidence,
-            'smc_direction': smc_direction,
-            'pattern_details': {k: v for k, v in smc_patterns.items() if v.get('detected')},
-            'model_source': model_source if win_prob is not None else "NO_VALID_MODEL",
-            'model_ready': (self.nn_ready or self.nb_ready) if win_prob is not None else False
+            zone = (
+                "EQUILIBRIUM"
+            )
+
+        sweep = int(
+            features.get(
+                "liq_sweep_type",
+                0,
+            )
+            or 0
+        )
+
+        mss = int(
+            features.get(
+                "mss_signal",
+                0,
+            )
+            or 0
+        )
+
+        if (
+            sweep != 0
+            and mss != 0
+        ):
+            setup = (
+                "SHARP_TURN"
+            )
+
+        elif mss != 0:
+            setup = (
+                "MSS_ONLY"
+            )
+
+        elif sweep != 0:
+            setup = (
+                "SWEEP_ONLY"
+            )
+
+        else:
+            setup = (
+                "CONTINUATION"
+            )
+
+        quantized = {
+            "bias": (
+                "BULLISH"
+                if bias_val == 1
+                else (
+                    "BEARISH"
+                    if bias_val == -1
+                    else "NEUTRAL"
+                )
+            ),
+
+            "zone": zone,
+
+            "fvg": str(
+                features.get(
+                    "fvg_class",
+                    "none",
+                )
+            ).upper(),
+
+            "setup": setup,
         }
 
+        return str(
+            sorted(
+                quantized.items()
+            )
+        )
 
-    def _update_market_regime(self, symbol: str, features: Dict):
-        volatility = features.get('volatility', 0.0)
-        atr_pct = features.get('atr_pct', 0.0)
-        active_bias = features.get('active_bias', 0)
-        
-        regime = 'SIDEWAY'
-        if active_bias == 1: regime = 'BULLISH'
-        elif active_bias == -1: regime = 'BEARISH'
-            
-        self.market_regimes[symbol] = {
-            'regime': regime,
-            'timestamp': str(pd.Timestamp.now()),
-            'volatility': volatility,
-            'atr_pct': atr_pct
+    @staticmethod
+    def extract_temporal_embeddings(
+        timestamp_str_or_float,
+    ) -> list:
+
+        return (
+            FeatureExtractor
+            .extract_temporal_embeddings(
+                timestamp_str_or_float
+            )
+        )
+
+    @staticmethod
+    def extract_nn_features(
+        features: dict,
+    ) -> np.ndarray:
+
+        return (
+            FeatureExtractor
+            .extract_nn_features(
+                features
+            )
+        )
+
+    # =========================================================================
+    # CAUSAL OUTCOME RESOLVER
+    # =========================================================================
+
+    def _outcome_resolver(
+        self,
+    ):
+        from core.outcome_labeler import (
+            OutcomeResolver,
+        )
+
+        version = getattr(
+            OutcomeResolver,
+            "LABEL_VERSION",
+            None,
+        )
+
+        if (
+            version
+            != self.CAUSAL_LABEL_VERSION
+        ):
+            raise RuntimeError(
+                (
+                    "CAUSAL_OUTCOME_RESOLVER_REQUIRED:"
+                    f"expected="
+                    f"{self.CAUSAL_LABEL_VERSION},"
+                    f"got={version}"
+                )
+            )
+
+        return OutcomeResolver
+
+    @staticmethod
+    def _bars_to_records(
+        df: pd.DataFrame,
+    ) -> List[
+        Dict[
+            str,
+            float,
+        ]
+    ]:
+
+        columns = [
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+
+        records: List[
+            Dict[
+                str,
+                float,
+            ]
+        ] = []
+
+        for row in df[
+            columns
+        ].itertuples(
+            index=False,
+            name=None,
+        ):
+
+            records.append(
+                {
+                    "open": float(
+                        row[
+                            0
+                        ]
+                    ),
+
+                    "high": float(
+                        row[
+                            1
+                        ]
+                    ),
+
+                    "low": float(
+                        row[
+                            2
+                        ]
+                    ),
+
+                    "close": float(
+                        row[
+                            3
+                        ]
+                    ),
+                }
+            )
+
+        return records
+
+    def _resolve_label(
+        self,
+        candidate_id: str,
+        action: str,
+        entry_price: float,
+        stop_price: float,
+        target_price: float,
+        future_frame: pd.DataFrame,
+    ):
+
+        if (
+            future_frame is None
+            or len(
+                future_frame
+            )
+            == 0
+        ):
+            return None
+
+        OutcomeResolver = (
+            self._outcome_resolver()
+        )
+
+        # No fabricated costs.
+        #
+        # Historical spread/commission/slippage must be supplied by a
+        # higher-quality replay source later if they are actually known.
+        return OutcomeResolver.resolve(
+            candidate_id=(
+                candidate_id
+            ),
+
+            entry_price=float(
+                entry_price
+            ),
+
+            stop_price=float(
+                stop_price
+            ),
+
+            target_price=float(
+                target_price
+            ),
+
+            action=str(
+                action
+            ).upper(),
+
+            bars_future=(
+                self._bars_to_records(
+                    future_frame
+                )
+            ),
+
+            lower_tf_bars=None,
+
+            spread_points=0.0,
+            point=0.0,
+
+            commission_r=0.0,
+            slippage_r=0.0,
+
+            force_time_exit=False,
+        )
+
+    # =========================================================================
+    # CHRONOLOGICAL SPLITS
+    # =========================================================================
+
+    @classmethod
+    def _split_boundaries(
+        cls,
+        n: int,
+    ) -> Tuple[
+        int,
+        int,
+    ]:
+
+        train_end = int(
+            n
+            * cls.TRAIN_FRACTION
+        )
+
+        validation_end = int(
+            n
+            * (
+                cls.TRAIN_FRACTION
+                + cls.VALIDATION_FRACTION
+            )
+        )
+
+        train_end = max(
+            1,
+            min(
+                train_end,
+                n - 2,
+            ),
+        )
+
+        validation_end = max(
+            train_end + 1,
+            min(
+                validation_end,
+                n - 1,
+            ),
+        )
+
+        return (
+            train_end,
+            validation_end,
+        )
+
+    @classmethod
+    def _split_for_index(
+        cls,
+        index: int,
+        n: int,
+    ) -> Tuple[
+        str,
+        int,
+    ]:
+
+        (
+            train_end,
+            validation_end,
+        ) = (
+            cls._split_boundaries(
+                n
+            )
+        )
+
+        if index < train_end:
+
+            return (
+                "train",
+                train_end,
+            )
+
+        if index < validation_end:
+
+            return (
+                "validation",
+                validation_end,
+            )
+
+        return (
+            "holdout",
+            n,
+        )
+
+    # =========================================================================
+    # TRADE GEOMETRY
+    # =========================================================================
+
+    @classmethod
+    def _geometry(
+        cls,
+        action: str,
+        entry_price: float,
+        atr: float,
+        support: Optional[
+            float
+        ],
+        resistance: Optional[
+            float
+        ],
+        rr: float = 1.5,
+    ) -> Optional[
+        Tuple[
+            float,
+            float,
+        ]
+    ]:
+
+        if (
+            not math.isfinite(
+                entry_price
+            )
+            or entry_price <= 0.0
+            or not math.isfinite(
+                atr
+            )
+            or atr <= 0.0
+        ):
+            return None
+
+        action = str(
+            action
+        ).upper()
+
+        rr = max(
+            1.0,
+            float(
+                rr
+            ),
+        )
+
+        if action == "BUY":
+
+            stop = (
+                entry_price
+                - (
+                    1.5
+                    * atr
+                )
+            )
+
+            if (
+                support is not None
+                and math.isfinite(
+                    support
+                )
+                and support
+                < entry_price
+            ):
+
+                distance = (
+                    entry_price
+                    - support
+                )
+
+                if (
+                    0.5
+                    * atr
+                    <= distance
+                    <= 3.0
+                    * atr
+                ):
+
+                    stop = (
+                        support
+                        - (
+                            0.25
+                            * atr
+                        )
+                    )
+
+            risk = (
+                entry_price
+                - stop
+            )
+
+            if risk <= 0.0:
+                return None
+
+            target = (
+                entry_price
+                + (
+                    rr
+                    * risk
+                )
+            )
+
+            return (
+                float(
+                    stop
+                ),
+                float(
+                    target
+                ),
+            )
+
+        if action == "SELL":
+
+            stop = (
+                entry_price
+                + (
+                    1.5
+                    * atr
+                )
+            )
+
+            if (
+                resistance
+                is not None
+                and math.isfinite(
+                    resistance
+                )
+                and resistance
+                > entry_price
+            ):
+
+                distance = (
+                    resistance
+                    - entry_price
+                )
+
+                if (
+                    0.5
+                    * atr
+                    <= distance
+                    <= 3.0
+                    * atr
+                ):
+
+                    stop = (
+                        resistance
+                        + (
+                            0.25
+                            * atr
+                        )
+                    )
+
+            risk = (
+                stop
+                - entry_price
+            )
+
+            if risk <= 0.0:
+                return None
+
+            target = (
+                entry_price
+                - (
+                    rr
+                    * risk
+                )
+            )
+
+            return (
+                float(
+                    stop
+                ),
+                float(
+                    target
+                ),
+            )
+
+        return None
+
+    # =========================================================================
+    # SINGLE-TIMEFRAME CAUSAL DATASET
+    # =========================================================================
+
+    def _build_single_timeframe_samples(
+        self,
+        timeframe_data: pd.DataFrame,
+        max_holding_bars: int,
+    ) -> List[
+        _CausalSample
+    ]:
+
+        from utils.smc_indicators import (
+            SMCIndicators,
+        )
+
+        from utils.settings_manager import (
+            settings_manager,
+        )
+
+        df = self._closed_frame(
+            timeframe_data
+        )
+
+        if (
+            df is None
+            or len(
+                df
+            ) < 80
+        ):
+            return []
+
+        swing_window = max(
+            1,
+            int(
+                settings_manager.get(
+                    "smc_swing_window",
+                    3,
+                )
+                or 3
+            ),
+        )
+
+        feat = (
+            SMCIndicators
+            .compute_smc_features(
+                df,
+                window=(
+                    swing_window
+                ),
+            )
+        )
+
+        feat = feat.reindex(
+            df.index
+        )
+
+        n = len(
+            df
+        )
+
+        if len(
+            feat
+        ) != n:
+            return []
+
+        opens = (
+            df[
+                "open"
+            ]
+            .astype(
+                float
+            )
+            .to_numpy()
+        )
+
+        biases = (
+            feat[
+                "active_bias"
+            ]
+            .fillna(
+                0
+            )
+            .to_numpy()
+            if "active_bias"
+            in feat
+            else np.zeros(
+                n
+            )
+        )
+
+        sweeps = (
+            feat[
+                "liq_sweep_type"
+            ]
+            .fillna(
+                0
+            )
+            .to_numpy()
+            if "liq_sweep_type"
+            in feat
+            else np.zeros(
+                n
+            )
+        )
+
+        mss_values = (
+            feat[
+                "mss_signal"
+            ]
+            .fillna(
+                0
+            )
+            .to_numpy()
+            if "mss_signal"
+            in feat
+            else np.zeros(
+                n
+            )
+        )
+
+        atr_values = (
+            pd.to_numeric(
+                feat[
+                    "atr"
+                ],
+                errors="coerce",
+            ).to_numpy()
+            if "atr"
+            in feat
+            else np.full(
+                n,
+                np.nan,
+            )
+        )
+
+        volatility_values = (
+            pd.to_numeric(
+                feat[
+                    "volatility"
+                ],
+                errors="coerce",
+            ).to_numpy()
+            if "volatility"
+            in feat
+            else np.zeros(
+                n
+            )
+        )
+
+        support_values = (
+            pd.to_numeric(
+                feat[
+                    "support"
+                ],
+                errors="coerce",
+            ).to_numpy()
+            if "support"
+            in feat
+            else np.full(
+                n,
+                np.nan,
+            )
+        )
+
+        resistance_values = (
+            pd.to_numeric(
+                feat[
+                    "resistance"
+                ],
+                errors="coerce",
+            ).to_numpy()
+            if "resistance"
+            in feat
+            else np.full(
+                n,
+                np.nan,
+            )
+        )
+
+        fvg_values = (
+            feat[
+                "fvg_class"
+            ].to_numpy()
+            if "fvg_class"
+            in feat
+            else np.array(
+                [
+                    "none"
+                ]
+                * n,
+                dtype=object,
+            )
+        )
+
+        optional_signal_columns = {
+            "ob_reaction_signal": (
+                feat[
+                    "ob_reaction_signal"
+                ]
+                .fillna(
+                    0
+                )
+                .to_numpy()
+                if "ob_reaction_signal"
+                in feat
+                else np.zeros(
+                    n
+                )
+            ),
+
+            "sr_reaction_signal": (
+                feat[
+                    "sr_reaction_signal"
+                ]
+                .fillna(
+                    0
+                )
+                .to_numpy()
+                if "sr_reaction_signal"
+                in feat
+                else np.zeros(
+                    n
+                )
+            ),
+
+            "retest_pullback_signal": (
+                feat[
+                    "retest_pullback_signal"
+                ]
+                .fillna(
+                    0
+                )
+                .to_numpy()
+                if "retest_pullback_signal"
+                in feat
+                else np.zeros(
+                    n
+                )
+            ),
+
+            "trend_shift_signal": (
+                feat[
+                    "trend_shift_signal"
+                ]
+                .fillna(
+                    0
+                )
+                .to_numpy()
+                if "trend_shift_signal"
+                in feat
+                else np.zeros(
+                    n
+                )
+            ),
         }
 
-    def get_market_regime(self, symbol: str) -> str:
-        return self.market_regimes.get(symbol, {}).get('regime', 'RANGING')
+        samples: List[
+            _CausalSample
+        ] = []
 
-    def save_patterns(self):
-        try:
-            os.makedirs('data', exist_ok=True)
-            filepath = 'data/smc_patterns.json'
-            
-            # Serialize centroids and classifier parameters
-            centroids_list = self.kmeans.centroids.tolist() if isinstance(self.kmeans.centroids, np.ndarray) else []
-            
-            data = {
-                'patterns': dict(self.patterns),
-                'market_regimes': self.market_regimes,
-                'kmeans_centroids': centroids_list,
-                'naive_bayes': {
-                    'class_priors': self.classifier.class_priors,
-                    'discrete_conds': self.classifier.discrete_conds,
-                    'continuous_conds': self.classifier.continuous_conds
-                },
-                'training_stats': self.training_stats
-            }
-            with open(filepath, 'w') as f:
-                json.dump(data, f, indent=4)
-        except Exception as e:
-            self.logger.error(f"Failed to save patterns to file: {e}")
+        max_holding_bars = max(
+            5,
+            min(
+                5000,
+                int(
+                    max_holding_bars
+                ),
+            ),
+        )
 
-    def load_patterns(self):
-        filepath = 'data/smc_patterns.json'
-        if os.path.exists(filepath):
+        # -------------------------------------------------------------
+        # Signal on closed bar i.
+        # Earliest entry: next bar open i+1.
+        # -------------------------------------------------------------
+
+        for i in range(
+            max(
+                20,
+                swing_window
+                * 4,
+            ),
+            n - 1,
+        ):
+
+            (
+                split_name,
+                region_end,
+            ) = (
+                self._split_for_index(
+                    i,
+                    n,
+                )
+            )
+
+            entry_index = (
+                i + 1
+            )
+
+            if (
+                entry_index
+                >= region_end
+            ):
+                continue
+
             try:
-                with open(filepath, 'r') as f:
-                    data = json.load(f)
-                
-                self.patterns = defaultdict(list)
-                for k, v in data.get('patterns', {}).items():
-                    self.patterns[k] = v
-                self.market_regimes = data.get('market_regimes', {})
-                self.training_stats = data.get('training_stats', {})
-                
-                # Restore KMeans centroids
-                centroids = data.get('kmeans_centroids', [])
-                if centroids:
-                    self.kmeans.centroids = np.array(centroids)
-                    
-                # Restore Classifier parameters
-                nb = data.get('naive_bayes', {})
-                if nb:
-                    self.classifier.class_priors = {int(k): float(v) for k, v in nb.get('class_priors', {0:0.5, 1:0.5}).items()}
-                    
-                    disc = nb.get('discrete_conds', {})
-                    self.classifier.discrete_conds = {}
-                    for c_str, feat_dict in disc.items():
-                        c = int(c_str)
-                        self.classifier.discrete_conds[c] = {}
-                        for feat_key, val_dict in feat_dict.items():
-                            self.classifier.discrete_conds[c][feat_key] = {k: float(v) for k, v in val_dict.items()}
-                            
-                    cont = nb.get('continuous_conds', {})
-                    self.classifier.continuous_conds = {}
-                    for c_str, feat_dict in cont.items():
-                        c = int(c_str)
-                        self.classifier.continuous_conds[c] = {}
-                        for feat_key, params in feat_dict.items():
-                            self.classifier.continuous_conds[c][feat_key] = (float(params[0]), float(params[1]))
-                            
-                self.logger.info(f"Loaded {sum(len(p) for p in self.patterns.values())} SMC patterns from disk")
-            except Exception as e:
-                self.logger.error(f"Failed to load patterns from file: {e}")
+                bias = (
+                    int(
+                        biases[
+                            i
+                        ]
+                    )
+                    if np.isfinite(
+                        float(
+                            biases[
+                                i
+                            ]
+                        )
+                    )
+                    else 0
+                )
 
-    def save_nn_model(self):
-        """Helper to save model weights and its schema metadata."""
-        try:
-            os.makedirs("models", exist_ok=True)
-            model_path = "models/pulse_viper_base.pth"
-            metadata_path = "models/pulse_viper_base.json"
-            
-            # Save weights
-            torch.save(self.nn_model.state_dict(), model_path)
-            
-            # Save metadata
-            from core.feature_extractor import FeatureExtractor
-            meta = {
-                "model_version": "pv-nn-003",
-                "feature_schema_version": 3,
-                "feature_names": FeatureExtractor.FEATURE_NAMES,
-                "feature_schema_hash": FeatureExtractor.FEATURE_SCHEMA_HASH,
-                "input_dim": 30,
-                "strategy_schema_version": 1,
-                "trained_at_utc": pd.Timestamp.now(tz='UTC').isoformat()
+            except Exception:
+                bias = 0
+
+            sweep = (
+                self._last_nonzero(
+                    sweeps,
+                    i,
+                    10,
+                )
+            )
+
+            mss = (
+                self._last_nonzero(
+                    mss_values,
+                    i,
+                    5,
+                )
+            )
+
+            bullish = (
+                bias == 1
+                and (
+                    sweep == 1
+                    or mss == 1
+                )
+            )
+
+            bearish = (
+                bias == -1
+                and (
+                    sweep == -1
+                    or mss == -1
+                )
+            )
+
+            # Preserve neutral/range mean-reversion setup.
+            if (
+                bias == 0
+                and not bullish
+                and not bearish
+            ):
+
+                bullish = (
+                    sweep == 1
+                    or mss == 1
+                )
+
+                bearish = (
+                    sweep == -1
+                    or mss == -1
+                )
+
+            if bullish == bearish:
+                continue
+
+            action = (
+                "BUY"
+                if bullish
+                else "SELL"
+            )
+
+            entry_price = (
+                self._finite(
+                    opens[
+                        entry_index
+                    ]
+                )
+            )
+
+            atr = (
+                self._finite(
+                    atr_values[
+                        i
+                    ]
+                )
+            )
+
+            if (
+                entry_price is None
+                or atr is None
+            ):
+                continue
+
+            support = (
+                self._finite(
+                    support_values[
+                        i
+                    ]
+                )
+            )
+
+            resistance = (
+                self._finite(
+                    resistance_values[
+                        i
+                    ]
+                )
+            )
+
+            geometry = (
+                self._geometry(
+                    action,
+                    entry_price,
+                    atr,
+                    support,
+                    resistance,
+                    rr=1.5,
+                )
+            )
+
+            if geometry is None:
+                continue
+
+            (
+                stop_price,
+                target_price,
+            ) = (
+                geometry
+            )
+
+            # Critical:
+            #
+            # future data is capped at this chronological split boundary.
+            #
+            # Training labels can NEVER use validation candles.
+            # Validation labels can NEVER use holdout candles.
+            future_end = min(
+                region_end,
+                (
+                    entry_index
+                    + max_holding_bars
+                ),
+            )
+
+            future = df.iloc[
+                entry_index:
+                future_end
+            ]
+
+            if len(
+                future
+            ) == 0:
+                continue
+
+            candidate_id = (
+                f"STF:"
+                f"{split_name}:"
+                f"{df.index[i].isoformat()}:"
+                f"{action}"
+            )
+
+            try:
+                outcome = (
+                    self._resolve_label(
+                        candidate_id,
+                        action,
+                        entry_price,
+                        stop_price,
+                        target_price,
+                        future,
+                    )
+                )
+
+            except RuntimeError:
+                raise
+
+            except Exception as exc:
+
+                self.logger.debug(
+                    (
+                        "Outcome resolution "
+                        "failed: %s"
+                    ),
+                    exc,
+                )
+
+                continue
+
+            if outcome is None:
+                continue
+
+            if outcome.outcome_type in {
+                "AMBIGUOUS_SAME_BAR",
+                "CENSORED",
+                "INVALID_GEOMETRY",
+            }:
+                continue
+
+            if (
+                outcome.net_r is None
+                or not math.isfinite(
+                    float(
+                        outcome.net_r
+                    )
+                )
+            ):
+                continue
+
+            holding_bars = max(
+                1,
+                int(
+                    outcome.holding_bars
+                ),
+            )
+
+            label_end_index = min(
+                region_end - 1,
+                (
+                    entry_index
+                    + holding_bars
+                    - 1
+                ),
+            )
+
+            feature_dict = {
+                "active_bias": (
+                    bias
+                ),
+
+                "liq_sweep_type": (
+                    sweep
+                ),
+
+                "mss_signal": (
+                    mss
+                ),
+
+                "fvg_class": str(
+                    fvg_values[
+                        i
+                    ]
+                ),
+
+                "volatility": float(
+                    volatility_values[
+                        i
+                    ]
+                    if np.isfinite(
+                        volatility_values[
+                            i
+                        ]
+                    )
+                    else 0.0
+                ),
+
+                "atr_pct": (
+                    atr
+                    / max(
+                        entry_price,
+                        1e-12,
+                    )
+                ),
+
+                "rvol": 1.0,
+
+                "buy_pressure": (
+                    50.0
+                ),
+
+                "sell_pressure": (
+                    50.0
+                ),
+
+                "ob_reaction_signal": float(
+                    optional_signal_columns[
+                        "ob_reaction_signal"
+                    ][
+                        i
+                    ]
+                ),
+
+                "sr_reaction_signal": float(
+                    optional_signal_columns[
+                        "sr_reaction_signal"
+                    ][
+                        i
+                    ]
+                ),
+
+                "retest_pullback_signal": float(
+                    optional_signal_columns[
+                        "retest_pullback_signal"
+                    ][
+                        i
+                    ]
+                ),
+
+                "trend_shift_signal": float(
+                    optional_signal_columns[
+                        "trend_shift_signal"
+                    ][
+                        i
+                    ]
+                ),
+
+                "candidate_strategy": (
+                    "SMC_CONCEPTS"
+                ),
+
+                "candidate_action": (
+                    action
+                ),
+
+                "timestamp": float(
+                    df.index[
+                        i
+                    ].timestamp()
+                ),
             }
-            with open(metadata_path, "w") as f:
-                json.dump(meta, f, indent=4)
-            self.logger.info(f"Saved active model and metadata to models/ folder.")
-        except Exception as e:
-            self.logger.error(f"Failed to save NN model: {e}")
 
-    def _validate_and_promote(self, candidate_model, inputs_tensor=None, targets_tensor=None) -> bool:
-        """
-        Verify technical validity and statistical benchmarks of candidate model.
-        Returns True if promoted, False otherwise.
-        """
-        try:
-            from utils.settings_manager import settings_manager
-            # 1. Ensure candidate model is in evaluation mode before validation and promotion
-            candidate_model.eval()
-            
-            # 2. Technical Validity checks
-            for param in candidate_model.parameters():
-                if torch.isnan(param).any() or torch.isinf(param).any():
-                    self.logger.warning("Technical validation failed: NaN/Inf detected in weights.")
-                    return False
-            
-            # Verify shape and dimension
-            test_input = torch.zeros((1, 30))
-            with torch.no_grad():
-                test_output = candidate_model(test_input)
-                val = float(test_output.item())
-                if val < 0.0 or val > 1.0:
-                    self.logger.warning(f"Technical validation failed: Output {val} out of bounds.")
-                    return False
-            
-            # 3. Statistical Promotion checks
-            if inputs_tensor is not None and targets_tensor is not None:
-                sample_count = len(inputs_tensor)
-                min_samples = settings_manager.get("min_promotion_samples", 5)
-                if sample_count < min_samples:
-                    self.logger.warning(f"Promotion skipped: Evaluation sample size ({sample_count}) below minimum ({min_samples}).")
-                    return False
-                    
-                with torch.no_grad():
-                    # Calculate Brier score for champion and challenger
-                    champ_preds = self.nn_model(inputs_tensor)
-                    cand_preds = candidate_model(inputs_tensor)
-                    
-                    champ_brier = float(torch.mean((champ_preds - targets_tensor) ** 2).item())
-                    cand_brier = float(torch.mean((cand_preds - targets_tensor) ** 2).item())
-                    
-                    # Challenger Brier score must be <= champion's Brier score (lower is better)
-                    if cand_brier > champ_brier:
-                        self.logger.warning(f"Statistical validation failed: Challenger Brier ({cand_brier:.4f}) is worse than Champion ({champ_brier:.4f}).")
-                        return False
-                        
-                    # Max allowed Brier score check
-                    max_allowed_brier = settings_manager.get("max_allowed_brier", 0.25)
-                    if cand_brier > max_allowed_brier:
-                        self.logger.warning(f"Statistical validation failed: Challenger Brier ({cand_brier:.4f}) exceeds maximum allowed ({max_allowed_brier:.4f}).")
-                        return False
-                        
-                    # Catastrophic regime regression safety check (segregated by high/low volatility inputs)
-                    vol_col = 4 # Index of volatility_scaled in FEATURE_NAMES (0-indexed)
-                    high_vol_mask = inputs_tensor[:, vol_col] > 1.0
-                    low_vol_mask = ~high_vol_mask
-                    
-                    for name, mask in [("HIGH_VOL", high_vol_mask), ("LOW_VOL", low_vol_mask)]:
-                        if mask.any():
-                            cand_regime_brier = float(torch.mean((cand_preds[mask] - targets_tensor[mask]) ** 2).item())
-                            if cand_regime_brier > 0.35: # hard ceiling on catastrophic regime failure
-                                self.logger.warning(f"Statistical validation failed: Catastrophic regression in {name} regime. Brier = {cand_regime_brier:.4f}")
-                                return False
-            
-            return True
-        except Exception as e:
-            self.logger.error(f"Validation error: {e}")
-            return False
+            try:
+                vector = (
+                    self.extract_nn_features(
+                        feature_dict
+                    )
+                )
 
-    def load_nn_model(self):
-        """Load PyTorch neural network weights if available and validated against schema metadata."""
-        model_path = "models/pulse_viper_base.pth"
-        metadata_path = "models/pulse_viper_base.json"
-        try:
-            self.nn_ready = False
-            os.makedirs("models", exist_ok=True)
-            if os.path.exists(model_path) and os.path.exists(metadata_path):
-                # 1. Load and verify metadata
-                with open(metadata_path, "r") as f:
-                    meta = json.load(f)
-                
-                from core.feature_extractor import FeatureExtractor
-                expected_hash = FeatureExtractor.FEATURE_SCHEMA_HASH
-                
-                if meta.get("input_dim") != 30:
-                    self.logger.warning("Model input dimension mismatch. Excluded from production.")
-                    return
-                if meta.get("feature_schema_hash") != expected_hash:
-                    self.logger.warning("Model feature schema hash mismatch. Excluded from production.")
-                    return
-                if meta.get("strategy_schema_version") != 1:
-                    self.logger.warning("Model strategy schema version mismatch. Excluded from production.")
-                    return
-                
-                # 2. Load weights
-                state_dict = torch.load(model_path, map_location=torch.device('cpu'))
-                self.nn_model.load_state_dict(state_dict)
-                self.nn_model.eval()
-                self.nn_ready = True
-                self.logger.info(f"🧠 PyTorch neural net weights ({meta.get('model_version')}) loaded and validated successfully.")
-            else:
-                self.logger.warning("PyTorch model files not found. Inference not ready.")
-        except Exception as e:
-            self.logger.warning(f"⚠️ PyTorch weights mismatch or loading error: {e}. Model set to NOT ready.")
-            self.nn_ready = False
+            except ValueError:
+                continue
+
+            samples.append(
+                _CausalSample(
+                    feature_vector=(
+                        vector
+                    ),
+
+                    target=(
+                        1.0
+                        if float(
+                            outcome.net_r
+                        )
+                        > 0.0
+                        else 0.0
+                    ),
+
+                    realized_r=float(
+                        outcome.net_r
+                    ),
+
+                    decision_index=(
+                        i
+                    ),
+
+                    label_end_index=(
+                        label_end_index
+                    ),
+
+                    decision_time_utc=(
+                        df.index[
+                            i
+                        ].isoformat()
+                    ),
+
+                    outcome_type=str(
+                        outcome.outcome_type
+                    ),
+
+                    split=(
+                        split_name
+                    ),
+                )
+            )
+
+        return samples
+
+    # =========================================================================
+    # MULTI-TIMEFRAME CAUSAL DATASET
+    # =========================================================================
+
+    def _build_mtf_samples(
+        self,
+        df_htf: pd.DataFrame,
+        df_context: pd.DataFrame,
+        df_ltf: pd.DataFrame,
+        max_holding_bars: int,
+    ) -> List[
+        _CausalSample
+    ]:
+
+        from utils.smc_indicators import (
+            SMCIndicators,
+        )
+
+        from utils.settings_manager import (
+            settings_manager,
+        )
+
+        htf = self._closed_frame(
+            df_htf
+        )
+
+        context = self._closed_frame(
+            df_context
+        )
+
+        ltf = self._closed_frame(
+            df_ltf
+        )
+
+        if (
+            htf is None
+            or context is None
+            or ltf is None
+            or len(
+                ltf
+            ) < 80
+        ):
+            return []
+
+        htf_seconds = (
+            self._infer_bar_seconds(
+                htf
+            )
+        )
+
+        context_seconds = (
+            self._infer_bar_seconds(
+                context
+            )
+        )
+
+        ltf_seconds = (
+            self._infer_bar_seconds(
+                ltf
+            )
+        )
+
+        if (
+            not htf_seconds
+            or not context_seconds
+            or not ltf_seconds
+        ):
+            return []
+
+        swing_window = max(
+            1,
+            int(
+                settings_manager.get(
+                    "smc_swing_window",
+                    3,
+                )
+                or 3
+            ),
+        )
+
+        htf_feat = (
+            SMCIndicators
+            .compute_smc_features(
+                htf,
+                window=(
+                    swing_window
+                ),
+            )
+            .reindex(
+                htf.index
+            )
+        )
+
+        context_feat = (
+            SMCIndicators
+            .compute_smc_features(
+                context,
+                window=(
+                    swing_window
+                ),
+            )
+            .reindex(
+                context.index
+            )
+        )
+
+        ltf_feat = (
+            SMCIndicators
+            .compute_smc_features(
+                ltf,
+                window=(
+                    swing_window
+                ),
+            )
+            .reindex(
+                ltf.index
+            )
+        )
+
+        # -------------------------------------------------------------
+        # CRITICAL MTF AVAILABILITY
+        #
+        # H1 candle opened 12:00 is not available at 12:15.
+        # It becomes available at 13:00.
+        # -------------------------------------------------------------
+
+        htf_available_ns = (
+            htf.index.view(
+                "int64"
+            )
+            + (
+                htf_seconds
+                * 1_000_000_000
+            )
+        )
+
+        context_available_ns = (
+            context.index.view(
+                "int64"
+            )
+            + (
+                context_seconds
+                * 1_000_000_000
+            )
+        )
+
+        htf_biases = (
+            htf_feat[
+                "active_bias"
+            ]
+            .fillna(
+                0
+            )
+            .to_numpy()
+            if "active_bias"
+            in htf_feat
+            else np.zeros(
+                len(
+                    htf
+                )
+            )
+        )
+
+        context_sweeps = (
+            context_feat[
+                "liq_sweep_type"
+            ]
+            .fillna(
+                0
+            )
+            .to_numpy()
+            if "liq_sweep_type"
+            in context_feat
+            else np.zeros(
+                len(
+                    context
+                )
+            )
+        )
+
+        ltf_mss = (
+            ltf_feat[
+                "mss_signal"
+            ]
+            .fillna(
+                0
+            )
+            .to_numpy()
+            if "mss_signal"
+            in ltf_feat
+            else np.zeros(
+                len(
+                    ltf
+                )
+            )
+        )
+
+        atr_values = (
+            pd.to_numeric(
+                ltf_feat[
+                    "atr"
+                ],
+                errors="coerce",
+            ).to_numpy()
+            if "atr"
+            in ltf_feat
+            else np.full(
+                len(
+                    ltf
+                ),
+                np.nan,
+            )
+        )
+
+        volatility_values = (
+            pd.to_numeric(
+                ltf_feat[
+                    "volatility"
+                ],
+                errors="coerce",
+            ).to_numpy()
+            if "volatility"
+            in ltf_feat
+            else np.zeros(
+                len(
+                    ltf
+                )
+            )
+        )
+
+        support_values = (
+            pd.to_numeric(
+                ltf_feat[
+                    "support"
+                ],
+                errors="coerce",
+            ).to_numpy()
+            if "support"
+            in ltf_feat
+            else np.full(
+                len(
+                    ltf
+                ),
+                np.nan,
+            )
+        )
+
+        resistance_values = (
+            pd.to_numeric(
+                ltf_feat[
+                    "resistance"
+                ],
+                errors="coerce",
+            ).to_numpy()
+            if "resistance"
+            in ltf_feat
+            else np.full(
+                len(
+                    ltf
+                ),
+                np.nan,
+            )
+        )
+
+        fvg_values = (
+            ltf_feat[
+                "fvg_class"
+            ].to_numpy()
+            if "fvg_class"
+            in ltf_feat
+            else np.array(
+                [
+                    "none"
+                ]
+                * len(
+                    ltf
+                ),
+                dtype=object,
+            )
+        )
+
+        opens = (
+            ltf[
+                "open"
+            ]
+            .astype(
+                float
+            )
+            .to_numpy()
+        )
+
+        n = len(
+            ltf
+        )
+
+        max_holding_bars = max(
+            5,
+            min(
+                5000,
+                int(
+                    max_holding_bars
+                ),
+            ),
+        )
+
+        samples: List[
+            _CausalSample
+        ] = []
+
+        for i in range(
+            max(
+                20,
+                swing_window
+                * 4,
+            ),
+            n - 1,
+        ):
+
+            (
+                split_name,
+                region_end,
+            ) = (
+                self._split_for_index(
+                    i,
+                    n,
+                )
+            )
+
+            entry_index = (
+                i + 1
+            )
+
+            if (
+                entry_index
+                >= region_end
+            ):
+                continue
+
+            # Signal becomes known at LTF close.
+            decision_ns = (
+                ltf.index[
+                    i
+                ].value
+                + (
+                    ltf_seconds
+                    * 1_000_000_000
+                )
+            )
+
+            htf_idx = int(
+                np.searchsorted(
+                    htf_available_ns,
+                    decision_ns,
+                    side="right",
+                )
+                - 1
+            )
+
+            context_idx = int(
+                np.searchsorted(
+                    context_available_ns,
+                    decision_ns,
+                    side="right",
+                )
+                - 1
+            )
+
+            if (
+                htf_idx < 0
+                or context_idx < 0
+            ):
+                continue
+
+            try:
+                htf_bias = (
+                    int(
+                        htf_biases[
+                            htf_idx
+                        ]
+                    )
+                    if np.isfinite(
+                        float(
+                            htf_biases[
+                                htf_idx
+                            ]
+                        )
+                    )
+                    else 0
+                )
+
+            except Exception:
+                htf_bias = 0
+
+            context_sweep = (
+                self._last_nonzero(
+                    context_sweeps,
+                    context_idx,
+                    10,
+                )
+            )
+
+            mss = (
+                self._last_nonzero(
+                    ltf_mss,
+                    i,
+                    5,
+                )
+            )
+
+            bullish = (
+                htf_bias == 1
+                and (
+                    context_sweep == 1
+                    or mss == 1
+                )
+            )
+
+            bearish = (
+                htf_bias == -1
+                and (
+                    context_sweep == -1
+                    or mss == -1
+                )
+            )
+
+            if bullish == bearish:
+                continue
+
+            action = (
+                "BUY"
+                if bullish
+                else "SELL"
+            )
+
+            entry_price = (
+                self._finite(
+                    opens[
+                        entry_index
+                    ]
+                )
+            )
+
+            atr = (
+                self._finite(
+                    atr_values[
+                        i
+                    ]
+                )
+            )
+
+            if (
+                entry_price is None
+                or atr is None
+            ):
+                continue
+
+            support = (
+                self._finite(
+                    support_values[
+                        i
+                    ]
+                )
+            )
+
+            resistance = (
+                self._finite(
+                    resistance_values[
+                        i
+                    ]
+                )
+            )
+
+            geometry = (
+                self._geometry(
+                    action,
+                    entry_price,
+                    atr,
+                    support,
+                    resistance,
+                    rr=1.5,
+                )
+            )
+
+            if geometry is None:
+                continue
+
+            (
+                stop_price,
+                target_price,
+            ) = (
+                geometry
+            )
+
+            future_end = min(
+                region_end,
+                (
+                    entry_index
+                    + max_holding_bars
+                ),
+            )
+
+            future = ltf.iloc[
+                entry_index:
+                future_end
+            ]
+
+            if len(
+                future
+            ) == 0:
+                continue
+
+            candidate_id = (
+                f"MTF:"
+                f"{split_name}:"
+                f"{ltf.index[i].isoformat()}:"
+                f"{action}"
+            )
+
+            try:
+                outcome = (
+                    self._resolve_label(
+                        candidate_id,
+                        action,
+                        entry_price,
+                        stop_price,
+                        target_price,
+                        future,
+                    )
+                )
+
+            except RuntimeError:
+                raise
+
+            except Exception as exc:
+
+                self.logger.debug(
+                    (
+                        "MTF outcome resolution "
+                        "failed: %s"
+                    ),
+                    exc,
+                )
+
+                continue
+
+            if outcome is None:
+                continue
+
+            if outcome.outcome_type in {
+                "AMBIGUOUS_SAME_BAR",
+                "CENSORED",
+                "INVALID_GEOMETRY",
+            }:
+                continue
+
+            if (
+                outcome.net_r is None
+                or not math.isfinite(
+                    float(
+                        outcome.net_r
+                    )
+                )
+            ):
+                continue
+
+            holding_bars = max(
+                1,
+                int(
+                    outcome.holding_bars
+                ),
+            )
+
+            label_end_index = min(
+                region_end - 1,
+                (
+                    entry_index
+                    + holding_bars
+                    - 1
+                ),
+            )
+
+            feature_dict = {
+                "active_bias": (
+                    htf_bias
+                ),
+
+                "liq_sweep_type": (
+                    context_sweep
+                ),
+
+                "mss_signal": (
+                    mss
+                ),
+
+                "fvg_class": str(
+                    fvg_values[
+                        i
+                    ]
+                ),
+
+                "volatility": float(
+                    volatility_values[
+                        i
+                    ]
+                    if np.isfinite(
+                        volatility_values[
+                            i
+                        ]
+                    )
+                    else 0.0
+                ),
+
+                "atr_pct": (
+                    atr
+                    / max(
+                        entry_price,
+                        1e-12,
+                    )
+                ),
+
+                "rvol": 1.0,
+
+                "buy_pressure": (
+                    50.0
+                ),
+
+                "sell_pressure": (
+                    50.0
+                ),
+
+                "ob_reaction_signal": float(
+                    ltf_feat[
+                        "ob_reaction_signal"
+                    ].iloc[
+                        i
+                    ]
+                    if (
+                        "ob_reaction_signal"
+                        in ltf_feat
+                        and pd.notna(
+                            ltf_feat[
+                                "ob_reaction_signal"
+                            ].iloc[
+                                i
+                            ]
+                        )
+                    )
+                    else 0.0
+                ),
+
+                "sr_reaction_signal": float(
+                    ltf_feat[
+                        "sr_reaction_signal"
+                    ].iloc[
+                        i
+                    ]
+                    if (
+                        "sr_reaction_signal"
+                        in ltf_feat
+                        and pd.notna(
+                            ltf_feat[
+                                "sr_reaction_signal"
+                            ].iloc[
+                                i
+                            ]
+                        )
+                    )
+                    else 0.0
+                ),
+
+                "retest_pullback_signal": float(
+                    ltf_feat[
+                        "retest_pullback_signal"
+                    ].iloc[
+                        i
+                    ]
+                    if (
+                        "retest_pullback_signal"
+                        in ltf_feat
+                        and pd.notna(
+                            ltf_feat[
+                                "retest_pullback_signal"
+                            ].iloc[
+                                i
+                            ]
+                        )
+                    )
+                    else 0.0
+                ),
+
+                "trend_shift_signal": float(
+                    ltf_feat[
+                        "trend_shift_signal"
+                    ].iloc[
+                        i
+                    ]
+                    if (
+                        "trend_shift_signal"
+                        in ltf_feat
+                        and pd.notna(
+                            ltf_feat[
+                                "trend_shift_signal"
+                            ].iloc[
+                                i
+                            ]
+                        )
+                    )
+                    else 0.0
+                ),
+
+                "candidate_strategy": (
+                    "SMC_CONCEPTS"
+                ),
+
+                "candidate_action": (
+                    action
+                ),
+
+                "timestamp": float(
+                    ltf.index[
+                        i
+                    ].timestamp()
+                ),
+            }
+
+            try:
+                vector = (
+                    self.extract_nn_features(
+                        feature_dict
+                    )
+                )
+
+            except ValueError:
+                continue
+
+            samples.append(
+                _CausalSample(
+                    feature_vector=(
+                        vector
+                    ),
+
+                    target=(
+                        1.0
+                        if float(
+                            outcome.net_r
+                        )
+                        > 0.0
+                        else 0.0
+                    ),
+
+                    realized_r=float(
+                        outcome.net_r
+                    ),
+
+                    decision_index=(
+                        i
+                    ),
+
+                    label_end_index=(
+                        label_end_index
+                    ),
+
+                    decision_time_utc=(
+                        ltf.index[
+                            i
+                        ].isoformat()
+                    ),
+
+                    outcome_type=str(
+                        outcome.outcome_type
+                    ),
+
+                    split=(
+                        split_name
+                    ),
+                )
+            )
+
+        return samples
+
+    # =========================================================================
+    # DATASET OUTPUT
+    # =========================================================================
 
     @staticmethod
-    def extract_temporal_embeddings(timestamp_str_or_float) -> list:
-        """
-        Converts raw UNIX timestamps or timestamp strings into cyclical temporal embeddings for PyTorch.
-        """
-        return FeatureExtractor.extract_temporal_embeddings(timestamp_str_or_float)
+    def _samples_to_dataset(
+        samples: Sequence[
+            _CausalSample
+        ],
+    ) -> Dict[
+        str,
+        Any,
+    ]:
 
-    @staticmethod
-    def extract_nn_features(features: dict) -> np.ndarray:
-        """
-        Convert market features dict to an 18-dimensional numpy array for the PyTorch Neural Net.
-        """
-        return FeatureExtractor.extract_nn_features(features)
+        if not samples:
 
-    def append_live_experience(self, features: dict, outcome_label: float, pnl_realized: float, symbol: str):
-        """
-        Thread-safe Continuous Alpha Learning Loop append.
-        Vectors are sent to the continuous training buffer for the PyTorch model.
-        """
-        import threading
-        if not hasattr(self, '_append_lock'):
-            self._append_lock = threading.Lock()
-            
-        with self._append_lock:
-            q_id = self._quantize_smc_state(features)
-            record = {
-                'pattern': q_id,
-                'outcome': pnl_realized,
-                'timestamp': str(pd.Timestamp.now())
+            return {
+                "features": (
+                    np.empty(
+                        (
+                            0,
+                            len(
+                                FeatureExtractor
+                                .FEATURE_NAMES
+                            ),
+                        ),
+                        dtype=np.float32,
+                    )
+                ),
+
+                "targets": (
+                    np.empty(
+                        (
+                            0,
+                            1,
+                        ),
+                        dtype=np.float32,
+                    )
+                ),
+
+                "realized_r": (
+                    np.empty(
+                        (
+                            0,
+                        ),
+                        dtype=np.float32,
+                    )
+                ),
+
+                "metadata": [],
             }
-            if outcome_label == 1.0:
-                self.patterns[f"{symbol}_winning"].append(record)
-                self.logger.info(f"📚 CALL: Appended WINNING live experience for {symbol}")
-            else:
-                self.patterns[f"{symbol}_losing"].append(record)
-                self.logger.info(f"📚 CALL: Appended LOSING live experience for {symbol}")
-                
-            # Keep bounded
-            self.patterns[f"{symbol}_winning"] = self.patterns[f"{symbol}_winning"][-200:]
-            self.patterns[f"{symbol}_losing"] = self.patterns[f"{symbol}_losing"][-200:]
-            
-            # We can optionally call incremental train here or allow a background worker to do it
+
+        return {
+            "features": (
+                np.asarray(
+                    [
+                        sample.feature_vector
+                        for sample
+                        in samples
+                    ],
+                    dtype=np.float32,
+                )
+            ),
+
+            "targets": (
+                np.asarray(
+                    [
+                        [
+                            sample.target
+                        ]
+                        for sample
+                        in samples
+                    ],
+                    dtype=np.float32,
+                )
+            ),
+
+            "realized_r": (
+                np.asarray(
+                    [
+                        sample.realized_r
+                        for sample
+                        in samples
+                    ],
+                    dtype=np.float32,
+                )
+            ),
+
+            "metadata": [
+                {
+                    "decision_index": (
+                        sample.decision_index
+                    ),
+
+                    "label_end_index": (
+                        sample.label_end_index
+                    ),
+
+                    "decision_time_utc": (
+                        sample.decision_time_utc
+                    ),
+
+                    "outcome_type": (
+                        sample.outcome_type
+                    ),
+
+                    "split": (
+                        sample.split
+                    ),
+                }
+                for sample
+                in samples
+            ],
+        }
+
+    def extract_causal_dataset(
+        self,
+        timeframe_data: pd.DataFrame,
+        split: str = "all",
+        max_holding_bars: int = (
+            DEFAULT_MAX_HOLDING_BARS
+        ),
+    ) -> Dict[
+        str,
+        Any,
+    ]:
+
+        samples = (
+            self._build_single_timeframe_samples(
+                timeframe_data,
+                max_holding_bars=(
+                    max_holding_bars
+                ),
+            )
+        )
+
+        split = (
+            str(
+                split
+            )
+            .lower()
+            .strip()
+        )
+
+        if split != "all":
+
+            if split not in {
+                "train",
+                "validation",
+                "holdout",
+            }:
+
+                raise ValueError(
+                    (
+                        "split must be "
+                        "train, validation, "
+                        "holdout, or all"
+                    )
+                )
+
+            samples = [
+                sample
+                for sample
+                in samples
+                if sample.split
+                == split
+            ]
+
+        dataset = (
+            self._samples_to_dataset(
+                samples
+            )
+        )
+
+        dataset[
+            "label_version"
+        ] = (
+            self.CAUSAL_LABEL_VERSION
+        )
+
+        dataset[
+            "cost_assumption"
+        ] = (
+            "ZERO_EXPLICIT_COSTS_"
+            "UNLESS_REPLAY_SUPPLIES_"
+            "REAL_COSTS"
+        )
+
+        return dataset
+
+    def extract_vectorized_features(
+        self,
+        timeframe_data: pd.DataFrame,
+        split: str = "train",
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """
+        Compatibility API.
+
+        Default is TRAIN only.
+
+        Validation and final holdout are never returned to the
+        asynchronous trainer by default.
+        """
+
+        try:
+            dataset = (
+                self.extract_causal_dataset(
+                    timeframe_data,
+                    split=(
+                        split
+                    ),
+                )
+            )
+
+            features = dataset[
+                "features"
+            ]
+
+            targets = dataset[
+                "targets"
+            ]
+
+            if len(
+                features
+            ) == 0:
+
+                return (
+                    torch.empty(
+                        (
+                            0,
+                            len(
+                                FeatureExtractor
+                                .FEATURE_NAMES
+                            ),
+                        )
+                    ),
+
+                    torch.empty(
+                        (
+                            0,
+                            1,
+                        )
+                    ),
+                )
+
+            return (
+                torch.tensor(
+                    features,
+                    dtype=torch.float32,
+                ),
+
+                torch.tensor(
+                    targets,
+                    dtype=torch.float32,
+                ),
+            )
+
+        except RuntimeError as exc:
+
+            self.logger.error(
+                (
+                    "Causal dataset "
+                    "unavailable: %s"
+                ),
+                exc,
+            )
+
+            return (
+                torch.empty(
+                    (
+                        0,
+                        len(
+                            FeatureExtractor
+                            .FEATURE_NAMES
+                        ),
+                    )
+                ),
+
+                torch.empty(
+                    (
+                        0,
+                        1,
+                    )
+                ),
+            )
+
+        except Exception as exc:
+
+            self.logger.exception(
+                (
+                    "Feature extraction "
+                    "failed closed: %s"
+                ),
+                exc,
+            )
+
+            return (
+                torch.empty(
+                    (
+                        0,
+                        len(
+                            FeatureExtractor
+                            .FEATURE_NAMES
+                        ),
+                    )
+                ),
+
+                torch.empty(
+                    (
+                        0,
+                        1,
+                    )
+                ),
+            )
+
+    # =========================================================================
+    # HISTORICAL ENTRYPOINTS
+    # =========================================================================
+
+    def _record_dataset_stats(
+        self,
+        symbol: str,
+        samples: Sequence[
+            _CausalSample
+        ],
+        source: str,
+    ) -> Dict[
+        str,
+        Any,
+    ]:
+
+        by_split = {
+            split: [
+                sample
+                for sample
+                in samples
+                if sample.split
+                == split
+            ]
+            for split
+            in (
+                "train",
+                "validation",
+                "holdout",
+            )
+        }
+
+        stats = {
+            "source": (
+                source
+            ),
+
+            "label_version": (
+                self.CAUSAL_LABEL_VERSION
+            ),
+
+            "train_samples": len(
+                by_split[
+                    "train"
+                ]
+            ),
+
+            "validation_samples": len(
+                by_split[
+                    "validation"
+                ]
+            ),
+
+            "holdout_samples": len(
+                by_split[
+                    "holdout"
+                ]
+            ),
+
+            "total_samples": len(
+                samples
+            ),
+
+            "train_realized_r": round(
+                float(
+                    sum(
+                        sample.realized_r
+                        for sample
+                        in by_split[
+                            "train"
+                        ]
+                    )
+                ),
+                6,
+            ),
+
+            "validation_realized_r": round(
+                float(
+                    sum(
+                        sample.realized_r
+                        for sample
+                        in by_split[
+                            "validation"
+                        ]
+                    )
+                ),
+                6,
+            ),
+
+            "holdout_realized_r": round(
+                float(
+                    sum(
+                        sample.realized_r
+                        for sample
+                        in by_split[
+                            "holdout"
+                        ]
+                    )
+                ),
+                6,
+            ),
+
+            "last_train_time": (
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+            ),
+
+            "production_mutation": (
+                False
+            ),
+
+            "status": (
+                "SHADOW_DATASET_READY"
+                if samples
+                else "NO_CAUSAL_SAMPLES"
+            ),
+        }
+
+        self.training_stats[
+            symbol
+        ] = stats
+
+        self._last_training_result = (
+            dict(
+                stats
+            )
+        )
+
+        return stats
+
+    def train_on_history(
+        self,
+        symbol: str,
+        df_htf: pd.DataFrame,
+        df_context: pd.DataFrame,
+        df_ltf: pd.DataFrame,
+    ) -> Dict[
+        str,
+        Any,
+    ]:
+        """
+        Build a causal MTF shadow dataset.
+
+        Production NN is NOT changed.
+        """
+
+        try:
+            samples = (
+                self._build_mtf_samples(
+                    df_htf,
+                    df_context,
+                    df_ltf,
+                    (
+                        self
+                        .DEFAULT_MAX_HOLDING_BARS
+                    ),
+                )
+            )
+
+            dataset = (
+                self._samples_to_dataset(
+                    samples
+                )
+            )
+
+            dataset[
+                "label_version"
+            ] = (
+                self.CAUSAL_LABEL_VERSION
+            )
+
+            with self._shadow_lock:
+
+                self._last_causal_dataset = (
+                    dataset
+                )
+
+            stats = (
+                self._record_dataset_stats(
+                    symbol,
+                    samples,
+                    "MTF_CAUSAL",
+                )
+            )
+
+            # Descriptive cluster only.
+            # TRAIN split only.
+            train_vectors = [
+                sample.feature_vector[
+                    :3
+                ]
+                for sample
+                in samples
+                if sample.split
+                == "train"
+            ]
+
+            if train_vectors:
+
+                self.kmeans.fit(
+                    np.asarray(
+                        train_vectors,
+                        dtype=float,
+                    )
+                )
+
             self.save_patterns()
 
-    def train_incremental(self, trades: List[Dict]):
-        """
-        Run a single optimization epoch on a batch of closed trades to adjust neural net weights.
-        Uses a challenger model and validates it before promoting.
-        """
+            return stats
+
+        except Exception as exc:
+
+            self.logger.exception(
+                (
+                    "MTF shadow dataset "
+                    "failed: %s"
+                ),
+                exc,
+            )
+
+            result = {
+                "source": (
+                    "MTF_CAUSAL"
+                ),
+
+                "status": (
+                    "FAILED_CLOSED"
+                ),
+
+                "reason": (
+                    f"{type(exc).__name__}:"
+                    f"{exc}"
+                ),
+
+                "production_mutation": (
+                    False
+                ),
+            }
+
+            self.training_stats[
+                symbol
+            ] = result
+
+            self._last_training_result = (
+                dict(
+                    result
+                )
+            )
+
+            return result
+
+    def train_on_single_timeframe(
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+    ) -> Dict[
+        str,
+        Any,
+    ]:
+
         try:
-            if not trades:
-                return
-            
-            inputs = []
-            targets = []
-            
-            for t in trades:
-                try:
-                    feat = self.extract_nn_features(t.get('features', {}))
-                    inputs.append(feat)
-                    outcome = 1.0 if float(t.get('pnl', 0.0)) > 0 else 0.0
-                    targets.append([outcome])
-                except ValueError as ve:
-                    self.logger.warning(f"Skipping legacy trade training row: {ve}")
-                    continue
-                    
-            if not inputs:
-                return
-                
-            inputs_tensor = torch.tensor(np.array(inputs, dtype=np.float32))
-            targets_tensor = torch.tensor(np.array(targets, dtype=np.float32))
-            
-            # Create challenger model
-            import copy
-            candidate_model = copy.deepcopy(self.nn_model)
-            candidate_optimizer = optim.Adam(candidate_model.parameters(), lr=0.003, weight_decay=1e-4)
-            
-            candidate_model.train()
-            candidate_optimizer.zero_grad()
-            outputs = candidate_model(inputs_tensor)
-            loss = self.nn_criterion(outputs, targets_tensor)
-            loss.backward()
-            candidate_optimizer.step()
-            candidate_model.eval()
-            
-            # Validate and promote
-            if self._validate_and_promote(candidate_model, inputs_tensor, targets_tensor):
-                with self.model_lock:
-                    self.nn_model = candidate_model
-                    self.nn_optimizer = candidate_optimizer
-                    self.nn_ready = True
-                self.save_nn_model()
-                self.logger.info(f"🔄 Online Learning Epoch complete on {len(trades)} samples. Loss: {loss.item():.4f}. Challenger promoted and saved.")
-            else:
-                self.logger.warning("⚠️ Challenger model failed validation. Promotion aborted.")
-        except Exception as e:
-            self.logger.error(f"Error during incremental training: {e}")
+            samples = (
+                self._build_single_timeframe_samples(
+                    df,
+                    (
+                        self
+                        .DEFAULT_MAX_HOLDING_BARS
+                    ),
+                )
+            )
 
-    def train_timeframe_layer(self, model, timeframe_data):
+            dataset = (
+                self._samples_to_dataset(
+                    samples
+                )
+            )
+
+            dataset[
+                "label_version"
+            ] = (
+                self.CAUSAL_LABEL_VERSION
+            )
+
+            with self._shadow_lock:
+
+                self._last_causal_dataset = (
+                    dataset
+                )
+
+            stats = (
+                self._record_dataset_stats(
+                    symbol,
+                    samples,
+                    "SINGLE_TF_CAUSAL",
+                )
+            )
+
+            self.save_patterns()
+
+            return stats
+
+        except Exception as exc:
+
+            self.logger.exception(
+                (
+                    "Single-TF shadow "
+                    "dataset failed: %s"
+                ),
+                exc,
+            )
+
+            result = {
+                "source": (
+                    "SINGLE_TF_CAUSAL"
+                ),
+
+                "status": (
+                    "FAILED_CLOSED"
+                ),
+
+                "reason": (
+                    f"{type(exc).__name__}:"
+                    f"{exc}"
+                ),
+
+                "production_mutation": (
+                    False
+                ),
+            }
+
+            self.training_stats[
+                symbol
+            ] = result
+
+            self._last_training_result = (
+                dict(
+                    result
+                )
+            )
+
+            return result
+
+    def train_multi_strategy(
+        self,
+        symbol: str = "XAUUSDm",
+        dfs: Optional[
+            Dict[
+                str,
+                Any,
+            ]
+        ] = None,
+    ) -> Dict[
+        str,
+        Any,
+    ]:
         """
-        Executes thread-safe optimization epochs without blocking active execution threads
+        Legacy multi-strategy historical replay is intentionally disabled.
+
+        THIS DOES NOT DISABLE LIVE STRATEGIES.
+
+        It disables only the old historical training shortcut which:
+            - sliced HTF frames by open timestamp
+            - evaluated strategies on potentially open HTF candles
+            - manually resolved future SL/TP
+            - trained production probability directly
+
+        A later replay implementation must produce CandidateSetup objects
+        and send them through the exact causal OutcomeResolver.
         """
+
+        result = {
+            "source": (
+                "MULTI_STRATEGY"
+            ),
+
+            "status": (
+                "SHADOW_MULTI_STRATEGY_"
+                "REPLAY_NOT_IMPLEMENTED"
+            ),
+
+            "reason": (
+                "REQUIRES_CAUSAL_"
+                "CANDIDATE_REPLAY_WITH_"
+                "CLOSED_BAR_AVAILABILITY_"
+                "AND_OUTCOME_RESOLVER"
+            ),
+
+            "production_mutation": (
+                False
+            ),
+
+            "symbol": (
+                symbol
+            ),
+        }
+
+        self.training_stats[
+            symbol
+        ] = result
+
+        self._last_training_result = (
+            dict(
+                result
+            )
+        )
+
+        self.logger.warning(
+            (
+                "Unsafe legacy "
+                "multi-strategy "
+                "auto-training "
+                "disabled for %s."
+            ),
+            symbol,
+        )
+
+        return result
+
+    def train_on_synthetic_idealized_patterns(
+        self,
+        symbol: str,
+        n_samples_per_pattern: int = 500,
+    ) -> Dict[
+        str,
+        Any,
+    ]:
+        """
+        Synthetic labels are RESEARCH ONLY.
+
+        No fabricated synthetic win/loss is ever fitted into
+        production confidence.
+        """
+
+        result = {
+            "source": (
+                "SYNTHETIC_IDEALIZED"
+            ),
+
+            "status": (
+                "RESEARCH_ONLY"
+            ),
+
+            "symbol": (
+                symbol
+            ),
+
+            "requested_samples_per_pattern": int(
+                n_samples_per_pattern
+            ),
+
+            "samples_applied_to_production": (
+                0
+            ),
+
+            "production_mutation": (
+                False
+            ),
+        }
+
+        self._last_training_result = (
+            dict(
+                result
+            )
+        )
+
+        self.logger.info(
+            (
+                "Synthetic pattern "
+                "generation retained "
+                "as RESEARCH_ONLY "
+                "for %s."
+            ),
+            symbol,
+        )
+
+        return result
+
+    # =========================================================================
+    # SHADOW TRAINING
+    # =========================================================================
+
+    def train_timeframe_layer(
+        self,
+        model: nn.Module,
+        timeframe_data: pd.DataFrame,
+    ) -> None:
+        """
+        Train a caller-owned challenger.
+
+        TRAIN split only.
+        """
+
         try:
-            # 1. Localize features extraction to separate thread memory allocations
-            features, outcomes = self.extract_vectorized_features(timeframe_data)
-            if len(features) == 0:
+            (
+                features,
+                outcomes,
+            ) = (
+                self.extract_vectorized_features(
+                    timeframe_data,
+                    split="train",
+                )
+            )
+
+            if len(
+                features
+            ) < 30:
+
+                self.logger.warning(
+                    (
+                        "Shadow timeframe "
+                        "training skipped: "
+                        "only %d causal "
+                        "train samples."
+                    ),
+                    len(
+                        features
+                    ),
+                )
+
                 return
 
-            # 2. Train local model states safely using isolated torch gradients
-            model.train() 
-            local_optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
-            loss_function = torch.nn.BCELoss()
+            model.train()
 
-            loss = None
-            for epoch in range(3):
-                local_optimizer.zero_grad()
-                predictions = model(features)
-                loss = loss_function(predictions, outcomes)
+            optimizer = (
+                torch.optim.AdamW(
+                    model.parameters(),
+                    lr=0.001,
+                    weight_decay=1e-4,
+                )
+            )
+
+            loss_function = (
+                nn.BCELoss()
+            )
+
+            for _ in range(
+                3
+            ):
+                optimizer.zero_grad()
+
+                predictions = (
+                    model(
+                        features
+                    )
+                )
+
+                loss = (
+                    loss_function(
+                        predictions,
+                        outcomes,
+                    )
+                )
+
                 loss.backward()
-                local_optimizer.step()
 
-            # 3. Re-freeze layers for lightning-fast inference before worker termination
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=5.0,
+                )
+
+                optimizer.step()
+
             model.eval()
-            if loss is not None:
-                self.logger.info(f"✅ Trained timeframe layer successfully. Samples: {len(features)}. Final Loss: {loss.item():.4f}")
-        except Exception as e:
-            self.logger.error(f"Error in train_timeframe_layer: {e}")
+
+            with self._shadow_lock:
+
+                self._last_shadow_candidate = (
+                    model
+                )
+
+            self.logger.info(
+                (
+                    "Shadow timeframe "
+                    "layer trained on "
+                    "%d causal TRAIN "
+                    "samples."
+                ),
+                len(
+                    features
+                ),
+            )
+
+        except Exception as exc:
+
+            self.logger.exception(
+                (
+                    "Shadow timeframe "
+                    "training failed: %s"
+                ),
+                exc,
+            )
+
             if model is not None:
                 model.eval()
 
-    def extract_vectorized_features(self, timeframe_data: pd.DataFrame) -> Tuple[torch.Tensor, torch.Tensor]:
+    def train_incremental(
+        self,
+        trades: List[
+            Dict[
+                str,
+                Any,
+            ]
+        ],
+    ):
         """
-        Extracts features and target outcomes from timeframe data for PyTorch neural network training.
+        Closed-trade incremental learning.
+
+        Creates a shadow challenger only.
+
+        It does not validate on its training rows.
+        It does not swap the live champion.
         """
+
+        if not trades:
+            return None
+
+        rows = sorted(
+            list(
+                trades
+            ),
+            key=lambda row: str(
+                row.get(
+                    "close_time_utc",
+                    row.get(
+                        "timestamp",
+                        "",
+                    ),
+                )
+            ),
+        )
+
+        inputs: List[
+            np.ndarray
+        ] = []
+
+        targets: List[
+            List[
+                float
+            ]
+        ] = []
+
+        for row in rows:
+
+            features = row.get(
+                "features",
+                {},
+            )
+
+            if not isinstance(
+                features,
+                Mapping,
+            ):
+                continue
+
+            try:
+                vector = (
+                    self.extract_nn_features(
+                        dict(
+                            features
+                        )
+                    )
+                )
+
+            except ValueError:
+                continue
+
+            realized_r = (
+                self._finite(
+                    row.get(
+                        "net_r",
+                        row.get(
+                            "r_multiple",
+                            row.get(
+                                "pnl",
+                                None,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+            if realized_r is None:
+                continue
+
+            inputs.append(
+                vector
+            )
+
+            targets.append(
+                [
+                    (
+                        1.0
+                        if realized_r
+                        > 0.0
+                        else 0.0
+                    )
+                ]
+            )
+
+        if len(
+            inputs
+        ) < 30:
+
+            self.logger.warning(
+                (
+                    "Incremental shadow "
+                    "training skipped: "
+                    "%d usable rows."
+                ),
+                len(
+                    inputs
+                ),
+            )
+
+            return None
+
+        # Reserve last 20%.
+        # This training call never sees those rows.
+        train_end = max(
+            1,
+            int(
+                len(
+                    inputs
+                )
+                * 0.80
+            ),
+        )
+
+        train_inputs = torch.tensor(
+            np.asarray(
+                inputs[
+                    :train_end
+                ],
+                dtype=np.float32,
+            ),
+            dtype=torch.float32,
+        )
+
+        train_targets = torch.tensor(
+            np.asarray(
+                targets[
+                    :train_end
+                ],
+                dtype=np.float32,
+            ),
+            dtype=torch.float32,
+        )
+
+        candidate = copy.deepcopy(
+            self.nn_model
+        )
+
+        candidate.train()
+
+        optimizer = (
+            optim.Adam(
+                candidate.parameters(),
+                lr=0.001,
+                weight_decay=1e-4,
+            )
+        )
+
+        optimizer.zero_grad()
+
+        outputs = candidate(
+            train_inputs
+        )
+
+        loss = (
+            self.nn_criterion(
+                outputs,
+                train_targets,
+            )
+        )
+
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            candidate.parameters(),
+            max_norm=5.0,
+        )
+
+        optimizer.step()
+
+        candidate.eval()
+
+        with self._shadow_lock:
+
+            self._last_shadow_candidate = (
+                candidate
+            )
+
+            self._last_training_result = {
+                "source": (
+                    "INCREMENTAL_"
+                    "CLOSED_TRADES"
+                ),
+
+                "status": (
+                    "SHADOW_CANDIDATE_READY"
+                ),
+
+                "train_samples": (
+                    train_end
+                ),
+
+                "reserved_samples": (
+                    len(
+                        inputs
+                    )
+                    - train_end
+                ),
+
+                "production_mutation": (
+                    False
+                ),
+
+                "loss": float(
+                    loss.item()
+                ),
+            }
+
+        return candidate
+
+    def get_last_shadow_candidate(
+        self,
+    ):
+        with self._shadow_lock:
+            return (
+                self._last_shadow_candidate
+            )
+
+    def consume_shadow_candidate(
+        self,
+    ):
+        with self._shadow_lock:
+
+            candidate = (
+                self._last_shadow_candidate
+            )
+
+            self._last_shadow_candidate = (
+                None
+            )
+
+            return candidate
+
+    def get_last_causal_dataset(
+        self,
+    ) -> Dict[
+        str,
+        Any,
+    ]:
+
+        with self._shadow_lock:
+            return dict(
+                self._last_causal_dataset
+            )
+
+    def get_last_training_result(
+        self,
+    ) -> Dict[
+        str,
+        Any,
+    ]:
+
+        return dict(
+            self._last_training_result
+        )
+
+    # =========================================================================
+    # LEGACY PROMOTION APIs - BLOCKED
+    # =========================================================================
+
+    def _validate_and_promote(
+        self,
+        candidate_model,
+        inputs_tensor=None,
+        targets_tensor=None,
+    ) -> bool:
+        """
+        Compatibility shim.
+
+        PatternLearner no longer has promotion authority.
+        """
+
+        self.logger.error(
+            (
+                "_validate_and_promote "
+                "is disabled. Use frozen "
+                "PromotionValidator + "
+                "walk-forward + "
+                "ModelRegistry authorization."
+            )
+        )
+
+        return False
+
+    def save_nn_model(
+        self,
+    ) -> bool:
+        """
+        Compatibility shim.
+
+        An active registry model is immutable.
+        PatternLearner cannot overwrite it.
+        """
+
+        self.logger.error(
+            (
+                "Direct save_nn_model "
+                "blocked. Save challenger "
+                "to a VERSIONED path and "
+                "promote through ModelRegistry."
+            )
+        )
+
+        return False
+
+    # =========================================================================
+    # ACTIVE CHAMPION
+    # =========================================================================
+
+    def load_nn_model(
+        self,
+    ) -> bool:
+        """
+        Load ONLY active ModelRegistry champion.
+        """
+
+        self.nn_ready = False
+
+        self.active_model_version = (
+            None
+        )
+
         try:
-            if timeframe_data is None or len(timeframe_data) < 20:
-                return torch.empty(0), torch.empty(0)
-                
-            from utils.smc_indicators import SMCIndicators
-            from utils.settings_manager import settings_manager
-            
-            swing_window = settings_manager.get("smc_swing_window", 3)
-            df_feat = SMCIndicators.compute_smc_features(timeframe_data, window=swing_window)
-            
-            inputs = []
-            targets = []
-            
-            n = len(df_feat)
-            closes = df_feat['close'].values
-            highs = df_feat['high'].values
-            lows = df_feat['low'].values
-            biases = df_feat['active_bias'].values if 'active_bias' in df_feat.columns else np.zeros(n)
-            sweeps = df_feat['liq_sweep_type'].values if 'liq_sweep_type' in df_feat.columns else np.zeros(n)
-            mss_signals = df_feat['mss_signal'].values if 'mss_signal' in df_feat.columns else np.zeros(n)
-            atrs = df_feat['atr'].values if 'atr' in df_feat.columns else np.zeros(n)
-            volatilities = df_feat['volatility'].values if 'volatility' in df_feat.columns else np.zeros(n)
-            supports = df_feat['support'].values if 'support' in df_feat.columns else np.zeros(n)
-            resistances = df_feat['resistance'].values if 'resistance' in df_feat.columns else np.zeros(n)
-            fvg_classes = df_feat['fvg_class'].values if 'fvg_class' in df_feat.columns else np.zeros(n)
-            timestamps = df_feat.index.view(np.int64) // 10**9 if isinstance(df_feat.index, pd.DatetimeIndex) else np.zeros(n)
-            ob_reaction_signals = df_feat['ob_reaction_signal'].values if 'ob_reaction_signal' in df_feat.columns else np.zeros(n)
-            sr_reaction_signals = df_feat['sr_reaction_signal'].values if 'sr_reaction_signal' in df_feat.columns else np.zeros(n)
-            retest_pullback_signals = df_feat['retest_pullback_signal'].values if 'retest_pullback_signal' in df_feat.columns else np.zeros(n)
-            trend_shift_signals = df_feat['trend_shift_signal'].values if 'trend_shift_signal' in df_feat.columns else np.zeros(n)
-            
-            for i in range(10, n - 10):
-                bias = biases[i]
-                # Context sweep
-                sweep = 0
-                for k in range(i, max(-1, i - 10), -1):
-                    if sweeps[k] != 0:
-                        sweep = int(sweeps[k])
-                        break
-                # MSS signal
-                mss = 0
-                for k in range(i, max(-1, i - 5), -1):
-                    if mss_signals[k] != 0:
-                        mss = int(mss_signals[k])
-                        break
-                
-                entry_price = closes[i]
-                atr_val = atrs[i]
-                support_val = supports[i]
-                resistance_val = resistances[i]
-                volatility_val = volatilities[i]
-                fvg_class_val = fvg_classes[i]
-                
-                action = None
-                sl_price = 0.0
-                tp_price = 0.0
-                
-                is_bullish = (bias == 1) and (sweep == 1 or mss == 1)
-                is_bearish = (bias == -1) and (sweep == -1 or mss == -1)
-                
-                # Range-bounce setups: bias == 0 but a sweep or MSS provides direction
-                # These are mean-reversion setups at range boundaries
-                if not is_bullish and not is_bearish and bias == 0:
-                    if sweep == 1 or mss == 1:
-                        is_bullish = True   # swept low in neutral market → mean-reversion buy
-                    elif sweep == -1 or mss == -1:
-                        is_bearish = True   # swept high in neutral market → mean-reversion sell
-                
-                if is_bullish:
-                    action = "BUY"
-                    sl_price = support_val - (1.5 * atr_val)
-                    tp_price = entry_price + 1.5 * (entry_price - sl_price)
-                elif is_bearish:
-                    action = "SELL"
-                    sl_price = resistance_val + (1.5 * atr_val)
-                    tp_price = entry_price - 1.5 * (sl_price - entry_price)
-                    
-                if action is None:
-                    continue
-                    
-                pnl = 0.0
-                resolved = False
-                max_lookahead = min(n, i + 100)
-                for j in range(i + 1, max_lookahead):
-                    future_low = lows[j]
-                    future_high = highs[j]
-                    if action == "BUY":
-                        if future_low <= sl_price:
-                            pnl = -1.0
-                            resolved = True
-                            break
-                        elif future_high >= tp_price:
-                            pnl = 1.5
-                            resolved = True
-                            break
-                    elif action == "SELL":
-                        if future_high >= sl_price:
-                            pnl = -1.0
-                            resolved = True
-                            break
-                        elif future_low <= tp_price:
-                            pnl = 1.5
-                            resolved = True
-                            break
-                
-                if resolved:
-                    features_dict = {
-                        'active_bias': bias,
-                        'liq_sweep_type': sweep,
-                        'mss_signal': mss,
-                        'fvg_class': fvg_class_val,
-                        'volatility': volatility_val,
-                        'atr_pct': atr_val / (entry_price + 1e-9),
-                        'rvol': 1.0,
-                        'buy_pressure': 50.0,
-                        'sell_pressure': 50.0,
-                        'ob_reaction_signal': ob_reaction_signals[i],
-                        'sr_reaction_signal': sr_reaction_signals[i],
-                        'retest_pullback_signal': retest_pullback_signals[i],
-                        'trend_shift_signal': trend_shift_signals[i],
-                        'timestamp': timestamps[i]
-                    }
-                    feat_arr = self.extract_nn_features(features_dict)
-                    inputs.append(feat_arr)
-                    targets.append([1.0 if pnl > 0 else 0.0])
-                    
-            if not inputs:
-                return torch.empty(0), torch.empty(0)
-                
-            features_tensor = torch.tensor(np.array(inputs, dtype=np.float32))
-            outcomes_tensor = torch.tensor(np.array(targets, dtype=np.float32))
-            return features_tensor, outcomes_tensor
-        except Exception as e:
-            self.logger.error(f"Error in extract_vectorized_features: {e}")
-            return torch.empty(0), torch.empty(0)
+            from core.model_registry import (
+                model_registry,
+            )
+
+            bundle = (
+                model_registry
+                .get_active_bundle()
+            )
+
+            if bundle is None:
+
+                self.logger.warning(
+                    (
+                        "No validated active "
+                        "model bundle. "
+                        "NN inference disabled."
+                    )
+                )
+
+                return False
+
+            if (
+                bundle.feature_schema_hash
+                != FeatureExtractor
+                .FEATURE_SCHEMA_HASH
+            ):
+
+                self.logger.error(
+                    (
+                        "Active model schema "
+                        "mismatch. "
+                        "NN inference disabled."
+                    )
+                )
+
+                return False
+
+            weights_path = str(
+                bundle.model_weights_path
+            )
+
+            if not os.path.isfile(
+                weights_path
+            ):
+
+                self.logger.error(
+                    (
+                        "Active model "
+                        "weights missing: %s"
+                    ),
+                    weights_path,
+                )
+
+                return False
+
+            try:
+                state_dict = torch.load(
+                    weights_path,
+                    map_location=(
+                        torch.device(
+                            "cpu"
+                        )
+                    ),
+                    weights_only=True,
+                )
+
+            except TypeError:
+
+                state_dict = torch.load(
+                    weights_path,
+                    map_location=(
+                        torch.device(
+                            "cpu"
+                        )
+                    ),
+                )
+
+            candidate = (
+                PulseViperNeuralNet(
+                    input_dim=len(
+                        FeatureExtractor
+                        .FEATURE_NAMES
+                    )
+                )
+            )
+
+            candidate.load_state_dict(
+                state_dict
+            )
+
+            candidate.eval()
+
+            test_input = torch.zeros(
+                (
+                    1,
+                    len(
+                        FeatureExtractor
+                        .FEATURE_NAMES
+                    ),
+                ),
+                dtype=torch.float32,
+            )
+
+            with torch.no_grad():
+
+                output = candidate(
+                    test_input
+                )
+
+            value = float(
+                output.reshape(
+                    -1
+                )[
+                    0
+                ].item()
+            )
+
+            if (
+                not math.isfinite(
+                    value
+                )
+                or not (
+                    0.0
+                    <= value
+                    <= 1.0
+                )
+            ):
+
+                self.logger.error(
+                    (
+                        "Active model failed "
+                        "inference sanity check."
+                    )
+                )
+
+                return False
+
+            with self.model_lock:
+
+                self.nn_model = (
+                    candidate
+                )
+
+                self.nn_optimizer = (
+                    optim.Adam(
+                        self.nn_model.parameters(),
+                        lr=0.003,
+                        weight_decay=1e-4,
+                    )
+                )
+
+                self.nn_ready = (
+                    True
+                )
+
+                self.active_model_version = (
+                    bundle.model_version
+                )
+
+            self.logger.info(
+                (
+                    "Loaded validated "
+                    "NN champion "
+                    "version=%s."
+                ),
+                bundle.model_version,
+            )
+
+            return True
+
+        except Exception as exc:
+
+            self.logger.exception(
+                (
+                    "Active NN champion "
+                    "load failed closed: %s"
+                ),
+                exc,
+            )
+
+            self.nn_ready = (
+                False
+            )
+
+            self.active_model_version = (
+                None
+            )
+
+            return False
+
+    # =========================================================================
+    # INFERENCE
+    # =========================================================================
+
+    def get_trading_signal(
+        self,
+        symbol: str,
+        current_features: Dict,
+        df_ltf: Optional[
+            pd.DataFrame
+        ] = None,
+        df_m5: Optional[
+            pd.DataFrame
+        ] = None,
+        df_h1: Optional[
+            pd.DataFrame
+        ] = None,
+        candidate_strategy: Optional[
+            str
+        ] = None,
+        candidate_action: Optional[
+            str
+        ] = None,
+    ) -> Dict[
+        str,
+        Any,
+    ]:
+
+        visual_patterns = (
+            self.detect_visual_patterns(
+                df_ltf
+            )
+            if df_ltf
+            is not None
+            else []
+        )
+
+        smc_patterns: Dict[
+            str,
+            Dict[
+                str,
+                Any,
+            ],
+        ] = {}
+
+        smc_found: List[
+            str
+        ] = []
+
+        smc_confidence = (
+            0.0
+        )
+
+        smc_direction: Optional[
+            str
+        ] = None
+
+        if df_ltf is not None:
+
+            smc_patterns = (
+                ChartPatternDetector
+                .detect(
+                    df_m1=(
+                        df_ltf
+                    ),
+                    df_m5=(
+                        df_m5
+                    ),
+                    df_h1=(
+                        df_h1
+                    ),
+                )
+            )
+
+            (
+                smc_found,
+                smc_confidence,
+                smc_direction,
+            ) = (
+                ChartPatternDetector
+                .get_summary(
+                    smc_patterns
+                )
+            )
+
+        all_patterns = sorted(
+            set(
+                visual_patterns
+                + smc_found
+            )
+        )
+
+        volatility = float(
+            current_features.get(
+                "volatility",
+                0.0,
+            )
+            or 0.0
+        )
+
+        price = float(
+            current_features.get(
+                "price",
+                current_features.get(
+                    "close",
+                    0.0,
+                ),
+            )
+            or 0.0
+        )
+
+        support = float(
+            current_features.get(
+                "support",
+                price,
+            )
+            or price
+        )
+
+        atr_pct = float(
+            current_features.get(
+                "atr_pct",
+                0.0,
+            )
+            or 0.0
+        )
+
+        cluster_id = (
+            self.kmeans.predict(
+                np.asarray(
+                    [
+                        volatility,
+
+                        (
+                            abs(
+                                price
+                                - support
+                            )
+                            / max(
+                                abs(
+                                    price
+                                ),
+                                1e-12,
+                            )
+                        ),
+
+                        atr_pct,
+                    ],
+                    dtype=float,
+                )
+            )
+        )
+
+        features_copy = (
+            copy.deepcopy(
+                current_features
+            )
+        )
+
+        if candidate_strategy is not None:
+
+            features_copy[
+                "candidate_strategy"
+            ] = (
+                str(
+                    candidate_strategy
+                )
+                .upper()
+            )
+
+        if candidate_action is not None:
+
+            features_copy[
+                "candidate_action"
+            ] = (
+                str(
+                    candidate_action
+                )
+                .upper()
+            )
+
+        win_prob: Optional[
+            float
+        ] = None
+
+        model_source = (
+            "NO_VALID_MODEL"
+        )
+
+        # -------------------------------------------------------------
+        # NO NAIVE BAYES FALLBACK
+        #
+        # If there is no validated champion, AI confidence is unavailable.
+        # We do not invent or silently substitute an unvalidated model.
+        # -------------------------------------------------------------
+
+        if self.nn_ready:
+
+            try:
+                vector = (
+                    self.extract_nn_features(
+                        features_copy
+                    )
+                )
+
+                tensor = torch.tensor(
+                    vector,
+                    dtype=torch.float32,
+                ).unsqueeze(
+                    0
+                )
+
+                with self.model_lock:
+
+                    self.nn_model.eval()
+
+                    with torch.no_grad():
+
+                        value = (
+                            self.nn_model(
+                                tensor
+                            )
+                        )
+
+                win_prob = float(
+                    value.reshape(
+                        -1
+                    )[
+                        0
+                    ].item()
+                )
+
+                if (
+                    not math.isfinite(
+                        win_prob
+                    )
+                    or not (
+                        0.0
+                        <= win_prob
+                        <= 1.0
+                    )
+                ):
+
+                    win_prob = (
+                        None
+                    )
+
+                else:
+                    model_source = (
+                        "NN_CHAMPION"
+                    )
+
+            except Exception as exc:
+
+                self.logger.error(
+                    (
+                        "NN prediction "
+                        "failed closed: %s"
+                    ),
+                    exc,
+                )
+
+                win_prob = (
+                    None
+                )
+
+        signal_action = (
+            "HOLD"
+        )
+
+        adjustment = (
+            0.0
+        )
+
+        if (
+            win_prob is not None
+            and win_prob >= 0.58
+        ):
+
+            if (
+                candidate_action
+                is not None
+                and str(
+                    candidate_action
+                ).upper()
+                in {
+                    "BUY",
+                    "SELL",
+                }
+            ):
+
+                signal_action = (
+                    str(
+                        candidate_action
+                    )
+                    .upper()
+                )
+
+            else:
+
+                bias = int(
+                    current_features.get(
+                        "active_bias",
+                        0,
+                    )
+                    or 0
+                )
+
+                if bias == 1:
+                    signal_action = (
+                        "BUY"
+                    )
+
+                elif bias == -1:
+                    signal_action = (
+                        "SELL"
+                    )
+
+            adjustment = (
+                (
+                    win_prob
+                    - 0.5
+                )
+                * 0.8
+            )
+
+        return {
+            "signal": (
+                signal_action
+            ),
+
+            "confidence": (
+                round(
+                    win_prob,
+                    4,
+                )
+                if win_prob
+                is not None
+                else None
+            ),
+
+            "adjustment": float(
+                adjustment
+            ),
+
+            "cluster_id": (
+                cluster_id
+            ),
+
+            "detected_patterns": (
+                all_patterns
+            ),
+
+            "smc_patterns": (
+                smc_found
+            ),
+
+            "smc_confidence": (
+                smc_confidence
+            ),
+
+            "smc_direction": (
+                smc_direction
+            ),
+
+            "pattern_details": {
+                key: value
+                for key, value
+                in smc_patterns.items()
+                if value.get(
+                    "detected"
+                )
+            },
+
+            "model_source": (
+                model_source
+            ),
+
+            "model_ready": bool(
+                self.nn_ready
+                and win_prob
+                is not None
+            ),
+
+            "model_version": (
+                self.active_model_version
+            ),
+        }
+
+    # =========================================================================
+    # REALIZED EXPERIENCE
+    # =========================================================================
+
+    def learn_from_trade(
+        self,
+        trade_data: Dict[
+            str,
+            Any,
+        ],
+    ) -> None:
+
+        symbol = str(
+            trade_data.get(
+                "symbol",
+                "UNKNOWN",
+            )
+        )
+
+        features = (
+            trade_data.get(
+                "features",
+                {},
+            )
+        )
+
+        if (
+            not isinstance(
+                features,
+                Mapping,
+            )
+            or not features
+        ):
+            return
+
+        outcome = (
+            self._finite(
+                trade_data.get(
+                    "net_r",
+                    trade_data.get(
+                        "r_multiple",
+                        trade_data.get(
+                            "outcome",
+                            trade_data.get(
+                                "pnl",
+                                None,
+                            ),
+                        ),
+                    ),
+                )
+            )
+        )
+
+        if outcome is None:
+            return
+
+        timestamp = str(
+            trade_data.get(
+                "close_time_utc",
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            )
+        )
+
+        record = {
+            "pattern": (
+                self._quantize_smc_state(
+                    dict(
+                        features
+                    )
+                )
+            ),
+
+            "outcome": float(
+                outcome
+            ),
+
+            "timestamp": (
+                timestamp
+            ),
+
+            "source": (
+                "REALIZED_TRADE"
+            ),
+        }
+
+        bucket = (
+            f"{symbol}_winning"
+            if outcome > 0.0
+            else f"{symbol}_losing"
+        )
+
+        with self._append_lock:
+
+            self.patterns[
+                bucket
+            ].append(
+                record
+            )
+
+            self.patterns[
+                bucket
+            ] = (
+                self.patterns[
+                    bucket
+                ][
+                    -500:
+                ]
+            )
+
+            self._update_market_regime(
+                symbol,
+                dict(
+                    features
+                ),
+            )
+
+            self.save_patterns()
+
+    def append_live_experience(
+        self,
+        features: dict,
+        outcome_label: float,
+        pnl_realized: float,
+        symbol: str,
+    ) -> None:
+
+        self.learn_from_trade(
+            {
+                "symbol": (
+                    symbol
+                ),
+
+                "features": (
+                    features
+                ),
+
+                "outcome": (
+                    pnl_realized
+                ),
+
+                "outcome_label": (
+                    outcome_label
+                ),
+
+                "close_time_utc": (
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                ),
+            }
+        )
+
+    # =========================================================================
+    # MARKET REGIME
+    # =========================================================================
+
+    def _update_market_regime(
+        self,
+        symbol: str,
+        features: Dict[
+            str,
+            Any,
+        ],
+    ) -> None:
+
+        bias = int(
+            features.get(
+                "active_bias",
+                0,
+            )
+            or 0
+        )
+
+        regime = (
+            "BULLISH"
+            if bias == 1
+            else (
+                "BEARISH"
+                if bias == -1
+                else "SIDEWAY"
+            )
+        )
+
+        self.market_regimes[
+            symbol
+        ] = {
+            "regime": (
+                regime
+            ),
+
+            "timestamp": (
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+            ),
+
+            "volatility": float(
+                features.get(
+                    "volatility",
+                    0.0,
+                )
+                or 0.0
+            ),
+
+            "atr_pct": float(
+                features.get(
+                    "atr_pct",
+                    0.0,
+                )
+                or 0.0
+            ),
+        }
+
+    def get_market_regime(
+        self,
+        symbol: str,
+    ) -> str:
+
+        return str(
+            self.market_regimes.get(
+                symbol,
+                {},
+            ).get(
+                "regime",
+                "RANGING",
+            )
+        )
+
+    # =========================================================================
+    # NON-PRODUCTION MEMORY PERSISTENCE
+    # =========================================================================
+
+    def save_patterns(
+        self,
+    ) -> None:
+
+        try:
+            os.makedirs(
+                "data",
+                exist_ok=True,
+            )
+
+            path = (
+                "data/smc_patterns.json"
+            )
+
+            temp_path = (
+                path
+                + ".tmp"
+            )
+
+            data = {
+                "schema_version": (
+                    2
+                ),
+
+                "patterns": dict(
+                    self.patterns
+                ),
+
+                "market_regimes": (
+                    self.market_regimes
+                ),
+
+                "kmeans_centroids": (
+                    self.kmeans
+                    .centroids
+                    .tolist()
+                    if isinstance(
+                        self.kmeans.centroids,
+                        np.ndarray,
+                    )
+                    else []
+                ),
+
+                "training_stats": (
+                    self.training_stats
+                ),
+
+                "naive_bayes_production_enabled": (
+                    False
+                ),
+            }
+
+            with open(
+                temp_path,
+                "w",
+                encoding="utf-8",
+            ) as handle:
+
+                json.dump(
+                    data,
+                    handle,
+                    indent=2,
+                    allow_nan=False,
+                )
+
+                handle.flush()
+
+                try:
+                    os.fsync(
+                        handle.fileno()
+                    )
+
+                except OSError:
+                    pass
+
+            os.replace(
+                temp_path,
+                path,
+            )
+
+        except Exception as exc:
+
+            self.logger.error(
+                (
+                    "Failed to save "
+                    "pattern memory: %s"
+                ),
+                exc,
+            )
+
+    def load_patterns(
+        self,
+    ) -> None:
+
+        path = (
+            "data/smc_patterns.json"
+        )
+
+        if not os.path.exists(
+            path
+        ):
+            return
+
+        try:
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+            ) as handle:
+
+                data = json.load(
+                    handle
+                )
+
+            self.patterns = (
+                defaultdict(
+                    list
+                )
+            )
+
+            for key, rows in data.get(
+                "patterns",
+                {},
+            ).items():
+
+                if isinstance(
+                    rows,
+                    list,
+                ):
+
+                    self.patterns[
+                        str(
+                            key
+                        )
+                    ] = rows[
+                        -500:
+                    ]
+
+            regimes = data.get(
+                "market_regimes",
+                {},
+            )
+
+            self.market_regimes = (
+                dict(
+                    regimes
+                )
+                if isinstance(
+                    regimes,
+                    Mapping,
+                )
+                else {}
+            )
+
+            stats = data.get(
+                "training_stats",
+                {},
+            )
+
+            self.training_stats = (
+                dict(
+                    stats
+                )
+                if isinstance(
+                    stats,
+                    Mapping,
+                )
+                else {}
+            )
+
+            centroids = data.get(
+                "kmeans_centroids",
+                [],
+            )
+
+            if (
+                isinstance(
+                    centroids,
+                    list,
+                )
+                and centroids
+            ):
+
+                arr = np.asarray(
+                    centroids,
+                    dtype=float,
+                )
+
+                if (
+                    arr.ndim == 2
+                    and np.isfinite(
+                        arr
+                    ).all()
+                ):
+
+                    self.kmeans.centroids = (
+                        arr
+                    )
+
+            # Critical:
+            #
+            # Do not restore old Naive Bayes parameters trained from
+            # synthetic/leaky historical labels.
+            self.classifier = (
+                NaiveBayesClassifier()
+            )
+
+        except Exception as exc:
+
+            self.logger.warning(
+                (
+                    "Failed to load "
+                    "pattern memory: %s"
+                ),
+                exc,
+            )
+
+    # =========================================================================
+    # STATUS
+    # =========================================================================
+
+    def get_training_stats(
+        self,
+        symbol: Optional[
+            str
+        ] = None,
+    ) -> Dict[
+        str,
+        Any,
+    ]:
+
+        if symbol is None:
+
+            return copy.deepcopy(
+                self.training_stats
+            )
+
+        return copy.deepcopy(
+            self.training_stats.get(
+                symbol,
+                {},
+            )
+        )
+
+    def get_model_status(
+        self,
+    ) -> Dict[
+        str,
+        Any,
+    ]:
+
+        return {
+            "nn_ready": bool(
+                self.nn_ready
+            ),
+
+            "nb_ready": (
+                False
+            ),
+
+            "active_model_version": (
+                self.active_model_version
+            ),
+
+            "feature_schema_hash": (
+                FeatureExtractor
+                .FEATURE_SCHEMA_HASH
+            ),
+
+            "shadow_candidate_ready": (
+                self.get_last_shadow_candidate()
+                is not None
+            ),
+
+            "promotion_inside_pattern_learner": (
+                False
+            ),
+        }

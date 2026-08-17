@@ -1,45 +1,111 @@
+# ============================================================
+# Python
+# ============================================================
+
 venv/
+.venv/
+
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.coverage
+.coverage.*
+htmlcov/
+
+
+# ============================================================
+# Runtime state
+# ============================================================
+
 logs/
-data/*.csv
-models/
-*.pt
-.env
+*.log
 
-# PyInstaller build files
-build/
-dist/
-*.spec
-
-# Caches and DBs
-data/trade_history.db
-data/experience_memory.pkl
-data/*.db
-data/*.pkl
-configs/sentiment_cache.json
-
-# Sensitive & Local Data Files
 data/
-*.bak
-*.pkl
-*.db
+models/
 scratch/
-Books/
 
-# Sensitive Config Files
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+
+*.pt
+*.pth
+*.ckpt
+
+
+# ============================================================
+# Operator-local configuration/state
+# ============================================================
+
 configs/settings.json
 configs/settings_audit.json
 configs/sentiment_cache.json
 
-# API Keys & Credentials
-.env
-.env.local
-.env.*.local
+configs/news_schedule.json
+configs/model_registry.json
 
-# IDE
+
+# ============================================================
+# Secrets / environment
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+*.pem
+*.key
+*.p12
+*.pfx
+
+
+# ============================================================
+# Local research/reference material
+# ============================================================
+
+Books/
+
+
+# ============================================================
+# IDE / editor
+# ============================================================
+
 .vscode/
 .idea/
+
 *.swp
 *.swo
+*~
 
+
+# ============================================================
+# Build artifacts
+# ============================================================
+
+build/
+dist/
+*.spec
+
+
+# ============================================================
+# OS junk
+# ============================================================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# ============================================================
+# Temporary files
+# ============================================================
+
+*.tmp
+*.temp
+*.bak

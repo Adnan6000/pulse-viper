@@ -1,261 +1,1212 @@
-# core/news_schedule.py
-"""
-Manual Weekly News Schedule System
-===================================
-Allows the user to define a fixed weekly timetable of high-impact news events.
-Only USD high-impact events block trading.
-This runs ALONGSIDE the ForexFactory live calendar as a fallback and override.
+from __future__ import annotations
 
-Schedule is stored in: configs/news_schedule.json
-Format:
-  [
-    { "day": "Monday",   "time_utc": "14:30", "name": "USD ISM Manufacturing PMI",  "duration_mins": 30 },
-    { "day": "Tuesday",  "time_utc": "14:30", "name": "USD JOLTS Job Openings",      "duration_mins": 30 },
-    ...
-  ]
-
-day: Monday-Friday (or "Daily" for every day)
-time_utc: HH:MM in UTC
-duration_mins: How many minutes to block BEFORE AND AFTER the event (default 30 pre, 15 post)
-"""
-
+import copy
 import json
-import os
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Tuple, Optional
+import os
+import re
+import threading
+
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 
-# ── Default high-impact USD weekly schedule ──────────────────────────────────
-# These are the most impactful USD events that reliably move Gold/Forex
-DEFAULT_SCHEDULE: List[Dict] = [
-    # Monday
-    {"day": "Monday",    "time_utc": "14:00", "name": "USD ISM Manufacturing PMI",        "duration_mins": 5},
+SCHEDULE_FILE = (
+    "configs/news_schedule.json"
+)
 
-    # Tuesday
-    {"day": "Tuesday",   "time_utc": "14:30", "name": "USD JOLTS Job Openings",            "duration_mins": 5},
-    {"day": "Tuesday",   "time_utc": "19:00", "name": "FOMC Member Speech",                "duration_mins": 5},
+# No invented weekly macro timetable.
+DEFAULT_SCHEDULE: List[
+    Dict[
+        str,
+        Any,
+    ]
+] = []
 
-    # Wednesday
-    {"day": "Wednesday", "time_utc": "14:15", "name": "USD ADP Non-Farm Employment",       "duration_mins": 5},
-    {"day": "Wednesday", "time_utc": "14:30", "name": "USD Trade Balance",                 "duration_mins": 5},
-    {"day": "Wednesday", "time_utc": "15:00", "name": "USD ISM Non-Manufacturing PMI",     "duration_mins": 5},
-    {"day": "Wednesday", "time_utc": "18:00", "name": "FOMC Rate Decision",                "duration_mins": 5},
-    {"day": "Wednesday", "time_utc": "18:30", "name": "FOMC Press Conference",             "duration_mins": 5},
+DAYS = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
 
-    # Thursday
-    {"day": "Thursday",  "time_utc": "14:30", "name": "USD Initial Jobless Claims",        "duration_mins": 5},
-    {"day": "Thursday",  "time_utc": "14:30", "name": "USD PPI MoM",                       "duration_mins": 5},
-
-    # Friday
-    {"day": "Friday",    "time_utc": "14:30", "name": "USD Non-Farm Payrolls (NFP)",       "duration_mins": 5},
-    {"day": "Friday",    "time_utc": "14:30", "name": "USD Average Hourly Earnings MoM",   "duration_mins": 5},
-    {"day": "Friday",    "time_utc": "14:30", "name": "USD Unemployment Rate",             "duration_mins": 5},
-    {"day": "Friday",    "time_utc": "16:00", "name": "USD Michigan Consumer Sentiment",   "duration_mins": 5},
-]
-
-SCHEDULE_FILE = "configs/news_schedule.json"
 DAYS_MAP = {
-    "Monday": 0, "Tuesday": 1, "Wednesday": 2,
-    "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6
+    day: index
+    for index, day
+    in enumerate(
+        DAYS
+    )
 }
 
 
 class NewsScheduleManager:
     """
-    Manages a user-defined weekly news blackout timetable.
-    Blocks trading X minutes before and Y minutes after each event.
+    Explicit operator-maintained manual news schedule.
+
+    Manual schedule can contain/display any events.
+
+    But execution blocking still requires:
+
+        currency == USD
+        impact == HIGH
+
+    NewsIntelligenceEngine checks this schedule only when:
+
+        use_manual_news_schedule == True
     """
-    def __init__(self, schedule_file: str = SCHEDULE_FILE):
-        self.schedule_file = schedule_file
-        self.logger = logging.getLogger("PulseViper.NewsSchedule")
-        self.schedule: List[Dict] = []
+
+    def __init__(
+        self,
+        schedule_file: str = (
+            SCHEDULE_FILE
+        ),
+    ):
+        self.schedule_file = (
+            schedule_file
+        )
+
+        self.logger = logging.getLogger(
+            "PulseViper.NewsSchedule"
+        )
+
+        self.schedule: List[
+            Dict[
+                str,
+                Any,
+            ]
+        ] = []
+
+        self._lock = (
+            threading.RLock()
+        )
+
         self._load()
 
-    def _load(self):
-        """Load schedule from file, or create default."""
-        if os.path.exists(self.schedule_file):
-            try:
-                with open(self.schedule_file, "r") as f:
-                    self.schedule = json.load(f)
-                
-                # Auto-migrate: convert any old 20/30/60 min default durations to 5 mins
-                migrated = False
-                for ev in self.schedule:
-                    if ev.get("duration_mins", 30) in [30, 20, 60]:
-                        ev["duration_mins"] = 5
-                        migrated = True
-                if migrated:
-                    self._save()
-                    self.logger.info("Migrated old weekly schedule events to 5-minute durations")
-                
-                self.logger.info(f"News schedule loaded: {len(self.schedule)} events")
-            except Exception as e:
-                self.logger.error(f"Failed to load news schedule: {e}. Using defaults.")
-                self.schedule = list(DEFAULT_SCHEDULE)
-                self._save()
-        else:
-            self.logger.info("No news schedule found. Creating default USD high-impact schedule.")
-            self.schedule = list(DEFAULT_SCHEDULE)
-            self._save()
+    # =========================================================================
+    # NORMALIZATION
+    # =========================================================================
 
-    def _save(self):
-        """Persist schedule to disk."""
-        try:
-            os.makedirs(os.path.dirname(self.schedule_file), exist_ok=True)
-            with open(self.schedule_file, "w") as f:
-                json.dump(self.schedule, f, indent=2)
-        except Exception as e:
-            self.logger.error(f"Failed to save news schedule: {e}")
+    @staticmethod
+    def _normalize_currency(
+        value: Any,
+    ) -> str:
 
-    def add_event(self, day: str, time_utc: str, name: str, duration_mins: int = 30) -> bool:
-        """Add a new event to the schedule."""
-        if day not in DAYS_MAP and day != "Daily":
-            return False
+        raw = re.sub(
+            r"[^A-Z]",
+            "",
+            str(
+                value
+                or ""
+            ).upper(),
+        )
+
+        if raw in {
+            "USD",
+            "US",
+            "USA",
+            "UNITEDSTATES",
+        }:
+
+            return "USD"
+
+        if len(
+            raw
+        ) == 3:
+
+            return raw
+
+        return raw
+
+    @staticmethod
+    def _normalize_impact(
+        value: Any,
+    ) -> str:
+
+        raw = re.sub(
+            r"\s+",
+            " ",
+            str(
+                value
+                or ""
+            )
+            .strip()
+            .upper(),
+        )
+
+        if raw in {
+            "HIGH",
+            "HIGH IMPACT",
+        }:
+
+            return "HIGH"
+
+        if raw in {
+            "MEDIUM",
+            "MED",
+            "MEDIUM IMPACT",
+        }:
+
+            return "MEDIUM"
+
+        if raw in {
+            "LOW",
+            "LOW IMPACT",
+        }:
+
+            return "LOW"
+
+        return raw
+
+    @staticmethod
+    def _valid_time(
+        value: str,
+    ) -> bool:
+
         try:
-            h, m = map(int, time_utc.split(":"))
-            if not (0 <= h <= 23 and 0 <= m <= 59):
-                return False
+
+            hour, minute = map(
+                int,
+                str(
+                    value
+                ).split(
+                    ":"
+                ),
+            )
+
+            return (
+                0
+                <= hour
+                <= 23
+                and 0
+                <= minute
+                <= 59
+            )
+
         except Exception:
+
             return False
 
-        # Avoid exact duplicates
-        for ev in self.schedule:
-            if ev["day"] == day and ev["time_utc"] == time_utc and ev["name"] == name:
-                return False
+    @classmethod
+    def _normalize_event(
+        cls,
+        event: Dict[
+            str,
+            Any,
+        ],
+    ) -> Optional[
+        Dict[
+            str,
+            Any,
+        ]
+    ]:
 
-        self.schedule.append({
-            "day": day,
-            "time_utc": time_utc,
-            "name": name,
-            "duration_mins": duration_mins
-        })
-        self._save()
-        self.logger.info(f"News schedule: added '{name}' on {day} at {time_utc} UTC ({duration_mins}m block)")
-        return True
+        if not isinstance(
+            event,
+            dict,
+        ):
 
-    def remove_event(self, index: int) -> bool:
-        """Remove event by index."""
-        if 0 <= index < len(self.schedule):
-            removed = self.schedule.pop(index)
-            self._save()
-            self.logger.info(f"News schedule: removed '{removed['name']}' on {removed['day']}")
-            return True
-        return False
+            return None
 
-    def update_event(self, index: int, day: Optional[str] = None, time_utc: Optional[str] = None,
-                     name: Optional[str] = None, duration_mins: Optional[int] = None) -> bool:
-        """Update an existing event by index."""
-        if 0 <= index < len(self.schedule):
-            ev = self.schedule[index]
-            if day is not None:
-                ev["day"] = day
-            if time_utc is not None:
-                ev["time_utc"] = time_utc
-            if name is not None:
-                ev["name"] = name
-            if duration_mins is not None:
-                ev["duration_mins"] = duration_mins
-            self._save()
-            return True
-        return False
+        day = str(
+            event.get(
+                "day",
+                "",
+            )
+        ).strip()
 
-    def get_all_events(self) -> List[Dict]:
-        """Return full schedule for dashboard display."""
-        return list(self.schedule)
+        time_utc = str(
+            event.get(
+                "time_utc",
+                "",
+            )
+        ).strip()
 
-    def is_blocked(self, current_utc: Optional[datetime] = None,
-                   pre_mins: int = 30, post_mins: int = 15) -> Tuple[bool, Optional[str]]:
-        """
-        Check if trading should be blocked right now due to a scheduled news event.
+        name = str(
+            event.get(
+                "name",
+                "",
+            )
+        ).strip()
 
-        Args:
-            current_utc: Current UTC datetime (defaults to now)
-            pre_mins: Minutes to block BEFORE event (default 30, can be overridden by event's duration_mins)
-            post_mins: Minutes to block AFTER event (default 15)
+        if (
+            day not in DAYS_MAP
+            and day != "Daily"
+        ):
 
-        Returns:
-            (is_blocked: bool, reason: Optional[str])
-        """
-        if not self.schedule:
-            return False, None
+            return None
 
-        if current_utc is None:
-            current_utc = datetime.now(timezone.utc)
+        if not cls._valid_time(
+            time_utc
+        ):
 
-        # Get current weekday (0=Monday)
-        current_weekday = current_utc.weekday()
-        current_day_name = ["Monday", "Tuesday", "Wednesday", "Thursday",
-                             "Friday", "Saturday", "Sunday"][current_weekday]
+            return None
 
-        for event in self.schedule:
-            event_day = event.get("day", "")
-            if event_day != current_day_name and event_day != "Daily":
-                continue
+        if not name:
 
-            time_str = event.get("time_utc", "00:00")
-            dur = int(event.get("duration_mins", pre_mins))
-            name = event.get("name", "Unknown Event")
+            return None
 
-            try:
-                h, m = map(int, time_str.split(":"))
-                # Build event datetime for today
-                event_dt = current_utc.replace(
-                    hour=h, minute=m, second=0, microsecond=0
+        # Important:
+        #
+        # Existing old rows missing currency/impact DO NOT inherit USD/HIGH
+        # because of their event name.
+        currency = (
+            cls._normalize_currency(
+                event.get(
+                    "currency",
+                    "",
+                )
+            )
+        )
+
+        impact = (
+            cls._normalize_impact(
+                event.get(
+                    "impact",
+                    "",
+                )
+            )
+        )
+
+        try:
+
+            duration = max(
+                0,
+                min(
+                    1440,
+                    int(
+                        event.get(
+                            "duration_mins",
+                            30,
+                        )
+                    ),
+                ),
+            )
+
+        except Exception:
+
+            duration = 30
+
+        return {
+            "day": (
+                day
+            ),
+
+            "time_utc": (
+                time_utc
+            ),
+
+            "name": (
+                name
+            ),
+
+            # Kept for dashboard compatibility.
+            "duration_mins": (
+                duration
+            ),
+
+            "currency": (
+                currency
+            ),
+
+            "impact": (
+                impact
+            ),
+
+            "source": (
+                "MANUAL"
+            ),
+        }
+
+    @classmethod
+    def _is_blocking_event(
+        cls,
+        event: Dict[
+            str,
+            Any,
+        ],
+    ) -> bool:
+
+        return (
+            cls._normalize_currency(
+                event.get(
+                    "currency",
+                    "",
+                )
+            )
+            == "USD"
+            and
+            cls._normalize_impact(
+                event.get(
+                    "impact",
+                    "",
+                )
+            )
+            == "HIGH"
+        )
+
+    # =========================================================================
+    # LOAD / SAVE
+    # =========================================================================
+
+    def _load(
+        self,
+    ) -> None:
+
+        with self._lock:
+
+            if not os.path.exists(
+                self.schedule_file
+            ):
+
+                self.schedule = []
+
+                self._save_locked()
+
+                self.logger.info(
+                    (
+                        "No manual news "
+                        "schedule found; "
+                        "created empty schedule."
+                    )
                 )
 
-                # Block window: pre_mins before → post_mins after
-                block_start = event_dt - timedelta(minutes=dur)
-                block_end = event_dt + timedelta(minutes=post_mins)
+                return
 
-                if block_start <= current_utc <= block_end:
-                    mins_to_event = int((event_dt - current_utc).total_seconds() / 60)
-                    if mins_to_event >= 0:
-                        reason = f"📅 NEWS BLOCK: '{name}' in {mins_to_event}m (UTC {time_str})"
-                    else:
-                        mins_after = int((current_utc - event_dt).total_seconds() / 60)
-                        reason = f"📅 NEWS COOLDOWN: '{name}' ended {mins_after}m ago (UTC {time_str})"
-                    return True, reason
-            except Exception:
+            try:
+
+                with open(
+                    self.schedule_file,
+                    "r",
+                    encoding="utf-8",
+                ) as handle:
+
+                    data = json.load(
+                        handle
+                    )
+
+                if not isinstance(
+                    data,
+                    list,
+                ):
+
+                    raise ValueError(
+                        (
+                            "News schedule "
+                            "root must be list."
+                        )
+                    )
+
+                normalized: List[
+                    Dict[
+                        str,
+                        Any,
+                    ]
+                ] = []
+
+                for row in data:
+
+                    parsed = (
+                        self._normalize_event(
+                            row
+                        )
+                    )
+
+                    if parsed is not None:
+
+                        normalized.append(
+                            parsed
+                        )
+
+                self.schedule = (
+                    normalized
+                )
+
+                self.logger.info(
+                    (
+                        "Manual schedule "
+                        "loaded: %d rows; "
+                        "%d blocking-eligible."
+                    ),
+                    len(
+                        self.schedule
+                    ),
+                    sum(
+                        1
+                        for row
+                        in self.schedule
+                        if self._is_blocking_event(
+                            row
+                        )
+                    ),
+                )
+
+            except Exception as exc:
+
+                # Fail empty.
+                # Never fall back to invented recurring events.
+                self.schedule = []
+
+                self.logger.error(
+                    (
+                        "Manual schedule "
+                        "load failed; "
+                        "using empty schedule: %s"
+                    ),
+                    exc,
+                )
+
+    def _save_locked(
+        self,
+    ) -> None:
+
+        directory = os.path.dirname(
+            self.schedule_file
+        )
+
+        if directory:
+
+            os.makedirs(
+                directory,
+                exist_ok=True,
+            )
+
+        temp_path = (
+            self.schedule_file
+            + ".tmp"
+        )
+
+        with open(
+            temp_path,
+            "w",
+            encoding="utf-8",
+        ) as handle:
+
+            json.dump(
+                self.schedule,
+                handle,
+                indent=2,
+                allow_nan=False,
+            )
+
+            handle.flush()
+
+            try:
+
+                os.fsync(
+                    handle.fileno()
+                )
+
+            except OSError:
+
+                pass
+
+        os.replace(
+            temp_path,
+            self.schedule_file,
+        )
+
+    def _save(
+        self,
+    ) -> None:
+
+        with self._lock:
+
+            try:
+
+                self._save_locked()
+
+            except Exception as exc:
+
+                self.logger.error(
+                    (
+                        "Failed saving "
+                        "manual schedule: %s"
+                    ),
+                    exc,
+                )
+
+    # =========================================================================
+    # MUTATION
+    # =========================================================================
+
+    def add_event(
+        self,
+        day: str,
+        time_utc: str,
+        name: str,
+        duration_mins: int = 30,
+        currency: str = "USD",
+        impact: str = "HIGH",
+    ) -> bool:
+        """
+        Backward compatible with old four-argument dashboard calls.
+
+        Newly-added manual rows default to explicit USD/HIGH because this is
+        specifically the USD high-impact manual blackout schedule.
+        """
+
+        candidate = (
+            self._normalize_event(
+                {
+                    "day": (
+                        day
+                    ),
+
+                    "time_utc": (
+                        time_utc
+                    ),
+
+                    "name": (
+                        name
+                    ),
+
+                    "duration_mins": (
+                        duration_mins
+                    ),
+
+                    "currency": (
+                        currency
+                    ),
+
+                    "impact": (
+                        impact
+                    ),
+                }
+            )
+        )
+
+        if candidate is None:
+
+            return False
+
+        with self._lock:
+
+            for existing in (
+                self.schedule
+            ):
+
+                if (
+                    existing.get(
+                        "day"
+                    )
+                    == candidate[
+                        "day"
+                    ]
+                    and existing.get(
+                        "time_utc"
+                    )
+                    == candidate[
+                        "time_utc"
+                    ]
+                    and existing.get(
+                        "name"
+                    )
+                    == candidate[
+                        "name"
+                    ]
+                    and existing.get(
+                        "currency"
+                    )
+                    == candidate[
+                        "currency"
+                    ]
+                    and existing.get(
+                        "impact"
+                    )
+                    == candidate[
+                        "impact"
+                    ]
+                ):
+
+                    return False
+
+            self.schedule.append(
+                candidate
+            )
+
+            try:
+
+                self._save_locked()
+
+            except Exception as exc:
+
+                self.schedule.pop()
+
+                self.logger.error(
+                    (
+                        "Failed persisting "
+                        "added event: %s"
+                    ),
+                    exc,
+                )
+
+                return False
+
+        return True
+
+    def remove_event(
+        self,
+        index: int,
+    ) -> bool:
+
+        index = int(
+            index
+        )
+
+        with self._lock:
+
+            if not (
+                0
+                <= index
+                < len(
+                    self.schedule
+                )
+            ):
+
+                return False
+
+            removed = (
+                self.schedule.pop(
+                    index
+                )
+            )
+
+            try:
+
+                self._save_locked()
+
+            except Exception as exc:
+
+                self.schedule.insert(
+                    index,
+                    removed,
+                )
+
+                self.logger.error(
+                    (
+                        "Failed persisting "
+                        "removed event: %s"
+                    ),
+                    exc,
+                )
+
+                return False
+
+        return True
+
+    def update_event(
+        self,
+        index: int,
+        day: Optional[
+            str
+        ] = None,
+        time_utc: Optional[
+            str
+        ] = None,
+        name: Optional[
+            str
+        ] = None,
+        duration_mins: Optional[
+            int
+        ] = None,
+        currency: Optional[
+            str
+        ] = None,
+        impact: Optional[
+            str
+        ] = None,
+    ) -> bool:
+
+        index = int(
+            index
+        )
+
+        with self._lock:
+
+            if not (
+                0
+                <= index
+                < len(
+                    self.schedule
+                )
+            ):
+
+                return False
+
+            old = copy.deepcopy(
+                self.schedule[
+                    index
+                ]
+            )
+
+            candidate = copy.deepcopy(
+                old
+            )
+
+            if day is not None:
+
+                candidate[
+                    "day"
+                ] = day
+
+            if time_utc is not None:
+
+                candidate[
+                    "time_utc"
+                ] = time_utc
+
+            if name is not None:
+
+                candidate[
+                    "name"
+                ] = name
+
+            if duration_mins is not None:
+
+                candidate[
+                    "duration_mins"
+                ] = duration_mins
+
+            if currency is not None:
+
+                candidate[
+                    "currency"
+                ] = currency
+
+            if impact is not None:
+
+                candidate[
+                    "impact"
+                ] = impact
+
+            normalized = (
+                self._normalize_event(
+                    candidate
+                )
+            )
+
+            if normalized is None:
+
+                return False
+
+            self.schedule[
+                index
+            ] = normalized
+
+            try:
+
+                self._save_locked()
+
+            except Exception as exc:
+
+                self.schedule[
+                    index
+                ] = old
+
+                self.logger.error(
+                    (
+                        "Failed persisting "
+                        "updated event: %s"
+                    ),
+                    exc,
+                )
+
+                return False
+
+        return True
+
+    # =========================================================================
+    # READ API
+    # =========================================================================
+
+    def get_all_events(
+        self,
+    ) -> List[
+        Dict
+    ]:
+
+        with self._lock:
+
+            return [
+                {
+                    **copy.deepcopy(
+                        event
+                    ),
+
+                    "blocking_eligible": (
+                        self._is_blocking_event(
+                            event
+                        )
+                    ),
+                }
+                for event
+                in self.schedule
+            ]
+
+    @staticmethod
+    def _normalize_utc(
+        value: Optional[
+            datetime
+        ],
+    ) -> datetime:
+
+        if value is None:
+
+            return datetime.now(
+                timezone.utc
+            )
+
+        if value.tzinfo is None:
+
+            return value.replace(
+                tzinfo=timezone.utc
+            )
+
+        return value.astimezone(
+            timezone.utc
+        )
+
+    # =========================================================================
+    # MANUAL BLOCK CHECK
+    # =========================================================================
+
+    def is_blocked(
+        self,
+        current_utc: Optional[
+            datetime
+        ] = None,
+        pre_mins: int = 30,
+        post_mins: int = 15,
+    ) -> Tuple[
+        bool,
+        Optional[str],
+    ]:
+        """
+        Manual schedule uses the same global pre/post window.
+
+        Legacy duration_mins is kept for UI compatibility but does not
+        silently override the global lockout/cooldown settings.
+        """
+
+        now = (
+            self._normalize_utc(
+                current_utc
+            )
+        )
+
+        pre_minutes = max(
+            0,
+            int(
+                pre_mins
+            ),
+        )
+
+        post_minutes = max(
+            0,
+            int(
+                post_mins
+            ),
+        )
+
+        with self._lock:
+
+            rows = [
+                copy.deepcopy(
+                    event
+                )
+                for event
+                in self.schedule
+            ]
+
+        current_day = (
+            DAYS[
+                now.weekday()
+            ]
+        )
+
+        for event in rows:
+
+            # Exact USD + HIGH condition.
+            if not self._is_blocking_event(
+                event
+            ):
+
                 continue
 
-        return False, None
+            event_day = str(
+                event.get(
+                    "day",
+                    "",
+                )
+            )
 
-    def get_upcoming_events(self, hours_ahead: int = 24) -> List[Dict]:
-        """Return events in the next N hours with time-to-event."""
-        now = datetime.now(timezone.utc)
-        current_weekday = now.weekday()
-        upcoming = []
+            if event_day not in {
+                current_day,
+                "Daily",
+            }:
 
-        for day_offset in range(7):  # Check next 7 days
-            check_weekday = (current_weekday + day_offset) % 7
-            check_day_name = ["Monday", "Tuesday", "Wednesday", "Thursday",
-                               "Friday", "Saturday", "Sunday"][check_weekday]
+                continue
 
-            for event in self.schedule:
-                if event.get("day") != check_day_name and event.get("day") != "Daily":
-                    continue
-                try:
-                    h, m = map(int, event["time_utc"].split(":"))
-                    event_dt = (now + timedelta(days=day_offset)).replace(
-                        hour=h, minute=m, second=0, microsecond=0
+            try:
+
+                hour, minute = map(
+                    int,
+                    str(
+                        event[
+                            "time_utc"
+                        ]
+                    ).split(
+                        ":"
+                    ),
+                )
+
+            except Exception:
+
+                continue
+
+            event_dt = now.replace(
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+
+            block_start = (
+                event_dt
+                - timedelta(
+                    minutes=(
+                        pre_minutes
                     )
-                    diff_hours = (event_dt - now).total_seconds() / 3600
-                    if 0 <= diff_hours <= hours_ahead:
-                        upcoming.append({
-                            "name": event["name"],
-                            "day": event["day"],
-                            "time_utc": event["time_utc"],
-                            "duration_mins": event.get("duration_mins", 30),
-                            "minutes_until": int((event_dt - now).total_seconds() / 60),
-                            "event_dt_utc": event_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                        })
-                except Exception:
+                )
+            )
+
+            block_end = (
+                event_dt
+                + timedelta(
+                    minutes=(
+                        post_minutes
+                    )
+                )
+            )
+
+            if (
+                block_start
+                <= now
+                <= block_end
+            ):
+
+                return (
+                    True,
+                    (
+                        "MANUAL_USD_HIGH: "
+                        f"{event['name']} @ "
+                        f"{event_dt.isoformat().replace('+00:00', 'Z')}"
+                    ),
+                )
+
+        return (
+            False,
+            None,
+        )
+
+    # =========================================================================
+    # UPCOMING EVENTS
+    # =========================================================================
+
+    def get_upcoming_events(
+        self,
+        hours_ahead: int = 24,
+    ) -> List[
+        Dict
+    ]:
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        horizon = (
+            now
+            + timedelta(
+                hours=max(
+                    0,
+                    int(
+                        hours_ahead
+                    ),
+                )
+            )
+        )
+
+        with self._lock:
+
+            rows = [
+                copy.deepcopy(
+                    event
+                )
+                for event
+                in self.schedule
+            ]
+
+        upcoming: List[
+            Dict[
+                str,
+                Any,
+            ]
+        ] = []
+
+        days_to_scan = max(
+            1,
+            int(
+                (
+                    horizon
+                    - now
+                ).total_seconds()
+                // 86400
+            )
+            + 2,
+        )
+
+        for day_offset in range(
+            days_to_scan
+        ):
+
+            reference = (
+                now
+                + timedelta(
+                    days=day_offset
+                )
+            )
+
+            day_name = (
+                DAYS[
+                    reference.weekday()
+                ]
+            )
+
+            for event in rows:
+
+                if event.get(
+                    "day"
+                ) not in {
+                    day_name,
+                    "Daily",
+                }:
+
                     continue
 
-        upcoming.sort(key=lambda x: x["minutes_until"])
+                try:
+
+                    hour, minute = map(
+                        int,
+                        str(
+                            event[
+                                "time_utc"
+                            ]
+                        ).split(
+                            ":"
+                        ),
+                    )
+
+                except Exception:
+
+                    continue
+
+                event_dt = (
+                    reference.replace(
+                        hour=hour,
+                        minute=minute,
+                        second=0,
+                        microsecond=0,
+                    )
+                )
+
+                if not (
+                    now
+                    <= event_dt
+                    <= horizon
+                ):
+
+                    continue
+
+                upcoming.append(
+                    {
+                        "name": (
+                            event[
+                                "name"
+                            ]
+                        ),
+
+                        "day": (
+                            event[
+                                "day"
+                            ]
+                        ),
+
+                        "time_utc": (
+                            event[
+                                "time_utc"
+                            ]
+                        ),
+
+                        "duration_mins": (
+                            event.get(
+                                "duration_mins",
+                                30,
+                            )
+                        ),
+
+                        "currency": (
+                            event.get(
+                                "currency",
+                                "",
+                            )
+                        ),
+
+                        "impact": (
+                            event.get(
+                                "impact",
+                                "",
+                            )
+                        ),
+
+                        "blocking_eligible": (
+                            self._is_blocking_event(
+                                event
+                            )
+                        ),
+
+                        "minutes_until": int(
+                            (
+                                event_dt
+                                - now
+                            ).total_seconds()
+                            / 60
+                        ),
+
+                        "event_dt_utc": (
+                            event_dt
+                            .isoformat()
+                            .replace(
+                                "+00:00",
+                                "Z",
+                            )
+                        ),
+                    }
+                )
+
+        upcoming.sort(
+            key=lambda row: (
+                row[
+                    "event_dt_utc"
+                ]
+            )
+        )
+
         return upcoming
 
 
-# Singleton instance
-news_schedule = NewsScheduleManager()
+news_schedule = (
+    NewsScheduleManager()
+)
