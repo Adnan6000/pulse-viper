@@ -28,7 +28,11 @@ class AdvancedFeatureEngine:
             emas[f'ema_{period}'] = prices.ewm(span=period, adjust=False).mean()
         return pd.DataFrame(emas)
     
-    def compute_atr(self, df, period=14):
+    def compute_atr(
+        self,
+        df: pd.DataFrame,
+        period: int = 14,
+    ) -> tuple[pd.Series, pd.Series]:
         """Advanced ATR with normalization"""
         high, low, close = df['high'], df['low'], df['close']
         tr1 = high - low

@@ -264,6 +264,12 @@ class TestIntelligencePipeline(unittest.TestCase):
             0.0,
         )
 
+        self.assertIsNotNone(
+            outcome.net_r
+        )
+
+        assert outcome.net_r is not None
+
         self.assertAlmostEqual(
             outcome.net_r,
             2.0,

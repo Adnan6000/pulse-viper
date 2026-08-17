@@ -365,8 +365,16 @@ class AdaptiveBacktester:
 
     @staticmethod
     def _index_ns(
-        index: pd.DatetimeIndex,
+        index: pd.Index,
     ) -> np.ndarray:
+
+        if not isinstance(
+            index,
+            pd.DatetimeIndex,
+        ):
+            raise TypeError(
+                "BACKTEST_INDEX_MUST_BE_DATETIMEINDEX"
+            )
 
         return np.asarray(
             index.asi8,
@@ -836,19 +844,19 @@ class AdaptiveBacktester:
             )
         )
 
-        htf_smc = (
+        normalized_htf = (
             self._normalize_frame(
                 htf_smc
             )
         )
 
-        context_smc = (
+        normalized_context = (
             self._normalize_frame(
                 context_smc
             )
         )
 
-        ltf_smc = (
+        normalized_ltf = (
             self._normalize_frame(
                 ltf_smc
             )
@@ -861,9 +869,9 @@ class AdaptiveBacktester:
         )
 
         if (
-            htf_smc is None
-            or context_smc is None
-            or ltf_smc is None
+            normalized_htf is None
+            or normalized_context is None
+            or normalized_ltf is None
         ):
 
             return {
@@ -872,6 +880,10 @@ class AdaptiveBacktester:
                 ),
                 "symbol": symbol,
             }
+
+        htf_smc = normalized_htf
+        context_smc = normalized_context
+        ltf_smc = normalized_ltf
 
         required_htf = {
             "active_bias",

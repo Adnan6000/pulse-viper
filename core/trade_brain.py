@@ -841,15 +841,13 @@ class TradeBrain:
                 "NO_EMPIRICAL_DATA",
             )
 
-        trades = int(
-            float(
-                stats[
-                    "total_trades"
-                ]
+        trades_value = self._finite(
+            stats.get(
+                "total_trades"
             )
         )
 
-        expectancy = float(
+        expectancy_value = self._finite(
             stats.get(
                 "expectancy_r",
                 stats.get(
@@ -858,11 +856,42 @@ class TradeBrain:
             )
         )
 
-        profit_factor = float(
-            stats[
+        profit_factor_value = self._finite(
+            stats.get(
                 "profit_factor"
-            ]
+            )
         )
+
+        if (
+            trades_value is None
+            or expectancy_value is None
+            or profit_factor_value is None
+        ):
+            return (
+                0.0,
+                "NO_EMPIRICAL_DATA",
+            )
+
+        trades = int(
+            trades_value
+        )
+
+        expectancy = float(
+            expectancy_value
+        )
+
+        profit_factor = float(
+            profit_factor_value
+        )
+
+        if (
+            trades
+            < self.MIN_EMPIRICAL_TRADES
+        ):
+            return (
+                0.0,
+                "NO_EMPIRICAL_DATA",
+            )
 
         # Empirical routing can only have a small influence.
         if (
@@ -1256,18 +1285,10 @@ class TradeBrain:
             str,
             Any,
         ] = {
-            # Explicit telemetry proving these shortcuts are disabled.
             "paper_mode_threshold_relaxation": False,
             "exploration_override": False,
             "news_sentiment_execution_authority": False,
         }
-
-        # ---------------------------------------------------------------------
-        # HARD NEWS GATE
-        #
-        # analysis.news_locked comes from hardened NewsEngine:
-        # Forex Factory USD HIGH only.
-        # ---------------------------------------------------------------------
 
         news_locked = bool(
             analysis.get(
@@ -1300,8 +1321,6 @@ class TradeBrain:
                 ),
             )
 
-        # General headline sentiment deliberately has no execution authority.
-
         if regime == "CHAOTIC":
 
             return BrainResult(
@@ -1328,10 +1347,6 @@ class TradeBrain:
                 ),
             )
 
-        # ---------------------------------------------------------------------
-        # OPTIONAL SESSION FILTER
-        # ---------------------------------------------------------------------
-
         if bool(
             settings_manager.get(
                 "killzone_filter_enabled",
@@ -1356,13 +1371,6 @@ class TradeBrain:
                         BLOCK_REASON_KILLZONE
                     ),
                 )
-
-        # ---------------------------------------------------------------------
-        # EARLY SPREAD CHECK
-        #
-        # Only explicit broker spread_points is trusted here.
-        # ExecutionValidator remains final authority.
-        # ---------------------------------------------------------------------
 
         spread_points = (
             self._finite(
@@ -1399,11 +1407,9 @@ class TradeBrain:
                 threshold,
                 {
                     **reason_map,
-
                     "spread_points": (
                         spread_points
                     ),
-
                     "max_spread_points": (
                         max_spread
                     ),
@@ -1413,10 +1419,6 @@ class TradeBrain:
                     BLOCK_REASON_SPREAD
                 ),
             )
-
-        # ---------------------------------------------------------------------
-        # AI GATE
-        # ---------------------------------------------------------------------
 
         ai_required = bool(
             settings_manager.get(
@@ -1433,7 +1435,6 @@ class TradeBrain:
 
         if ai_required:
 
-            # Never substitute missing NN with fake 0.50 confidence.
             if ai_prob is None:
 
                 return BrainResult(
@@ -1465,11 +1466,9 @@ class TradeBrain:
                     threshold,
                     {
                         **reason_map,
-
                         "ai_confidence": (
                             ai_prob
                         ),
-
                         "min_ai_confidence": (
                             min_conf
                         ),
@@ -1483,10 +1482,6 @@ class TradeBrain:
         else:
 
             ai_prob = None
-
-        # ---------------------------------------------------------------------
-        # TIER 1 + TIER 2
-        # ---------------------------------------------------------------------
 
         (
             bull_t1,
@@ -1581,10 +1576,6 @@ class TradeBrain:
                 bear_t2,
             )
 
-        # ---------------------------------------------------------------------
-        # TIER 3
-        # ---------------------------------------------------------------------
-
         t3_score = float(
             np.clip(
                 (
@@ -1622,22 +1613,18 @@ class TradeBrain:
                     t1_score,
                     3,
                 ),
-
                 "_tier2": round(
                     t2_score,
                     3,
                 ),
-
                 "_tier3": round(
                     t3_score,
                     3,
                 ),
-
                 "bull_total_pre_t3": round(
                     bull_total,
                     3,
                 ),
-
                 "bear_total_pre_t3": round(
                     bear_total,
                     3,
@@ -1673,10 +1660,6 @@ class TradeBrain:
                 tier3_score=t3_score,
             )
 
-        # ---------------------------------------------------------------------
-        # STRATEGY MUST CONFIRM BRAIN DIRECTION
-        # ---------------------------------------------------------------------
-
         normalized_action = (
             str(
                 strategy_action
@@ -1686,7 +1669,6 @@ class TradeBrain:
             else None
         )
 
-        # Engine may call evaluate() with no strategy only for telemetry.
         if normalized_action not in {
             "BUY",
             "SELL",
@@ -1717,7 +1699,6 @@ class TradeBrain:
                 threshold,
                 {
                     **reason_map,
-
                     "strategy_action": (
                         normalized_action
                     ),
@@ -1730,10 +1711,6 @@ class TradeBrain:
                 tier2_score=t2_score,
                 tier3_score=t3_score,
             )
-
-        # ---------------------------------------------------------------------
-        # EMPIRICAL ROUTING
-        # ---------------------------------------------------------------------
 
         routing_adjustment = (
             0.0
@@ -1964,7 +1941,6 @@ class TradeBrain:
                     bull,
                     3,
                 ),
-
                 "t1_bear": round(
                     bear,
                     3,
@@ -2061,7 +2037,6 @@ class TradeBrain:
             or 0.0
         )
 
-        # Same strict directional semantics used in Quantum strategy.
         bull_ofi = (
             2.0
             if ofi >= 0.15
@@ -2125,7 +2100,6 @@ class TradeBrain:
             )
         )
 
-        # No ICT/RAJA/BANK/etc fixed strategy-name bonuses.
         bull = float(
             np.clip(
                 (
@@ -3009,8 +2983,6 @@ class TradeBrain:
 
                 continue
 
-            # Ignore final row conservatively because older callers may
-            # include a currently-forming candle.
             history = frame.iloc[
                 -min(
                     len(

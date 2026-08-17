@@ -1615,25 +1615,34 @@ class AdvancedTradingEngine:
             ):
                 return 0.0
 
-            prices = (
+            prices = np.asarray(
                 df_h1[
                     "close"
                 ]
                 .tail(period)
-                .astype(float)
-                .values
+                .to_numpy(
+                    dtype=np.float64
+                ),
+                dtype=np.float64,
             )
 
             x = np.arange(
-                len(prices)
+                prices.size,
+                dtype=np.float64,
             )
 
-            slope, intercept = (
-                np.polyfit(
-                    x,
-                    prices,
-                    1,
-                )
+            coefficients = np.polyfit(
+                x,
+                prices,
+                1,
+            )
+
+            slope = float(
+                coefficients[0]
+            )
+
+            intercept = float(
+                coefficients[1]
             )
 
             fitted = (
@@ -2299,7 +2308,10 @@ class AdvancedTradingEngine:
             action, strategy_regime, sl, tp, meta = (
                 FibRetestStrategy
                 .evaluate_retest(
-                    df_context=df_m15,
+                    df_context=cast(
+                        pd.DataFrame,
+                        df_m15,
+                    ),
                     current_price=current_price,
                     atr=atr,
                     volume_cache=(
@@ -5622,14 +5634,22 @@ class AdvancedTradingEngine:
         # Do not call model again.
         # ---------------------------------------------------------------------
 
-        ai_signal = (
+        raw_ai_signal = (
             analysis.get(
                 "ai_signal_snapshot"
             )
+        )
+
+        ai_signal: Dict[
+            str,
+            Any,
+        ] = (
+            cast(
+                Dict[str, Any],
+                raw_ai_signal,
+            )
             if isinstance(
-                analysis.get(
-                    "ai_signal_snapshot"
-                ),
+                raw_ai_signal,
                 dict,
             )
             else {}

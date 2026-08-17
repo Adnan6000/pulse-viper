@@ -1311,7 +1311,7 @@ class NewsIntelligenceEngine:
         current_time_utc: datetime,
         lockout_mins: int = 30,
         cooldown_mins: int = 15,
-        symbol: str = None,
+        symbol: Optional[str] = None,
     ) -> Tuple[
         bool,
         Optional[str],

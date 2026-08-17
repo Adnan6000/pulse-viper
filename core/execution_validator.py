@@ -879,7 +879,7 @@ class ExecutionValidator:
         )
 
         try:
-            timestamp = float(time_msc)
+            timestamp = ExecutionValidator._finite_float(time_msc, 0.0)
 
             if (
                 math.isfinite(timestamp)
@@ -903,7 +903,7 @@ class ExecutionValidator:
         )
 
         try:
-            timestamp = float(time_sec)
+            timestamp = ExecutionValidator._finite_float(time_sec, 0.0)
 
             if (
                 math.isfinite(timestamp)

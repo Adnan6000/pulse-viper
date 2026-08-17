@@ -604,7 +604,7 @@ class MT5ExecutionService:
         time_msc = getattr(tick, "time_msc", None)
 
         try:
-            value = float(time_msc)
+            value = _safe_float(time_msc, 0.0)
 
             if math.isfinite(value) and value > 0:
                 return max(0.0, now_ms - value)
@@ -615,7 +615,7 @@ class MT5ExecutionService:
         time_sec = getattr(tick, "time", None)
 
         try:
-            value = float(time_sec)
+            value = _safe_float(time_sec, 0.0)
 
             if math.isfinite(value) and value > 0:
                 return max(

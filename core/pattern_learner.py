@@ -1670,7 +1670,7 @@ class PatternLearner:
     def _last_nonzero(
         values: Sequence[
             Any
-        ],
+        ] | np.ndarray,
         end_index: int,
         lookback: int,
     ) -> int:

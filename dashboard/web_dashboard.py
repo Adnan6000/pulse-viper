@@ -1925,7 +1925,7 @@ class DashboardRequestHandler(
             fvgs = []
             sweeps = []
             mss_events = []
-            levels = {}
+            levels: Dict[str, Any] = {}
 
             if len(
                 closed
