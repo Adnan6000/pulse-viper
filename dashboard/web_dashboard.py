@@ -1,1192 +1,3470 @@
-# dashboard/web_dashboard.py
+from __future__ import annotations
+
 import json
 import logging
+import math
+import os
+import secrets
 import threading
 import time
-import secrets
-import numpy as np
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.parse
-from typing import Dict, Any, List
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, Mapping, Optional
+
+import numpy as np
+
+from core.news_schedule import news_schedule
+from dashboard.html_template import HTML_TEMPLATE
 from utils.mt5_gateway import mt5_gateway as mt5
 from utils.settings_manager import settings_manager
-from dashboard.html_template import HTML_TEMPLATE
-from core.news_schedule import news_schedule
+from utils.snapshot_helper import deep_thaw
 
-# Server-side sessions
-sessions = {}
-
-def validate_settings(settings_dict):
-    """Validates a settings dictionary against settings_manager schema rules."""
-    for k, v in settings_dict.items():
-        settings_manager._validate_value(k, v)
-    return True
-
-def resolve_broker_symbol(symbol: str, engine=None) -> str:
-    """Smartly resolves exact case-sensitive broker symbol name (e.g. BTCUSDm, XAUUSDm, EURUSDm)."""
-    if not symbol:
-        return symbol
-    clean_sym = symbol.strip()
-    info = mt5.symbol_info(clean_sym)
-    if info is not None:
-        return info.name
-        
-    all_symbols = mt5.symbols_get()
-    if not all_symbols:
-        return clean_sym
-        
-    sym_upper = clean_sym.upper()
-    # 1. Case-insensitive exact match
-    for s in all_symbols:
-        if s.name.upper() == sym_upper:
-            return s.name
-            
-    # 2. Equivalent symbol mapping (handles BTCUSD -> BTCUSDm, XAUUSD -> XAUUSDm, etc.)
-    all_names = [s.name for s in all_symbols]
-    if engine and hasattr(engine, 'find_equivalent_symbol'):
-        match = engine.find_equivalent_symbol(clean_sym, all_names)
-        if match:
-            return match
-            
-    # 3. Base currency prefix search
-    for s in all_symbols:
-        if s.name.upper().startswith(sym_upper) or sym_upper.startswith(s.name.upper()):
-            return s.name
-            
-    return clean_sym
+LOG = logging.getLogger("PulseViper.WebDashboard")
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+MAX_BODY = 64 * 1024
+SECRET_WORDS = ("token", "secret", "password", "api_key", "apikey")
 
 
+def json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
 
-class DashboardRequestHandler(BaseHTTPRequestHandler):
-    def __init__(self, engine, *args, **kwargs):
-        self.engine = engine
-        super().__init__(*args, **kwargs)
-        
-    def _set_headers(self, content_type="application/json", status=200, nonce=None):
-        self.send_response(status)
-        self.send_header('Content-Type', content_type)
-        
-        origin = self.headers.get("Origin")
-        if origin:
-            parsed_origin = urllib.parse.urlparse(origin)
-            if parsed_origin.hostname in ("127.0.0.1", "localhost"):
-                self.send_header('Access-Control-Allow-Origin', origin)
-                self.send_header('Access-Control-Allow-Credentials', 'true')
-                
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-PulseViper-Control-Token')
-        
-        self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Referrer-Policy', 'strict-origin-when-cross-origin')
-        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
-        
-        csp = (
-            "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
-            "script-src-elem 'self' 'unsafe-inline' 'unsafe-eval'; "
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-            "style-src-elem 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-            "font-src 'self' https://fonts.gstatic.com data:; "
-            "img-src 'self' data: blob:; "
-            "connect-src 'self' ws: wss: http: https:;"
-        )
-        self.send_header('Content-Security-Policy', csp)
-        self.end_headers()
+    if isinstance(value, (float, np.floating)):
+        value = float(value)
+        return value if math.isfinite(value) else None
 
-    def do_OPTIONS(self):
-        self._set_headers(status=200)
+    if isinstance(value, np.integer):
+        return int(value)
 
-    def _validate_host_and_origin(self) -> bool:
-        host = self.headers.get("Host", "")
-        addr = getattr(self.server, 'server_address', None)
-        server_port = addr[1] if isinstance(addr, tuple) and len(addr) > 1 else 8000
-        allowed_hosts = [
-            f"127.0.0.1:{server_port}",
-            f"localhost:{server_port}",
-            "127.0.0.1",
-            "localhost"
+    if isinstance(value, Mapping):
+        return {
+            str(k): json_safe(v)
+            for k, v in value.items()
+        }
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [
+            json_safe(v)
+            for v in value
         ]
-        clean_host = host.strip().lower()
-        if not any(clean_host == allowed or clean_host.startswith(allowed + ":") for allowed in ["127.0.0.1", "localhost"]):
-            self.send_error(400, "Invalid Host header")
-            return False
 
-        if self.command in ("POST", "PUT", "DELETE"):
-            origin = self.headers.get("Origin")
-            referer = self.headers.get("Referer")
-            valid = False
-            
-            if origin:
-                parsed_origin = urllib.parse.urlparse(origin)
-                if parsed_origin.hostname in ("127.0.0.1", "localhost"):
-                    valid = True
-            elif referer:
-                parsed_referer = urllib.parse.urlparse(referer)
-                if parsed_referer.hostname in ("127.0.0.1", "localhost"):
-                    valid = True
-            else:
-                auth_token = self.headers.get("X-PulseViper-Control-Token")
-                expected_token = settings_manager.get("control_token")
-                if auth_token and expected_token and auth_token == expected_token:
-                    valid = True
-                    
-            if not valid:
-                self.send_error(403, "Invalid Origin or Referer header")
-                return False
-        return True
-
-    def _is_authenticated(self) -> bool:
-        return True
-
-    def do_GET(self):
-        if not self._validate_host_and_origin():
-            return
-
-        parsed_url = urllib.parse.urlparse(self.path)
-        path = parsed_url.path
-
-        if path == "/login":
-            self.send_response(302)
-            self.send_header("Location", "/")
-            self.end_headers()
-            return
-
-        if path == "/":
-            nonce = secrets.token_hex(16)
-            self._set_headers("text/html; charset=utf-8", nonce=nonce)
-            import importlib
-            import sys
-            import dashboard.html_template
-            importlib.reload(sys.modules['dashboard.html_template'])
-            from dashboard.html_template import HTML_TEMPLATE as HOT_HTML
-            nonced_html = HOT_HTML.replace("{{NONCE}}", nonce)
-            self.wfile.write(nonced_html.encode('utf-8'))
-            return
-
-        elif path == "/broadcast":
-            nonce = secrets.token_hex(16)
-            self._set_headers("text/html; charset=utf-8", nonce=nonce)
-            import importlib
-            import sys
-            import dashboard.html_template
-            importlib.reload(sys.modules['dashboard.html_template'])
-            from dashboard.html_template import BROADCAST_TEMPLATE as HOT_HTML
-            nonced_html = HOT_HTML.replace("{{NONCE}}", nonce)
-            self.wfile.write(nonced_html.encode('utf-8'))
-            return
-
-        elif path == "/api/broadcast/stream":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            
-            import time
-            last_cycle_id = None
-            try:
-                while True:
-                    snapshot = self.engine.get_dashboard_snapshot()
-                    if snapshot:
-                        from utils.snapshot_helper import deep_thaw
-                        thawed = deep_thaw(snapshot)
-                        cycle_id = thawed.get("cycle_id", "PV-CYCLE-INIT")
-                        
-                        tick_data = {
-                            "bid": thawed.get("account", {}).get("balance", 0.0),
-                            "ask": thawed.get("account", {}).get("equity", 0.0),
-                            "spread": thawed.get("spread", {}),
-                            "current_price": thawed.get("latency_ms", 0.0),
-                            "pnl": thawed.get("account", {}).get("profit", 0.0)
-                        }
-                        
-                        # Send tick event
-                        self.wfile.write(f"event: tick\ndata: {json.dumps(tick_data)}\n\n".encode('utf-8'))
-                        self.wfile.flush()
-                        
-                        # Send chart snapshot event if cycle changed
-                        if cycle_id != last_cycle_id:
-                            self.wfile.write(f"event: chart_snapshot\ndata: {json.dumps(thawed)}\n\n".encode('utf-8'))
-                            self.wfile.flush()
-                            last_cycle_id = cycle_id
-                    time.sleep(0.5)
-            except Exception:
-                pass
-            return
-            
-        elif path == "/api/status":
-            self._set_headers()
-            status_data = self._get_status_data()
-            self.wfile.write(json.dumps(status_data, default=str).encode('utf-8'))
-            
-        elif path == "/api/chart":
-            try:
-                query = urllib.parse.parse_qs(parsed_url.query)
-                raw_symbol = query.get("symbol", [None])[0]
-                if not raw_symbol and getattr(self, 'engine', None) and self.engine.symbols:
-                    raw_symbol = self.engine.symbols[0]
-                elif not raw_symbol:
-                    raw_symbol = settings_manager.get("active_symbol", "EURUSDm")
-
-                symbol = resolve_broker_symbol(raw_symbol, getattr(self, 'engine', None))
-                    
-                tf_str = query.get("timeframe", ["M5"])[0]
-                tf_map = {
-                    "M1": mt5.TIMEFRAME_M1,
-                    "M5": mt5.TIMEFRAME_M5,
-                    "M15": mt5.TIMEFRAME_M15,
-                    "M30": mt5.TIMEFRAME_M30,
-                    "H1": mt5.TIMEFRAME_H1,
-                    "H4": mt5.TIMEFRAME_H4,
-                    "D1": mt5.TIMEFRAME_D1
-                }
-                tf = tf_map.get(tf_str.upper(), mt5.TIMEFRAME_M5)
-                
-                # Select symbol in MT5 to guarantee it is enabled for history requests
-                mt5.symbol_select(symbol, True)
-                rates = mt5.copy_rates_from_pos(symbol, tf, 0, 350)
-                if rates is None or len(rates) == 0:
-                    rates = mt5.copy_rates_from_pos(symbol, tf, 0, 100)
-                if rates is None or len(rates) == 0:
-                    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 100)
-
-                candles = []
-                fvgs = []
-                sweeps = []
-                mss_events = []
-                levels = {}
-                volume_profile = None
-                
-                if rates is not None and len(rates) > 0:
-                    import pandas as pd
-                    df = pd.DataFrame(rates)
-                    # Align columns for SMCIndicators
-                    df_input = df.copy()
-                    df_input['time_dt'] = pd.to_datetime(df_input['time'], unit='s')
-                    df_input.set_index('time_dt', inplace=True)
-                    df_input.rename(columns={'tick_volume': 'volume'}, inplace=True)
-                    df_input = df_input.tail(300) # OPTIMIZATION: Only compute SMC on last 300 bars
-                    
-                    # Compute SMC features dynamically
-                    from utils.smc_indicators import SMCIndicators
-                    df_smc = SMCIndicators.compute_smc_features(df_input, window=2)
-                    
-                    # Compute Volume Profile dynamically
-                    from utils.volume_analyzer import VolumeAnalyzer
-                    volume_profile = VolumeAnalyzer.calculate_volume_profile(df_input, lookback=100, bins=30)
-                    
-                    for r in rates:
-                        candles.append({
-                            "time": int(r['time']),
-                            "open": float(r['open']),
-                            "high": float(r['high']),
-                            "low": float(r['low']),
-                            "close": float(r['close']),
-                            "volume": float(r['tick_volume'])
-                        })
-                        
-                    # Extract latest levels
-                    last_row = df_smc.iloc[-1]
-                    latest_support = float(last_row['support']) if not pd.isna(last_row['support']) else None
-                    latest_resistance = float(last_row['resistance']) if not pd.isna(last_row['resistance']) else None
-                    latest_ob_top = float(last_row['ob_top']) if not pd.isna(last_row['ob_top']) else None
-                    latest_ob_bottom = float(last_row['ob_bottom']) if not pd.isna(last_row['ob_bottom']) else None
-                    latest_ob_direction = str(last_row['ob_direction']) if ('ob_direction' in last_row and last_row['ob_direction'] != 'none') else None
-                    
-                    # Traverse the DataFrame to extract FVGs, Sweeps, MSS
-                    n_rows = len(df_smc)
-                    offset = len(rates) - n_rows
-                    for i in range(n_rows):
-                        row = df_smc.iloc[i]
-                        
-                        # FVGs
-                        fvg_type = int(row['fvg_type']) if not pd.isna(row['fvg_type']) else 0
-                        fvg_class = str(row['fvg_class']) if 'fvg_class' in row else ''
-                        # Only show high-quality FVGs (Breakaway Gaps and Runaway FVGs) to reduce chart noise
-                        if fvg_type != 0 and fvg_class in ('bag', 'rfvg'):
-                            top = float(row['fvg_top'])
-                            bottom = float(row['fvg_bottom'])
-                            start = max(0, i - 2) + offset
-                            end = n_rows - 1 + offset
-                            
-                            # Check mitigation
-                            for k in range(i + 1, n_rows):
-                                k_row = df_smc.iloc[k]
-                                if fvg_type == 1: # Bullish FVG
-                                    if float(k_row['low']) <= bottom:
-                                        end = k + offset
-                                        break
-                                elif fvg_type == -1: # Bearish FVG
-                                    if float(k_row['high']) >= top:
-                                        end = k + offset
-                                        break
-                            fvgs.append({
-                                "type": "bullish" if fvg_type == 1 else "bearish",
-                                "top": top,
-                                "bottom": bottom,
-                                "start": start,
-                                "end": end
-                            })
-                        
-                        # Liquidity Sweeps
-                        liq_sweep_type = int(row['liq_sweep_type']) if not pd.isna(row['liq_sweep_type']) else 0
-                        if liq_sweep_type != 0:
-                            sweeps.append({
-                                "index": i + offset,
-                                "type": "bullish" if liq_sweep_type == 1 else "bearish",
-                                "price": float(row['liq_sweep_level']) if not pd.isna(row['liq_sweep_level']) else float(row['low'] if liq_sweep_type == 1 else row['high'])
-                            })
-                            
-                        # MSS Events
-                        mss_signal = int(row['mss_signal']) if not pd.isna(row['mss_signal']) else 0
-                        if mss_signal != 0:
-                            mss_events.append({
-                                "index": i + offset,
-                                "type": "bullish" if mss_signal == 1 else "bearish",
-                                "price": float(row['close'])
-                            })
-                            
-                    analysis = self.engine.cached_analysis.get(symbol, {})
-                    pdh = self.engine.pdh_cache.get(symbol, None)
-                    pdl = self.engine.pdl_cache.get(symbol, None)
-                    pwh = self.engine.pwh_cache.get(symbol, None)
-                    pwl = self.engine.pwl_cache.get(symbol, None)
-                    crt_meta = analysis.get("crt_metadata", {})
-                    
-                    entry_price = None
-                    entry_action = None
-                    sl_price = None
-                    tp_price = None
-
-                    if hasattr(self.engine, 'trade_manager') and self.engine.trade_manager:
-                        for ticket, pos in self.engine.trade_manager.positions.items():
-                            if getattr(pos, 'symbol', '') == symbol:
-                                entry_price = float(getattr(pos, 'entry', 0.0) or getattr(pos, 'entry_price', 0.0) or 0.0)
-                                entry_action = str(getattr(pos, 'action', 'BUY'))
-                                sl_price = float(getattr(pos, 'sl', 0.0) or 0.0)
-                                tp_price = float(getattr(pos, 'tp', 0.0) or 0.0)
-                                break
-                    if not entry_price and analysis:
-                        target = analysis.get("target_setup") or getattr(self.engine, 'last_target_setup', {}).get(symbol)
-                        if target:
-                            entry_price = float(target.get("entry", 0.0) or 0.0)
-                            entry_action = str(target.get("action", "BUY"))
-                            sl_price = float(target.get("sl", 0.0) or 0.0)
-                            tp_price = float(target.get("tp", 0.0) or 0.0)
-
-                    levels = {
-                        "support": latest_support,
-                        "resistance": latest_resistance,
-                        "crt_high": crt_meta.get("crt_high"),
-                        "crt_low": crt_meta.get("crt_low"),
-                        "ob_top": latest_ob_top,
-                        "ob_bottom": latest_ob_bottom,
-                        "ob_direction": latest_ob_direction,
-                        "poc": volume_profile.get("poc_price") if volume_profile else None,
-                        "volume_profile": volume_profile,
-                        "val": volume_profile.get("val_price") if volume_profile else None,
-                        "vah": volume_profile.get("vah_price") if volume_profile else None,
-                        "pdh": pdh,
-                        "pdl": pdl,
-                        "pwh": pwh,
-                        "pwl": pwl,
-                        "entry_price": entry_price,
-                        "entry_action": entry_action,
-                        "sl_price": sl_price,
-                        "tp_price": tp_price
-                    }
-                else:
-                    levels = {
-                        "support": None, "resistance": None,
-                        "crt_high": None, "crt_low": None,
-                        "ob_top": None, "ob_bottom": None,
-                        "ob_direction": None, "poc": None,
-                        "volume_profile": None, "val": None, "vah": None,
-                        "pdh": None, "pdl": None, "pwh": None, "pwl": None,
-                        "entry_price": None, "entry_action": None
-                    }
-                
-                open_trades = []
-                if hasattr(self.engine, 'trade_manager') and self.engine.trade_manager:
-                    for ticket, pos in self.engine.trade_manager.positions.items():
-                        if getattr(pos, 'symbol', '') == symbol:
-                            open_trades.append({
-                                "ticket": ticket,
-                                "type": pos.action,
-                                "volume": pos.volume,
-                                "entry": pos.entry_price,
-                                "sl": pos.sl,
-                                "tp": pos.tp,
-                                "pnl": pos.pnl if hasattr(pos, 'pnl') else 0.0
-                            })
-                            
-                try:
-                    self._set_headers()
-                    self.wfile.write(json.dumps({
-                        "symbol": symbol,
-                        "timeframe": tf_str,
-                        "candles": candles,
-                        "fvgs": fvgs,
-                        "sweeps": sweeps,
-                        "mss": mss_events,
-                        "levels": levels,
-                        "trades": open_trades
-                    }).encode('utf-8'))
-                except (ConnectionResetError, BrokenPipeError, OSError):
-                    pass
-            except Exception as e:
-                try:
-                    self._set_headers(status=500)
-                    self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-                except (ConnectionResetError, BrokenPipeError, OSError):
-                    pass
-        elif path == "/api/journal":
-            try:
-                from core.trade_journal import trade_journal
-                trades = trade_journal.get_all_trades()
-                self._set_headers()
-                self.wfile.write(json.dumps({"trades": trades[-200:], "total": len(trades)}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-        elif path == "/api/daily_report":
-            try:
-                report = self.engine.daily_analyzer.get_latest_report()
-                from core.trade_journal import trade_journal
-                today_summary = trade_journal.get_daily_summary()
-                self._set_headers()
-                self.wfile.write(json.dumps({
-                    "report": report,
-                    "today_summary": today_summary
-                }).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-        elif path == "/api/backtest_results":
-            try:
-                results = self.engine.backtester.get_last_results()
-                self._set_headers()
-                self.wfile.write(json.dumps(results).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-        elif path == "/api/audit_evaluations":
-            try:
-                import sqlite3
-                from core.database import db_instance
-                with db_instance._lock:
-                    conn = sqlite3.connect(db_instance.db_path)
-                    conn.row_factory = sqlite3.Row
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT * FROM audit_evaluations ORDER BY id DESC LIMIT 100")
-                    rows = cursor.fetchall()
-                    conn.close()
-                
-                evaluations = []
-                for r in rows:
-                    evaluations.append(dict(r))
-                    
-                self._set_headers()
-                self.wfile.write(json.dumps({"evaluations": evaluations}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-        elif path == "/api/logs":
-            try:
-                import os
-                log_lines = []
-                log_path = "logs/engine.log"
-                if os.path.exists(log_path):
-                    # Safely and efficiently read the end of a potentially large file
-                    with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-                        f.seek(0, os.SEEK_END)
-                        file_size = f.tell()
-                        seek_size = min(40960, file_size)  # read last 40KB
-                        f.seek(file_size - seek_size)
-                        content = f.read()
-                        lines = content.splitlines()
-                        # Clean lines to keep only valid log rows (or last 35 lines)
-                        log_lines = lines[-35:]
-                self._set_headers()
-                self.wfile.write(json.dumps({"logs": log_lines}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-        elif path == "/api/news_schedule":
-            try:
-                events = news_schedule.get_all_events()
-                self._set_headers()
-                self.wfile.write(json.dumps({"events": events}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-        else:
-            self._set_headers("text/plain", 404)
-            self.wfile.write(b"Not Found")
-            
-    def do_POST(self):
-        if not self._validate_host_and_origin():
-            return
-
-        parsed_url = urllib.parse.urlparse(self.path)
-        path = parsed_url.path
-        
-        content_length = int(self.headers.get('Content-Length', 0))
-        post_data = self.rfile.read(content_length)
-
-        if path == "/login":
-            self.send_response(302)
-            self.send_header("Location", "/")
-            self.end_headers()
-            return
-        
-        if path == "/api/settings":
-            try:
-                data = json.loads(post_data.decode('utf-8'))
-                validate_settings(data)
-                
-                # If active_symbol is being updated, ensure it's selected in MT5 and engine immediately
-                if "active_symbol" in data:
-                    new_sym = str(data["active_symbol"]).strip()
-                    if new_sym:
-                        match_sym = resolve_broker_symbol(new_sym, getattr(self, 'engine', None))
-                        data["active_symbol"] = match_sym
-                        mt5.symbol_select(match_sym, True)
-                        if hasattr(self, 'engine') and self.engine and match_sym not in self.engine.symbols:
-                            self.engine.symbols.append(match_sym)
-
-                # 1. ALWAYS persist directly & immediately to settings_manager (configs/settings.json)
-                for key, val in data.items():
-                    settings_manager.set(key, val, source="DASHBOARD_API", reason="User updated setting via Web Dashboard")
-
-                # 2. Queue in engine for thread-safe cycle boundary sync if engine is running
-                if hasattr(self, 'engine') and self.engine:
-                    res = self.engine.queue_settings_update(data)
-                    if isinstance(res, dict) and "completion_event" in res:
-                        res["completion_event"].wait(timeout=0.5)
-
-                self._set_headers()
-                self.wfile.write(json.dumps({"status": "success", "settings": settings_manager.get_all()}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=400)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-        elif path == "/api/reset_settings":
-            try:
-                settings_manager.reset_all()
-                self._set_headers()
-                self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-                
-        elif path == "/api/news_schedule/add":
-            try:
-                data = json.loads(post_data.decode('utf-8'))
-                day = data.get("day", "").strip()
-                time_utc = data.get("time_utc", "").strip()
-                name = data.get("name", "").strip()
-                duration_mins = int(data.get("duration_mins", 30))
-                
-                success = news_schedule.add_event(day, time_utc, name, duration_mins)
-                if success:
-                    self._set_headers()
-                    self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
-                else:
-                    self._set_headers(status=400)
-                    self.wfile.write(json.dumps({"error": "Failed to add event. Check inputs or duplicates."}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-                
-        elif path == "/api/news_schedule/remove":
-            try:
-                data = json.loads(post_data.decode('utf-8'))
-                index = int(data.get("index", -1))
-                
-                success = news_schedule.remove_event(index)
-                if success:
-                    self._set_headers()
-                    self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
-                else:
-                    self._set_headers(status=400)
-                    self.wfile.write(json.dumps({"error": "Failed to remove event. Index out of range."}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-                
-        elif path == "/api/news_schedule/update":
-            try:
-                data = json.loads(post_data.decode('utf-8'))
-                index = int(data.get("index", -1))
-                day = data.get("day")
-                time_utc = data.get("time_utc")
-                name = data.get("name")
-                raw_dur = data.get("duration_mins")
-                duration_mins = int(raw_dur) if raw_dur is not None else 30
-                
-                success = news_schedule.update_event(index, day, time_utc, name, duration_mins)
-                if success:
-                    self._set_headers()
-                    self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
-                else:
-                    self._set_headers(status=400)
-                    self.wfile.write(json.dumps({"error": "Failed to update event."}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-                
-        elif path == "/api/execute_trade":
-            try:
-                data = json.loads(post_data.decode('utf-8')) if post_data else {}
-                raw_sym = data.get("symbol") or getattr(self.engine, 'symbols', ['XAUUSDm'])[0]
-                resolved = resolve_broker_symbol(raw_sym, getattr(self, 'engine', None))
-                is_micro = bool(data.get("micro_scalp", False))
-                
-                snapshot = self.engine.get_dashboard_snapshot() if hasattr(self, 'engine') and self.engine else {}
-                levels = snapshot.get("levels", {})
-                
-                if is_micro:
-                    tick = mt5.symbol_info_tick(resolved)
-                    action = levels.get("entry_action") or "BUY"
-                    if tick:
-                        entry = tick.ask if action == "BUY" else tick.bid
-                    else:
-                        entry = levels.get("entry_price") or 4020.0
-                    sl = (entry - 1.20) if action == "BUY" else (entry + 1.20)
-                    tp = (entry + 2.40) if action == "BUY" else (entry - 2.40)
-                    strat_name = "MICRO_SCALP_12P_24P"
-                else:
-                    entry = levels.get("entry_price")
-                    action = levels.get("entry_action") or "BUY"
-                    sl = levels.get("sl_price") or 0.0
-                    tp = levels.get("tp_price") or 0.0
-                    strat_name = "CO_PILOT_HYBRID"
-                
-                if entry and hasattr(self, 'engine') and self.engine:
-                    pos = self.engine.execute_and_record_trade(
-                        symbol=resolved,
-                        action=action,
-                        sl=sl,
-                        tp=tp,
-                        analysis=self.engine.cached_analysis.get(resolved, {}),
-                        strategy_name=strat_name
-                    )
-                    ticket = getattr(pos, 'ticket', 'MANUAL_EXEC')
-                    self._set_headers()
-                    self.wfile.write(json.dumps({"status": "success", "action": action, "entry": entry, "ticket": ticket, "mode": "MICRO_SCALP" if is_micro else "CO_PILOT"}).encode('utf-8'))
-                else:
-                    self._set_headers(status=400)
-                    self.wfile.write(json.dumps({"error": "No active target setup found on chart to execute."}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-                
-        elif path == "/api/add_symbol":
-            try:
-                data = json.loads(post_data.decode('utf-8'))
-                symbol = data.get("symbol", "").strip()
-                if not symbol:
-                    raise ValueError("Symbol name cannot be empty")
-                
-                # Smartly resolve symbol availability on MT5 server
-                match = resolve_broker_symbol(symbol, getattr(self, 'engine', None))
-                if not match:
-                    self._set_headers(status=400)
-                    self.wfile.write(json.dumps({"error": f"Symbol '{symbol}' not found on broker server"}).encode('utf-8'))
-                    return
-                
-                # Enable the symbol
-                if not mt5.symbol_select(match, True):
-                    self._set_headers(status=400)
-                    self.wfile.write(json.dumps({"error": f"Failed to select symbol '{match}' on broker"}).encode('utf-8'))
-                    return
-                
-                # Add to engine symbols
-                if match not in self.engine.symbols:
-                    self.engine.symbols.append(match)
-                    
-                # Set active symbol
-                settings_manager.set("active_symbol", match)
-                
-                self._set_headers()
-                self.wfile.write(json.dumps({
-                    "status": "success",
-                    "symbol": match,
-                    "all_symbols": self.engine.symbols
-                }).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=400)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-                
-        elif path == "/api/train":
-            try:
-                training_thread = threading.Thread(target=self._run_training_job, daemon=True)
-                training_thread.start()
-                self._set_headers()
-                self.wfile.write(json.dumps({"status": "training_started"}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-
-        elif path == "/api/close_all":
-            try:
-                panic_res = self.engine.trigger_emergency_panic_close()
-                command_id = panic_res["command_id"]
-                completion_event = panic_res["completion_event"]
-                result_holder = panic_res["result_holder"]
-                
-                completed = completion_event.wait(timeout=3.0)
-                if completed:
-                    self._set_headers(status=200)
-                    self.wfile.write(json.dumps({
-                        "status": "SUCCESS",
-                        "command_id": command_id,
-                        "result": result_holder.get("result")
-                    }).encode('utf-8'))
-                else:
-                    self._set_headers(status=202)
-                    self.wfile.write(json.dumps({
-                        "status": "ACCEPTED",
-                        "command_id": command_id,
-                        "message": "Panic command queued, closing asynchronously"
-                    }).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-
-        elif path == "/api/journal":
-            try:
-                from core.trade_journal import trade_journal
-                trades = trade_journal.get_all_trades()
-                self._set_headers()
-                self.wfile.write(json.dumps({"trades": trades[-200:], "total": len(trades)}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-
-        elif path == "/api/daily_report":
-            try:
-                report = self.engine.daily_analyzer.get_latest_report()
-                from core.trade_journal import trade_journal
-                yesterday_summary = trade_journal.get_daily_summary()
-                self._set_headers()
-                self.wfile.write(json.dumps({
-                    "report": report,
-                    "today_summary": yesterday_summary
-                }).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-
-        elif path == "/api/run_analysis":
-            try:
-                def _run():
-                    from datetime import date
-                    self.engine.daily_analyzer.analyze_date(date.today())
-                threading.Thread(target=_run, daemon=True).start()
-                self._set_headers()
-                self.wfile.write(json.dumps({"status": "analysis_started"}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-
-        elif path == "/api/run_backtest":
-            try:
-                def _run():
-                    symbol = self.engine.symbols[0] if self.engine.symbols else "XAUUSDm"
-                    trading_mode = settings_manager.get("trading_mode", "scalping")
-                    self.engine.backtester.self_optimize(symbol, trading_mode=trading_mode)
-                threading.Thread(target=_run, daemon=True).start()
-                self._set_headers()
-                self.wfile.write(json.dumps({"status": "backtest_started"}).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-
-        elif path == "/api/backtest_results":
-            try:
-                results = self.engine.backtester.get_last_results()
-                self._set_headers()
-                self.wfile.write(json.dumps(results).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-
-        elif path == "/api/run_test":
-            try:
-                data = json.loads(post_data.decode('utf-8'))
-                test_type = data.get("test_type", "engine_test")
-                
-                import subprocess
-                import sys
-                python_exe = sys.executable or "python"
-                
-                script_map = {
-                    "engine_test": "scratch/test_engine_run.py",
-                    "performance_audit": "scratch/performance_audit.py",
-                    "safety_check": "scratch/test_safety_engine.py"
-                }
-                
-                script_path = script_map.get(test_type)
-                if not script_path:
-                    raise ValueError(f"Unknown test type: {test_type}")
-                
-                res = subprocess.run([python_exe, script_path], capture_output=True, text=True, encoding="utf-8")
-                output = res.stdout + "\n" + res.stderr
-                
-                self._set_headers()
-                self.wfile.write(json.dumps({
-                    "status": "success",
-                    "test_type": test_type,
-                    "exit_code": res.returncode,
-                    "output": output
-                }).encode('utf-8'))
-            except Exception as e:
-                self._set_headers(status=500)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
-
-        else:
-            self._set_headers("text/plain", 404)
-            self.wfile.write(b"Not Found")
-
-    def _run_training_job(self):
-        if hasattr(self.engine, 'training_in_progress') and self.engine.training_in_progress:
-            return
-        
-        self.engine.training_in_progress = True
+    if hasattr(value, "isoformat"):
         try:
-            self.engine.trigger_historical_training()
-        except Exception as e:
-            self.engine.logger.error(f"Failed to auto-train pattern database: {e}")
-        finally:
-            self.engine.training_in_progress = False
-            
-    def _get_status_data(self) -> Dict[str, Any]:
-        try:
-            snapshot = self.engine.get_dashboard_snapshot()
-            if not snapshot:
-                return {
-                    "account": {"broker": "INITIALIZING", "balance": 0.0, "equity": 0.0, "profit": 0.0},
-                    "settings": settings_manager.get_all(),
-                    "symbols": self.engine.symbols,
-                    "sentiment": {
-                        "d1": 0.0, "h4": 0.0, "h1": 0.0, "m30": 0.0, "m15": 0.0, "m5": 0.0, "m1": 0.0,
-                        "h1_bias_label": "Neutral", "m15_sweep_label": "Neutral", "m5_mss_label": "Neutral",
-                        "news": 0.0, "news_articles": []
-                    },
-                    "volume": {"rvol": 1, "buy_pressure": 50, "sell_pressure": 50, "profile": {}},
-                    "positions": [],
-                    "history": [],
-                    "market_regime": "RANGING",
-                    "training_status": "idle",
-                    "leverage": "N/A",
-                    "margin_level": "N/A",
-                    "latency_ms": 0.0,
-                    "spread": {},
-                    "diagnostics_status": "UNHEALTHY"
-                }
+            return value.isoformat()
+        except Exception:
+            pass
 
-            from utils.snapshot_helper import deep_thaw
-            snap_dict = deep_thaw(snapshot)
+    return str(value)
 
-            acc = snap_dict.get("account", {})
-            is_paper = snap_dict.get("risk_status", {}).get("paper_mode", True)
-            
-            account_data = {
-                "broker": acc.get("broker", "GENERIC"),
-                "server": "DEMO" if is_paper else "LIVE",
-                "login": 0,
-                "balance": acc.get("balance", 0.0),
-                "equity": acc.get("equity", 0.0),
-                "profit": acc.get("profit", 0.0),
-                "mode": "paper" if is_paper else "live"
-            }
-            
-            leverage_str = f"1:{acc.get('leverage', 500)}"
-            margin_level_str = f"{acc.get('margin_level', 0.0):.1f}%" if acc.get("margin_level", 0.0) > 0 else "N/A"
 
-            spread_data = {}
-            if self.engine.symbols:
-                symbol = self.engine.symbols[0]
-                tick = mt5.symbol_info_tick(symbol)
-                symbol_info = mt5.symbol_info(symbol)
-                if tick and symbol_info:
-                    spread_points = (tick.ask - tick.bid) / symbol_info.point
-                    max_spread = settings_manager.get("max_spread_points", 300)
-                    spread_data = {
-                        "symbol": symbol,
-                        "current": round(spread_points, 1),
-                        "max_limit": max_spread,
-                        "exceeded": spread_points > max_spread,
-                        "bid": tick.bid,
-                        "ask": tick.ask
-                    }
+def redact(
+    value: Mapping[str, Any],
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
 
-            active_pos = []
-            for p in snap_dict.get("positions", ()):
-                active_pos.append({
-                    "ticket": p.get("ticket"),
-                    "symbol": p.get("symbol"),
-                    "action": p.get("action"),
-                    "volume": p.get("volume"),
-                    "entry_price": p.get("entry"),
-                    "sl": p.get("sl"),
-                    "tp": p.get("tp"),
-                    "pnl": p.get("pnl"),
-                    "age_seconds": p.get("age_seconds")
-                })
+    for key, val in value.items():
+        name = str(key)
 
-            active_settings = settings_manager.get_all()
+        if any(
+            word in name.lower()
+            for word in SECRET_WORDS
+        ):
+            continue
 
-            from utils.sentiment_analyzer import sentiment_analyzer
-            news_state = sentiment_analyzer.get_news_state()
-            upcoming_events = list(news_state.get("upcoming_events", []))
-            
-            tf_alignment = snap_dict.get("tf_alignment", {})
-            engine_sentiment = getattr(self.engine, 'sentiment_cache', {}) or {}
+        out[name] = (
+            redact(val)
+            if isinstance(val, Mapping)
+            else json_safe(val)
+        )
 
-            def get_tf_sentiment_score(tf_lower: str, tf_upper: str) -> float:
-                # 1. Continuous technical sentiment calculated by sentiment_analyzer
-                if tf_lower in engine_sentiment and engine_sentiment[tf_lower] is not None:
-                    try:
-                        return float(engine_sentiment[tf_lower])
-                    except (ValueError, TypeError):
-                        pass
-                # 2. Alignment bias integer (-1.0, 0.0, 1.0)
-                val = tf_alignment.get(tf_upper, {}).get('bias', 0.0)
-                try:
-                    return float(val)
-                except (ValueError, TypeError):
-                    return 0.0
+    return out
 
-            d1_score = get_tf_sentiment_score('d1', 'D1')
-            h4_score = get_tf_sentiment_score('h4', 'H4')
-            h1_score = get_tf_sentiment_score('h1', 'H1')
-            m30_score = get_tf_sentiment_score('m30', 'M30')
-            m15_score = get_tf_sentiment_score('m15', 'M15')
-            m5_score = get_tf_sentiment_score('m5', 'M5')
-            m1_score = get_tf_sentiment_score('m1', 'M1')
 
-            def resolve_bias_label(raw_lbl: str, score: float) -> str:
-                if raw_lbl and raw_lbl.strip().upper() not in ('NEUTRAL', 'NONE', ''):
-                    return raw_lbl.strip()
-                if score > 0.15: return 'BULLISH'
-                if score < -0.15: return 'BEARISH'
-                return 'NEUTRAL'
+def validate_settings(
+    values: Mapping[str, Any],
+) -> None:
+    if not isinstance(
+        values,
+        Mapping,
+    ):
+        raise ValueError(
+            "Settings payload must be an object"
+        )
 
-            h1_lbl = resolve_bias_label(tf_alignment.get('H1', {}).get('label', ''), h1_score)
-            m15_lbl = resolve_bias_label(tf_alignment.get('M15', {}).get('label', ''), m15_score)
-            m5_lbl = resolve_bias_label(tf_alignment.get('M5', {}).get('label', ''), m5_score)
-
-            sentiment_data = {
-                "d1": d1_score,
-                "h4": h4_score,
-                "h1": h1_score,
-                "m30": m30_score,
-                "m15": m15_score,
-                "m5": m5_score,
-                "m1": m1_score,
-                "h1_bias_label": h1_lbl,
-                "m15_sweep_label": m15_lbl,
-                "m5_mss_label": m5_lbl,
-                "news": news_state.get("score", 0.0),
-                "usd_forecast_bias": news_state.get("usd_forecast_bias", "NEUTRAL"),
-                "news_articles": news_state.get("articles", [])[:10],
-                "upcoming_events": upcoming_events
-            }
-
-            # Get real volume data from engine's volume_cache
-            engine_vol = getattr(self.engine, 'volume_cache', {}) or {}
-            volume_data = {
-                "rvol": float(engine_vol.get("rvol", 1.0)),
-                "buy_pressure": float(engine_vol.get("buy_pressure", 50.0)),
-                "sell_pressure": float(engine_vol.get("sell_pressure", 50.0)),
-                "profile": engine_vol.get("profile", {})
-            }
-
-            closed_pos = []
-            try:
-                from core.trade_journal import trade_journal
-                journal_trades = trade_journal.get_all_trades()
-                recent_trades = journal_trades[-50:] if journal_trades else []
-                for i, t in enumerate(recent_trades):
-                    closed_pos.append({
-                        "id": f"J-{i+1}",
-                        "symbol": t.get("symbol", ""),
-                        "action": t.get("action", ""),
-                        "volume": float(t.get("lot_size", 0.01)) if t.get("lot_size") != "" else 0.01,
-                        "entry_price": float(t.get("entry_price", 0.0)) if t.get("entry_price") != "" else 0.0,
-                        "close_price": float(t.get("close_price", 0.0)) if t.get("close_price") != "" else 0.0,
-                        "close_time": f"{t.get('date', '')} {t.get('time', '')}".strip(),
-                        "close_reason": t.get("close_reason", ""),
-                        "pnl": float(t.get("pnl", 0.0)) if t.get("pnl") != "" else 0.0,
-                        "strategy_name": t.get("strategy_name", "UNKNOWN"),
-                        "entry_pattern": t.get("entry_pattern", "UNKNOWN")
-                    })
-            except Exception as je:
-                logging.getLogger("PulseViper.WebDashboard").error(f"Error reading from trade history: {je}")
-
-            regime = snap_dict.get("market", {}).get("regime", "RANGE")
-            prediction_data = snap_dict.get("prediction", {})
-            skipped_stats = snap_dict.get("starvation_stats", {})
-
-            routing = snap_dict.get("routing", {})
-            best_strategy_suggestion = routing.get("suggestions", {})
-            if not best_strategy_suggestion:
-                best_strategy_suggestion = {
-                    "strategy": "UNKNOWN",
-                    "win_rate": 0.0,
-                    "profit_factor": 0.0,
-                    "total_trades": 0,
-                    "net_pnl_R": 0.0,
-                    "reason": "Scanning optimizer matrix...",
-                    "routing_adjustment": 0.0,
-                    "source": "fallback",
-                    "mode": settings_manager.get("trading_mode", "intraday"),
-                    "session": "LONDON",
-                    "regime": regime
-                }
-
-            diag = snap_dict.get("diagnostics", {})
-            diag_status = "HEALTHY" if diag.get("allowed", True) else "UNHEALTHY"
-
-            return {
-                "account": account_data,
-                "settings": active_settings,
-                "symbols": self.engine.symbols,
-                "sentiment": sentiment_data,
-                "volume": volume_data,
-                "positions": active_pos,
-                "history": closed_pos,
-                "market_regime": regime,
-                "training_status": "training" if getattr(self.engine, 'training_in_progress', False) else "idle",
-                "leverage": leverage_str,
-                "margin_level": margin_level_str,
-                "latency_ms": round(self.engine.market_state.get('latency_ms', 0.0), 1),
-                "spread": spread_data,
-                "prediction": prediction_data,
-                "skipped_stats": skipped_stats,
-                "active_sessions": list(snap_dict.get("active_sessions", ())),
-                "tf_alignment": tf_alignment,
-                "starvation_stats": skipped_stats,
-                "is_new_candle_close": False,
-                "diagnostics_status": diag_status,
-                "session_context": {},
-                "strategy_suggestion": best_strategy_suggestion,
-                "strategy_rankings": list(snap_dict.get("strategy_rankings", []))
-            }
-        except Exception as exc:
-            logger = logging.getLogger("PulseViper.WebDashboard")
-            logger.exception(
-                "Error gathering status JSON: %s",
-                exc,
+    for key, value in values.items():
+        if str(key).lower() == "control_token":
+            raise ValueError(
+                "control_token is runtime-only"
             )
 
-            symbols = list(
-                getattr(self.engine, "symbols", [])
-                or []
-            )
+        settings_manager._validate_value(
+            str(key),
+            value,
+        )
 
-            active_symbol = (
-                symbols[0]
-                if symbols
-                else settings_manager.get(
-                    "active_symbol",
-                    "",
+
+def resolve_broker_symbol(
+    symbol: str,
+    engine=None,
+) -> str:
+    symbol = str(
+        symbol or ""
+    ).strip()
+
+    if not symbol:
+        return ""
+
+    info = mt5.symbol_info(
+        symbol
+    )
+
+    if info is not None:
+        return str(
+            info.name
+        )
+
+    symbols = (
+        mt5.symbols_get()
+        or []
+    )
+
+    names = [
+        str(
+            getattr(
+                item,
+                "name",
+                "",
+            )
+        )
+        for item
+        in symbols
+    ]
+
+    wanted = symbol.upper()
+
+    for name in names:
+        if name.upper() == wanted:
+            return name
+
+    if (
+        engine is not None
+        and hasattr(
+            engine,
+            "find_equivalent_symbol",
+        )
+    ):
+        try:
+            found = (
+                engine.find_equivalent_symbol(
+                    symbol,
+                    names,
                 )
             )
 
-            return {
-                "status_error": str(exc),
-                "account": {
-                    "broker": "ERROR",
-                    "server": "",
-                    "login": 0,
-                    "balance": 0.0,
-                    "equity": 0.0,
-                    "profit": 0.0,
-                    "mode": "unknown",
-                },
-                "settings": settings_manager.get_all(),
-                "symbols": symbols,
-                "sentiment": {
-                    "d1": 0.0,
-                    "h4": 0.0,
-                    "h1": 0.0,
-                    "m30": 0.0,
-                    "m15": 0.0,
-                    "m5": 0.0,
-                    "m1": 0.0,
-                    "news": 0.0,
-                    "h1_bias_label": "Unavailable",
-                    "m15_sweep_label": "Unavailable",
-                    "m5_mss_label": "Unavailable",
-                    "usd_forecast_bias": "NEUTRAL",
-                    "news_articles": [],
-                    "upcoming_events": [],
-                },
-                "volume": {
-                    "rvol": 1.0,
-                    "buy_pressure": 50.0,
-                    "sell_pressure": 50.0,
-                    "profile": {},
-                },
-                "positions": [],
-                "history": [],
-                "market_regime": "UNKNOWN",
-                "training_status": "idle",
-                "leverage": "N/A",
-                "margin_level": "N/A",
-                "latency_ms": 0.0,
-                "spread": {
-                    "symbol": active_symbol,
-                    "current": None,
-                    "max_limit": settings_manager.get(
-                        "max_spread_points",
-                        300,
+            if found:
+                return str(
+                    found
+                )
+
+        except Exception:
+            pass
+
+    matches = [
+        name
+        for name
+        in names
+        if name.upper().startswith(
+            wanted
+        )
+    ]
+
+    return (
+        matches[0]
+        if len(matches) == 1
+        else symbol
+    )
+
+
+class DashboardRequestHandler(
+    BaseHTTPRequestHandler
+):
+    server_version = (
+        "PulseViperDashboard/2"
+    )
+
+    def __init__(
+        self,
+        engine,
+        *args,
+        **kwargs,
+    ):
+        self.engine = engine
+
+        super().__init__(
+            *args,
+            **kwargs,
+        )
+
+    def log_message(
+        self,
+        fmt: str,
+        *args,
+    ) -> None:
+        LOG.debug(
+            "dashboard: "
+            + fmt,
+            *args,
+        )
+
+    # ================================================================
+    # SECURITY
+    # ================================================================
+
+    def _local_url(
+        self,
+        value: Optional[str],
+    ) -> bool:
+        if not value:
+            return False
+
+        try:
+            return (
+                urllib.parse
+                .urlparse(
+                    value
+                )
+                .hostname
+                in LOCAL_HOSTS
+            )
+
+        except Exception:
+            return False
+
+    def _request_allowed(
+        self,
+    ) -> bool:
+        host = str(
+            self.headers.get(
+                "Host",
+                "",
+            )
+        ).strip()
+
+        host_only = (
+            host.rsplit(
+                ":",
+                1,
+            )[0]
+            .strip("[]")
+            .lower()
+            if host
+            else ""
+        )
+
+        if host_only not in LOCAL_HOSTS:
+            self.send_error(
+                400,
+                "Invalid Host header",
+            )
+
+            return False
+
+        if self.command not in {
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+        }:
+            return True
+
+        if (
+            self._local_url(
+                self.headers.get(
+                    "Origin"
+                )
+            )
+            or self._local_url(
+                self.headers.get(
+                    "Referer"
+                )
+            )
+        ):
+            return True
+
+        supplied = self.headers.get(
+            "X-PulseViper-Control-Token",
+            "",
+        )
+
+        expected = str(
+            settings_manager.get(
+                "control_token",
+                "",
+            )
+            or ""
+        )
+
+        if (
+            supplied
+            and expected
+            and secrets.compare_digest(
+                supplied,
+                expected,
+            )
+        ):
+            return True
+
+        self.send_error(
+            403,
+            (
+                "Mutation requires "
+                "local origin or "
+                "valid control token"
+            ),
+        )
+
+        return False
+
+    def _headers(
+        self,
+        content_type=(
+            "application/json; "
+            "charset=utf-8"
+        ),
+        status=200,
+        nonce=None,
+    ) -> None:
+        self.send_response(
+            status
+        )
+
+        self.send_header(
+            "Content-Type",
+            content_type,
+        )
+
+        self.send_header(
+            "Cache-Control",
+            (
+                "no-store, no-cache, "
+                "must-revalidate, "
+                "max-age=0"
+            ),
+        )
+
+        self.send_header(
+            "X-Content-Type-Options",
+            "nosniff",
+        )
+
+        self.send_header(
+            "Referrer-Policy",
+            "no-referrer",
+        )
+
+        self.send_header(
+            "X-Frame-Options",
+            "DENY",
+        )
+
+        self.send_header(
+            "Cross-Origin-Resource-Policy",
+            "same-origin",
+        )
+
+        self.send_header(
+            "Permissions-Policy",
+            (
+                "camera=(), "
+                "microphone=(), "
+                "geolocation=()"
+            ),
+        )
+
+        origin = self.headers.get(
+            "Origin"
+        )
+
+        if self._local_url(
+            origin
+        ):
+            self.send_header(
+                "Access-Control-Allow-Origin",
+                str(
+                    origin
+                ),
+            )
+
+            self.send_header(
+                "Vary",
+                "Origin",
+            )
+
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, OPTIONS",
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            (
+                "Content-Type, "
+                "X-PulseViper-Control-Token"
+            ),
+        )
+
+        script_src = (
+            f"'self' 'nonce-{nonce}'"
+            if nonce
+            else "'self'"
+        )
+
+        self.send_header(
+            "Content-Security-Policy",
+            (
+                "default-src 'self'; "
+                f"script-src {script_src}; "
+                "object-src 'none'; "
+                "base-uri 'none'; "
+                "frame-ancestors 'none'; "
+                "form-action 'self'; "
+                "style-src 'self' "
+                "'unsafe-inline' "
+                "https://fonts.googleapis.com; "
+                "font-src 'self' "
+                "https://fonts.gstatic.com "
+                "data:; "
+                "img-src 'self' "
+                "data: blob:; "
+                "connect-src 'self';"
+            ),
+        )
+
+        self.end_headers()
+
+    def _json(
+        self,
+        payload: Any,
+        status=200,
+    ) -> None:
+        self._headers(
+            status=status
+        )
+
+        self.wfile.write(
+            json.dumps(
+                json_safe(
+                    payload
+                ),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode(
+                "utf-8"
+            )
+        )
+
+    def _body(
+        self,
+    ) -> Dict[str, Any]:
+        try:
+            length = int(
+                self.headers.get(
+                    "Content-Length",
+                    "0",
+                )
+            )
+
+        except ValueError as exc:
+            raise ValueError(
+                "Invalid Content-Length"
+            ) from exc
+
+        if (
+            length < 0
+            or length > MAX_BODY
+        ):
+            raise ValueError(
+                "Request body too large"
+            )
+
+        if length == 0:
+            return {}
+
+        value = json.loads(
+            self.rfile.read(
+                length
+            ).decode(
+                "utf-8"
+            )
+        )
+
+        if not isinstance(
+            value,
+            dict,
+        ):
+            raise ValueError(
+                (
+                    "JSON body must "
+                    "be an object"
+                )
+            )
+
+        return value
+
+    # ================================================================
+    # SNAPSHOT
+    # ================================================================
+
+    def _snapshot(
+        self,
+    ) -> Dict[str, Any]:
+        if (
+            self.engine is None
+            or not hasattr(
+                self.engine,
+                "get_dashboard_snapshot",
+            )
+        ):
+            return {}
+
+        snap = (
+            self.engine
+            .get_dashboard_snapshot()
+        )
+
+        if not snap:
+            return {}
+
+        value = deep_thaw(
+            snap
+        )
+
+        return (
+            value
+            if isinstance(
+                value,
+                dict,
+            )
+            else {}
+        )
+
+    @staticmethod
+    def _number(
+        value: Any,
+    ) -> Optional[float]:
+        try:
+            value = float(
+                value
+            )
+
+            return (
+                value
+                if math.isfinite(
+                    value
+                )
+                else None
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+    def _settings(
+        self,
+    ) -> Dict[str, Any]:
+        try:
+            values = (
+                settings_manager
+                .get_all()
+            )
+
+        except Exception:
+            values = {}
+
+        return redact(
+            (
+                values
+                if isinstance(
+                    values,
+                    Mapping,
+                )
+                else {}
+            )
+        )
+
+    def _quote(
+        self,
+        snap: Mapping[
+            str,
+            Any,
+        ],
+    ) -> Dict[str, Any]:
+        market = snap.get(
+            "market",
+            {},
+        )
+
+        market = (
+            market
+            if isinstance(
+                market,
+                Mapping,
+            )
+            else {}
+        )
+
+        quote = market.get(
+            "quote",
+            {},
+        )
+
+        quote = (
+            quote
+            if isinstance(
+                quote,
+                Mapping,
+            )
+            else {}
+        )
+
+        spread = market.get(
+            "spread",
+            {},
+        )
+
+        spread = (
+            spread
+            if isinstance(
+                spread,
+                Mapping,
+            )
+            else {}
+        )
+
+        bid = self._number(
+            quote.get(
+                "bid",
+                market.get(
+                    "bid",
+                    spread.get(
+                        "bid"
                     ),
-                    "exceeded": False,
-                    "bid": 0.0,
-                    "ask": 0.0,
+                ),
+            )
+        )
+
+        ask = self._number(
+            quote.get(
+                "ask",
+                market.get(
+                    "ask",
+                    spread.get(
+                        "ask"
+                    ),
+                ),
+            )
+        )
+
+        return {
+            "symbol": quote.get(
+                "symbol",
+                market.get(
+                    "symbol"
+                ),
+            ),
+
+            "bid": bid,
+
+            "ask": ask,
+
+            "mid": (
+                (
+                    bid
+                    + ask
+                )
+                / 2.0
+                if (
+                    bid is not None
+                    and ask is not None
+                )
+                else None
+            ),
+
+            "spread_points": (
+                self._number(
+                    spread.get(
+                        "current",
+                        market.get(
+                            "spread_points"
+                        ),
+                    )
+                )
+            ),
+        }
+
+    # ================================================================
+    # ROUTING
+    # ================================================================
+
+    def do_OPTIONS(
+        self,
+    ) -> None:
+        if self._request_allowed():
+            self._headers(
+                status=204
+            )
+
+    def do_GET(
+        self,
+    ) -> None:
+        if not self._request_allowed():
+            return
+
+        parsed = (
+            urllib.parse
+            .urlparse(
+                self.path
+            )
+        )
+
+        path = parsed.path
+
+        if path == "/login":
+            self.send_response(
+                302
+            )
+
+            self.send_header(
+                "Location",
+                "/",
+            )
+
+            self.end_headers()
+            return
+
+        if path in {
+            "/",
+            "/broadcast",
+        }:
+            self._serve_html(
+                path == "/broadcast"
+            )
+            return
+
+        if path == "/api/broadcast/stream":
+            self._serve_sse()
+            return
+
+        if path == "/api/status":
+            self._json(
+                self._status()
+            )
+            return
+
+        if path == "/api/chart":
+            self._chart(
+                parsed
+            )
+            return
+
+        if path == "/api/journal":
+            self._journal()
+            return
+
+        if path == "/api/daily_report":
+            self._daily()
+            return
+
+        if path == "/api/backtest_results":
+            self._backtest_results()
+            return
+
+        if path == "/api/audit_evaluations":
+            self._audit()
+            return
+
+        if path == "/api/logs":
+            self._logs()
+            return
+
+        if path == "/api/news_schedule":
+            self._json(
+                {
+                    "events": (
+                        news_schedule
+                        .get_all_events()
+                    )
+                }
+            )
+            return
+
+        self._headers(
+            "text/plain; charset=utf-8",
+            404,
+        )
+
+        self.wfile.write(
+            b"Not Found"
+        )
+
+    def do_POST(
+        self,
+    ) -> None:
+        if not self._request_allowed():
+            return
+
+        path = (
+            urllib.parse
+            .urlparse(
+                self.path
+            )
+            .path
+        )
+
+        try:
+            data = self._body()
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
                 },
+                400,
+            )
+
+            return
+
+        if path == "/api/settings":
+            self._write_settings(
+                data
+            )
+            return
+
+        if path == "/api/reset_settings":
+            self._reset_settings()
+            return
+
+        if path == "/api/news_schedule/add":
+            self._news_add(
+                data
+            )
+            return
+
+        if path == "/api/news_schedule/remove":
+            self._news_remove(
+                data
+            )
+            return
+
+        if path == "/api/news_schedule/update":
+            self._news_update(
+                data
+            )
+            return
+
+        if path == "/api/execute_trade":
+            self._manual_execute(
+                data
+            )
+            return
+
+        if path == "/api/add_symbol":
+            self._add_symbol(
+                data
+            )
+            return
+
+        if path == "/api/train":
+            self._train()
+            return
+
+        if path == "/api/close_all":
+            self._close_all()
+            return
+
+        if path == "/api/run_analysis":
+            self._run_analysis()
+            return
+
+        if path == "/api/run_backtest":
+            self._run_backtest()
+            return
+
+        if path == "/api/run_test":
+            self._json(
+                {
+                    "error": (
+                        "DASHBOARD_SUBPROCESS_"
+                        "EXECUTION_DISABLED"
+                    )
+                },
+                410,
+            )
+
+            return
+
+        self._headers(
+            "text/plain; charset=utf-8",
+            404,
+        )
+
+        self.wfile.write(
+            b"Not Found"
+        )
+
+    # ================================================================
+    # HTML + SSE
+    # ================================================================
+
+    def _serve_html(
+        self,
+        broadcast=False,
+    ) -> None:
+        nonce = (
+            secrets
+            .token_urlsafe(
+                24
+            )
+        )
+
+        self._headers(
+            (
+                "text/html; "
+                "charset=utf-8"
+            ),
+            nonce=nonce,
+        )
+
+        template = (
+            HTML_TEMPLATE
+        )
+
+        if broadcast:
+            try:
+                from dashboard.html_template import (
+                    BROADCAST_TEMPLATE,
+                )
+
+                template = (
+                    BROADCAST_TEMPLATE
+                )
+
+            except Exception:
+                pass
+
+        self.wfile.write(
+            str(
+                template
+            )
+            .replace(
+                "{{NONCE}}",
+                nonce,
+            )
+            .encode(
+                "utf-8"
+            )
+        )
+
+    def _serve_sse(
+        self,
+    ) -> None:
+        self.send_response(
+            200
+        )
+
+        self.send_header(
+            "Content-Type",
+            (
+                "text/event-stream; "
+                "charset=utf-8"
+            ),
+        )
+
+        self.send_header(
+            "Cache-Control",
+            (
+                "no-cache, "
+                "no-transform"
+            ),
+        )
+
+        self.send_header(
+            "Connection",
+            "keep-alive",
+        )
+
+        self.send_header(
+            "X-Accel-Buffering",
+            "no",
+        )
+
+        origin = self.headers.get(
+            "Origin"
+        )
+
+        if self._local_url(
+            origin
+        ):
+            self.send_header(
+                "Access-Control-Allow-Origin",
+                str(
+                    origin
+                ),
+            )
+
+            self.send_header(
+                "Vary",
+                "Origin",
+            )
+
+        self.end_headers()
+
+        last_cycle = None
+
+        try:
+            while True:
+                snap = (
+                    self._snapshot()
+                )
+
+                if not snap:
+                    self._sse(
+                        "status",
+                        {
+                            "connected": False,
+                            "reason": (
+                                "SNAPSHOT_UNAVAILABLE"
+                            ),
+                        },
+                    )
+
+                else:
+                    cycle = (
+                        snap.get(
+                            "cycle_id"
+                        )
+                    )
+
+                    account = (
+                        snap.get(
+                            "account",
+                            {},
+                        )
+                    )
+
+                    account = (
+                        account
+                        if isinstance(
+                            account,
+                            Mapping,
+                        )
+                        else {}
+                    )
+
+                    self._sse(
+                        "tick",
+                        {
+                            **self._quote(
+                                snap
+                            ),
+
+                            "pnl": (
+                                self._number(
+                                    account.get(
+                                        "profit"
+                                    )
+                                )
+                            ),
+
+                            "cycle_id": (
+                                cycle
+                            ),
+                        },
+                    )
+
+                    if (
+                        cycle
+                        != last_cycle
+                    ):
+                        self._sse(
+                            "chart_snapshot",
+                            snap,
+                        )
+
+                        last_cycle = (
+                            cycle
+                        )
+
+                time.sleep(
+                    0.5
+                )
+
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            OSError,
+        ):
+            return
+
+    def _sse(
+        self,
+        event: str,
+        payload: Any,
+    ) -> None:
+        body = json.dumps(
+            json_safe(
+                payload
+            ),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+        self.wfile.write(
+            (
+                f"event: {event}\n"
+                f"data: {body}\n\n"
+            ).encode(
+                "utf-8"
+            )
+        )
+
+        self.wfile.flush()
+
+    # ================================================================
+    # STATUS
+    # ================================================================
+
+    def _status(
+        self,
+    ) -> Dict[str, Any]:
+        """
+        Pure dashboard projection.
+
+        Does NOT call:
+          - evaluate_entry_rules()
+          - get_trading_signal()
+          - TradeBrain.evaluate()
+          - strategy evaluators
+          - sentiment refresh
+          - optimizer
+        """
+
+        snap = self._snapshot()
+
+        if not snap:
+            return {
+                "connected": False,
+                "status": "INITIALIZING",
+                "settings": self._settings(),
+                "symbols": [],
+                "account": {},
+                "positions": [],
+                "history": self._history(),
+                "market_regime": "UNKNOWN",
                 "prediction": {},
-                "skipped_stats": {},
-                "active_sessions": [],
-                "tf_alignment": {},
-                "starvation_stats": {},
-                "session_context": {},
+                "spread": {
+                    "current": None,
+                    "bid": None,
+                    "ask": None,
+                },
                 "strategy_suggestion": None,
                 "strategy_rankings": [],
-                "diagnostics_status": "UNHEALTHY",
-                "is_new_candle_close": False,
+                "diagnostics_status": (
+                    "UNAVAILABLE"
+                ),
             }
 
+        account = snap.get(
+            "account",
+            {},
+        )
+
+        account = (
+            account
+            if isinstance(
+                account,
+                Mapping,
+            )
+            else {}
+        )
+
+        risk = snap.get(
+            "risk_status",
+            {},
+        )
+
+        risk = (
+            risk
+            if isinstance(
+                risk,
+                Mapping,
+            )
+            else {}
+        )
+
+        market = snap.get(
+            "market",
+            {},
+        )
+
+        market = (
+            market
+            if isinstance(
+                market,
+                Mapping,
+            )
+            else {}
+        )
+
+        diag = snap.get(
+            "diagnostics",
+            {},
+        )
+
+        diag = (
+            diag
+            if isinstance(
+                diag,
+                Mapping,
+            )
+            else {}
+        )
+
+        model = snap.get(
+            "model_status",
+            {},
+        )
+
+        model = (
+            model
+            if isinstance(
+                model,
+                Mapping,
+            )
+            else {}
+        )
+
+        pred = snap.get(
+            "prediction",
+            {},
+        )
+
+        pred = (
+            pred
+            if isinstance(
+                pred,
+                Mapping,
+            )
+            else {}
+        )
+
+        starvation = snap.get(
+            "starvation_stats",
+            {},
+        )
+
+        starvation = (
+            starvation
+            if isinstance(
+                starvation,
+                Mapping,
+            )
+            else {}
+        )
+
+        tf = snap.get(
+            "tf_alignment",
+            {},
+        )
+
+        tf = (
+            tf
+            if isinstance(
+                tf,
+                Mapping,
+            )
+            else {}
+        )
+
+        session = snap.get(
+            "session_context",
+            {},
+        )
+
+        session = (
+            session
+            if isinstance(
+                session,
+                Mapping,
+            )
+            else {}
+        )
+
+        quote = self._quote(
+            snap
+        )
+
+        spread_raw = market.get(
+            "spread",
+            {},
+        )
+
+        spread = (
+            dict(
+                spread_raw
+            )
+            if isinstance(
+                spread_raw,
+                Mapping,
+            )
+            else {}
+        )
+
+        spread.update(
+            {
+                "bid": quote[
+                    "bid"
+                ],
+
+                "ask": quote[
+                    "ask"
+                ],
+
+                "current": (
+                    quote[
+                        "spread_points"
+                    ]
+                ),
+            }
+        )
+
+        positions = []
+
+        for pos in (
+            snap.get(
+                "positions",
+                [],
+            )
+            or []
+        ):
+            if not isinstance(
+                pos,
+                Mapping,
+            ):
+                continue
+
+            positions.append(
+                {
+                    "ticket": pos.get(
+                        "ticket"
+                    ),
+
+                    "symbol": pos.get(
+                        "symbol"
+                    ),
+
+                    "action": pos.get(
+                        "action"
+                    ),
+
+                    "volume": pos.get(
+                        "volume"
+                    ),
+
+                    "entry_price": (
+                        pos.get(
+                            "entry_price",
+                            pos.get(
+                                "entry"
+                            ),
+                        )
+                    ),
+
+                    "sl": pos.get(
+                        "sl"
+                    ),
+
+                    "tp": pos.get(
+                        "tp"
+                    ),
+
+                    "pnl": pos.get(
+                        "pnl"
+                    ),
+
+                    "age_seconds": (
+                        pos.get(
+                            "age_seconds"
+                        )
+                    ),
+
+                    "entry_time_utc": (
+                        pos.get(
+                            "entry_time_utc"
+                        )
+                    ),
+                }
+            )
+
+        routing = snap.get(
+            "routing",
+            {},
+        )
+
+        routing = (
+            routing
+            if isinstance(
+                routing,
+                Mapping,
+            )
+            else {}
+        )
+
+        suggestion = snap.get(
+            "strategy_suggestion"
+        )
+
+        if (
+            not isinstance(
+                suggestion,
+                Mapping,
+            )
+            or not suggestion
+        ):
+            candidate = (
+                routing.get(
+                    "suggestions"
+                )
+            )
+
+            suggestion = (
+                candidate
+                if (
+                    isinstance(
+                        candidate,
+                        Mapping,
+                    )
+                    and candidate
+                )
+                else None
+            )
+
+        suggestion = (
+            dict(
+                suggestion
+            )
+            if isinstance(
+                suggestion,
+                Mapping,
+            )
+            else None
+        )
+
+        rankings = [
+            dict(
+                row
+            )
+            for row
+            in (
+                snap.get(
+                    "strategy_rankings",
+                    [],
+                )
+                or []
+            )
+            if isinstance(
+                row,
+                Mapping,
+            )
+        ]
+
+        paper = bool(
+            risk.get(
+                "paper_mode",
+                self._settings().get(
+                    "paper_mode",
+                    True,
+                ),
+            )
+        )
+
+        allowed = diag.get(
+            "allowed"
+        )
+
+        return {
+            "connected": bool(
+                snap.get(
+                    "connected",
+                    True,
+                )
+            ),
+
+            "snapshot_version": (
+                snap.get(
+                    "snapshot_version"
+                )
+            ),
+
+            "cycle_id": snap.get(
+                "cycle_id"
+            ),
+
+            "cycle_number": snap.get(
+                "cycle_number"
+            ),
+
+            "generated_at_utc": (
+                snap.get(
+                    "generated_at_utc"
+                )
+            ),
+
+            "account": {
+                "broker": account.get(
+                    "broker"
+                ),
+
+                "server": (
+                    "DEMO"
+                    if paper
+                    else "LIVE"
+                ),
+
+                "login": account.get(
+                    "login"
+                ),
+
+                "balance": account.get(
+                    "balance"
+                ),
+
+                "equity": account.get(
+                    "equity"
+                ),
+
+                "profit": account.get(
+                    "profit"
+                ),
+
+                "leverage": account.get(
+                    "leverage"
+                ),
+
+                "margin_level": (
+                    account.get(
+                        "margin_level"
+                    )
+                ),
+
+                "mode": (
+                    "paper"
+                    if paper
+                    else "live"
+                ),
+            },
+
+            "settings": self._settings(),
+
+            "symbols": list(
+                snap.get(
+                    "symbols",
+                    [],
+                )
+                or []
+            ),
+
+            "sentiment": (
+                dict(
+                    market.get(
+                        "sentiment",
+                        {},
+                    )
+                )
+                if isinstance(
+                    market.get(
+                        "sentiment"
+                    ),
+                    Mapping,
+                )
+                else {}
+            ),
+
+            "volume": (
+                dict(
+                    market.get(
+                        "volume",
+                        {},
+                    )
+                )
+                if isinstance(
+                    market.get(
+                        "volume"
+                    ),
+                    Mapping,
+                )
+                else {}
+            ),
+
+            "positions": positions,
+
+            "history": self._history(),
+
+            "market_regime": (
+                market.get(
+                    "regime",
+                    market.get(
+                        "market_regime",
+                        "UNKNOWN",
+                    ),
+                )
+            ),
+
+            "training_status": (
+                model.get(
+                    "training_status",
+                    "idle",
+                )
+            ),
+
+            "latency_ms": (
+                self._number(
+                    market.get(
+                        "latency_ms",
+                        diag.get(
+                            "latency_ms"
+                        ),
+                    )
+                )
+            ),
+
+            "spread": spread,
+
+            "prediction": dict(
+                pred
+            ),
+
+            "skipped_stats": dict(
+                starvation
+            ),
+
+            "active_sessions": list(
+                snap.get(
+                    "active_sessions",
+                    [],
+                )
+                or []
+            ),
+
+            "tf_alignment": dict(
+                tf
+            ),
+
+            "starvation_stats": dict(
+                starvation
+            ),
+
+            "session_context": dict(
+                session
+            ),
+
+            # No fabricated fallback.
+            "strategy_suggestion": (
+                suggestion
+            ),
+
+            "strategy_rankings": (
+                rankings
+            ),
+
+            "diagnostics_status": (
+                "HEALTHY"
+                if allowed is True
+                else (
+                    "UNHEALTHY"
+                    if allowed is False
+                    else "UNKNOWN"
+                )
+            ),
+
+            "model_status": dict(
+                model
+            ),
+
+            "risk_status": dict(
+                risk
+            ),
+
+            "is_new_candle_close": (
+                False
+            ),
+        }
+
+    # ================================================================
+    # CHART
+    # ================================================================
+
+    def _chart(
+        self,
+        parsed,
+    ) -> None:
+        try:
+            query = (
+                urllib.parse
+                .parse_qs(
+                    parsed.query
+                )
+            )
+
+            snap = self._snapshot()
+
+            symbols = (
+                list(
+                    snap.get(
+                        "symbols",
+                        [],
+                    )
+                    or []
+                )
+                if snap
+                else []
+            )
+
+            raw = (
+                query.get(
+                    "symbol",
+                    [None],
+                )[0]
+                or (
+                    symbols[0]
+                    if symbols
+                    else settings_manager.get(
+                        "active_symbol",
+                        "",
+                    )
+                )
+            )
+
+            symbol = (
+                resolve_broker_symbol(
+                    str(
+                        raw
+                        or ""
+                    ),
+                    self.engine,
+                )
+            )
+
+            tf_name = str(
+                query.get(
+                    "timeframe",
+                    ["M5"],
+                )[0]
+            ).upper()
+
+            tf_map = {
+                "M1": mt5.TIMEFRAME_M1,
+                "M5": mt5.TIMEFRAME_M5,
+                "M15": mt5.TIMEFRAME_M15,
+                "M30": mt5.TIMEFRAME_M30,
+                "H1": mt5.TIMEFRAME_H1,
+                "H4": mt5.TIMEFRAME_H4,
+                "D1": mt5.TIMEFRAME_D1,
+            }
+
+            if (
+                not symbol
+                or tf_name
+                not in tf_map
+            ):
+                raise ValueError(
+                    (
+                        "Invalid symbol "
+                        "or timeframe"
+                    )
+                )
+
+            rates = (
+                mt5.copy_rates_from_pos(
+                    symbol,
+                    tf_map[
+                        tf_name
+                    ],
+                    0,
+                    350,
+                )
+            )
+
+            if (
+                rates is None
+                or len(
+                    rates
+                )
+                == 0
+            ):
+                self._json(
+                    {
+                        "symbol": symbol,
+                        "timeframe": tf_name,
+                        "candles": [],
+                        "fvgs": [],
+                        "sweeps": [],
+                        "mss": [],
+                        "levels": {},
+                        "trades": [],
+                        "error": (
+                            "NO_MARKET_DATA"
+                        ),
+                    }
+                )
+
+                return
+
+            import pandas as pd
+
+            df = pd.DataFrame(
+                rates
+            )
+
+            candles = [
+                {
+                    "time": int(
+                        row[
+                            "time"
+                        ]
+                    ),
+
+                    "open": float(
+                        row[
+                            "open"
+                        ]
+                    ),
+
+                    "high": float(
+                        row[
+                            "high"
+                        ]
+                    ),
+
+                    "low": float(
+                        row[
+                            "low"
+                        ]
+                    ),
+
+                    "close": float(
+                        row[
+                            "close"
+                        ]
+                    ),
+
+                    "volume": (
+                        float(
+                            row[
+                                "tick_volume"
+                            ]
+                        )
+                        if (
+                            "tick_volume"
+                            in rates.dtype.names
+                        )
+                        else 0.0
+                    ),
+                }
+                for row
+                in rates
+            ]
+
+            df[
+                "time_dt"
+            ] = pd.to_datetime(
+                df[
+                    "time"
+                ],
+                unit="s",
+                utc=True,
+            )
+
+            df.set_index(
+                "time_dt",
+                inplace=True,
+            )
+
+            df.rename(
+                columns={
+                    "tick_volume": (
+                        "volume"
+                    )
+                },
+                inplace=True,
+            )
+
+            # Display current candle but calculate
+            # SMC only from closed candles.
+            closed = (
+                df.iloc[
+                    :-1
+                ]
+                .tail(
+                    300
+                )
+                .copy()
+                if len(
+                    df
+                ) > 1
+                else df.iloc[
+                    0:0
+                ].copy()
+            )
+
+            fvgs = []
+            sweeps = []
+            mss_events = []
+            levels = {}
+
+            if len(
+                closed
+            ) >= 20:
+                from utils.smc_indicators import (
+                    SMCIndicators,
+                )
+
+                smc = (
+                    SMCIndicators
+                    .compute_smc_features(
+                        closed,
+                        window=int(
+                            settings_manager.get(
+                                "smc_swing_window",
+                                3,
+                            )
+                        ),
+                    )
+                )
+
+                last = smc.iloc[
+                    -1
+                ]
+
+                levels = {
+                    key: (
+                        self._number(
+                            last.get(
+                                key
+                            )
+                        )
+                    )
+                    for key
+                    in (
+                        "support",
+                        "resistance",
+                        "ob_top",
+                        "ob_bottom",
+                    )
+                }
+
+                levels[
+                    "ob_direction"
+                ] = (
+                    str(
+                        last.get(
+                            "ob_direction"
+                        )
+                    )
+                    if (
+                        str(
+                            last.get(
+                                "ob_direction",
+                                "none",
+                            )
+                        ).lower()
+                        not in {
+                            "none",
+                            "nan",
+                            "",
+                        }
+                    )
+                    else None
+                )
+
+                for _, row in (
+                    smc.iterrows()
+                ):
+                    ftype = int(
+                        row.get(
+                            "fvg_type",
+                            0,
+                        )
+                        or 0
+                    )
+
+                    fclass = str(
+                        row.get(
+                            "fvg_class",
+                            "",
+                        )
+                    ).lower()
+
+                    top = self._number(
+                        row.get(
+                            "fvg_top"
+                        )
+                    )
+
+                    bottom = (
+                        self._number(
+                            row.get(
+                                "fvg_bottom"
+                            )
+                        )
+                    )
+
+                    if (
+                        ftype
+                        and top
+                        is not None
+                        and bottom
+                        is not None
+                        and fclass
+                        in {
+                            "bag",
+                            "rfvg",
+                        }
+                    ):
+                        fvgs.append(
+                            {
+                                "type": (
+                                    "bullish"
+                                    if ftype > 0
+                                    else "bearish"
+                                ),
+
+                                "top": top,
+
+                                "bottom": (
+                                    bottom
+                                ),
+
+                                "class": (
+                                    fclass
+                                ),
+                            }
+                        )
+
+                    sweep = int(
+                        row.get(
+                            "liq_sweep_type",
+                            0,
+                        )
+                        or 0
+                    )
+
+                    if sweep:
+                        sweeps.append(
+                            {
+                                "type": (
+                                    "bullish"
+                                    if sweep > 0
+                                    else "bearish"
+                                ),
+
+                                "price": (
+                                    self._number(
+                                        row.get(
+                                            "liq_sweep_level"
+                                        )
+                                    )
+                                ),
+                            }
+                        )
+
+                    mss = int(
+                        row.get(
+                            "mss_signal",
+                            0,
+                        )
+                        or 0
+                    )
+
+                    if mss:
+                        mss_events.append(
+                            {
+                                "type": (
+                                    "bullish"
+                                    if mss > 0
+                                    else "bearish"
+                                ),
+
+                                "price": (
+                                    self._number(
+                                        row.get(
+                                            "close"
+                                        )
+                                    )
+                                ),
+                            }
+                        )
+
+            # Quiet chart defaults.
+            fvgs = fvgs[
+                -8:
+            ]
+
+            sweeps = sweeps[
+                -5:
+            ]
+
+            mss_events = (
+                mss_events[
+                    -5:
+                ]
+            )
+
+            market = (
+                snap.get(
+                    "market",
+                    {},
+                )
+                if (
+                    snap
+                    and isinstance(
+                        snap.get(
+                            "market"
+                        ),
+                        Mapping,
+                    )
+                )
+                else {}
+            )
+
+            extra = (
+                market.get(
+                    "levels",
+                    {},
+                )
+                if isinstance(
+                    market,
+                    Mapping,
+                )
+                else {}
+            )
+
+            if isinstance(
+                extra,
+                Mapping,
+            ):
+                for key in (
+                    "pdh",
+                    "pdl",
+                    "pwh",
+                    "pwl",
+                    "entry_price",
+                    "entry_action",
+                    "sl_price",
+                    "tp_price",
+                ):
+                    if key in extra:
+                        levels[
+                            key
+                        ] = extra.get(
+                            key
+                        )
+
+            trades = [
+                {
+                    "ticket": (
+                        pos.get(
+                            "ticket"
+                        )
+                    ),
+
+                    "type": pos.get(
+                        "action"
+                    ),
+
+                    "volume": (
+                        pos.get(
+                            "volume"
+                        )
+                    ),
+
+                    "entry": (
+                        pos.get(
+                            "entry_price",
+                            pos.get(
+                                "entry"
+                            ),
+                        )
+                    ),
+
+                    "sl": pos.get(
+                        "sl"
+                    ),
+
+                    "tp": pos.get(
+                        "tp"
+                    ),
+
+                    "pnl": pos.get(
+                        "pnl"
+                    ),
+                }
+
+                for pos
+                in (
+                    snap.get(
+                        "positions",
+                        [],
+                    )
+                    if snap
+                    else []
+                )
+
+                if (
+                    isinstance(
+                        pos,
+                        Mapping,
+                    )
+                    and str(
+                        pos.get(
+                            "symbol",
+                            "",
+                        )
+                    )
+                    == symbol
+                )
+            ]
+
+            self._json(
+                {
+                    "symbol": symbol,
+                    "timeframe": tf_name,
+                    "candles": candles,
+                    "fvgs": fvgs,
+                    "sweeps": sweeps,
+                    "mss": mss_events,
+                    "levels": levels,
+                    "trades": trades,
+                }
+            )
+
+        except Exception as exc:
+            LOG.exception(
+                (
+                    "Chart endpoint "
+                    "failed: %s"
+                ),
+                exc,
+            )
+
+            self._json(
+                {
+                    "error": (
+                        "CHART_DATA_ERROR"
+                    ),
+
+                    "detail": str(
+                        exc
+                    ),
+                },
+                500,
+            )
+
+    # ================================================================
+    # READ-ONLY SECONDARY DATA
+    # ================================================================
+
+    def _history(
+        self,
+    ):
+        try:
+            from core.trade_journal import (
+                trade_journal,
+            )
+
+            rows = (
+                trade_journal
+                .get_all_trades()
+                or []
+            )
+
+            return [
+                {
+                    "id": row.get(
+                        "execution_id",
+                        row.get(
+                            "decision_id",
+                            f"J-{i + 1}",
+                        ),
+                    ),
+
+                    "symbol": row.get(
+                        "symbol"
+                    ),
+
+                    "action": row.get(
+                        "action"
+                    ),
+
+                    "volume": row.get(
+                        "lot_size"
+                    ),
+
+                    "entry_price": (
+                        row.get(
+                            "entry_price"
+                        )
+                    ),
+
+                    "close_price": (
+                        row.get(
+                            "close_price"
+                        )
+                    ),
+
+                    "entry_time_utc": (
+                        row.get(
+                            "entry_time_utc"
+                        )
+                    ),
+
+                    "close_time_utc": (
+                        row.get(
+                            "close_time_utc"
+                        )
+                    ),
+
+                    "close_reason": (
+                        row.get(
+                            "close_reason"
+                        )
+                    ),
+
+                    "pnl": row.get(
+                        "pnl"
+                    ),
+
+                    "r_multiple": (
+                        row.get(
+                            "r_multiple",
+                            row.get(
+                                "net_r"
+                            ),
+                        )
+                    ),
+
+                    "strategy_name": (
+                        row.get(
+                            "strategy_name"
+                        )
+                    ),
+
+                    "entry_pattern": (
+                        row.get(
+                            "entry_pattern"
+                        )
+                    ),
+                }
+
+                for i, row
+                in enumerate(
+                    rows[
+                        -50:
+                    ]
+                )
+
+                if isinstance(
+                    row,
+                    Mapping,
+                )
+            ]
+
+        except Exception:
+            return []
+
+    def _journal(
+        self,
+    ):
+        try:
+            from core.trade_journal import (
+                trade_journal,
+            )
+
+            rows = (
+                trade_journal
+                .get_all_trades()
+                or []
+            )
+
+            self._json(
+                {
+                    "trades": (
+                        rows[
+                            -200:
+                        ]
+                    ),
+
+                    "total": len(
+                        rows
+                    ),
+                }
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                500,
+            )
+
+    def _daily(
+        self,
+    ):
+        try:
+            from core.trade_journal import (
+                trade_journal,
+            )
+
+            analyzer = getattr(
+                self.engine,
+                "daily_analyzer",
+                None,
+            )
+
+            report = (
+                analyzer.get_latest_report()
+                if (
+                    analyzer
+                    is not None
+                    and hasattr(
+                        analyzer,
+                        "get_latest_report",
+                    )
+                )
+                else None
+            )
+
+            self._json(
+                {
+                    "report": report,
+
+                    "today_summary": (
+                        trade_journal
+                        .get_daily_summary()
+                    ),
+                }
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                500,
+            )
+
+    def _backtest_results(
+        self,
+    ):
+        try:
+            backtester = getattr(
+                self.engine,
+                "backtester",
+                None,
+            )
+
+            self._json(
+                (
+                    backtester
+                    .get_last_results()
+                    if backtester
+                    else {}
+                )
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                500,
+            )
+
+    def _audit(
+        self,
+    ):
+        try:
+            import sqlite3
+
+            from core.database import (
+                db_instance,
+            )
+
+            with db_instance._lock:
+                conn = sqlite3.connect(
+                    db_instance.db_path
+                )
+
+                conn.row_factory = (
+                    sqlite3.Row
+                )
+
+                try:
+                    rows = conn.execute(
+                        (
+                            "SELECT * FROM "
+                            "audit_evaluations "
+                            "ORDER BY id DESC "
+                            "LIMIT 100"
+                        )
+                    ).fetchall()
+
+                finally:
+                    conn.close()
+
+            self._json(
+                {
+                    "evaluations": [
+                        dict(
+                            row
+                        )
+                        for row
+                        in rows
+                    ]
+                }
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                500,
+            )
+
+    def _logs(
+        self,
+    ):
+        try:
+            lines = []
+            path = (
+                "logs/engine.log"
+            )
+
+            if os.path.isfile(
+                path
+            ):
+                with open(
+                    path,
+                    "rb",
+                ) as handle:
+                    handle.seek(
+                        0,
+                        os.SEEK_END,
+                    )
+
+                    size = (
+                        handle.tell()
+                    )
+
+                    handle.seek(
+                        max(
+                            0,
+                            size
+                            - 64
+                            * 1024,
+                        )
+                    )
+
+                    lines = (
+                        handle.read()
+                        .decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+                        .splitlines()[
+                            -50:
+                        ]
+                    )
+
+            self._json(
+                {
+                    "logs": lines
+                }
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                500,
+            )
+
+    # ================================================================
+    # CONTROL PLANE
+    # ================================================================
+
+    def _write_settings(
+        self,
+        data,
+    ):
+        try:
+            validate_settings(
+                data
+            )
+
+            prepared = dict(
+                data
+            )
+
+            if "active_symbol" in prepared:
+                prepared[
+                    "active_symbol"
+                ] = (
+                    resolve_broker_symbol(
+                        str(
+                            prepared[
+                                "active_symbol"
+                            ]
+                        ),
+                        self.engine,
+                    )
+                )
+
+            if hasattr(
+                settings_manager,
+                "set_many",
+            ):
+                settings_manager.set_many(
+                    prepared,
+
+                    source=(
+                        "DASHBOARD_API"
+                    ),
+
+                    reason=(
+                        "User updated "
+                        "settings via dashboard"
+                    ),
+                )
+
+            else:
+                for key, value in (
+                    prepared.items()
+                ):
+                    settings_manager.set(
+                        key,
+                        value,
+
+                        source=(
+                            "DASHBOARD_API"
+                        ),
+
+                        reason=(
+                            "Dashboard update"
+                        ),
+                    )
+
+            self._json(
+                {
+                    "status": (
+                        "success"
+                    ),
+
+                    "settings": (
+                        self._settings()
+                    ),
+                }
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                400,
+            )
+
+    def _reset_settings(
+        self,
+    ):
+        try:
+            settings_manager.reset_all(
+                source=(
+                    "DASHBOARD_API"
+                )
+            )
+
+            self._json(
+                {
+                    "status": (
+                        "success"
+                    ),
+
+                    "settings": (
+                        self._settings()
+                    ),
+                }
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                400,
+            )
+
+    def _news_add(
+        self,
+        data,
+    ):
+        try:
+            ok = (
+                news_schedule
+                .add_event(
+                    str(
+                        data.get(
+                            "day",
+                            "",
+                        )
+                    ).strip(),
+
+                    str(
+                        data.get(
+                            "time_utc",
+                            "",
+                        )
+                    ).strip(),
+
+                    str(
+                        data.get(
+                            "name",
+                            "",
+                        )
+                    ).strip(),
+
+                    int(
+                        data.get(
+                            "duration_mins",
+                            30,
+                        )
+                    ),
+
+                    currency=str(
+                        data.get(
+                            "currency",
+                            "USD",
+                        )
+                    ),
+
+                    impact=str(
+                        data.get(
+                            "impact",
+                            "HIGH",
+                        )
+                    ),
+                )
+            )
+
+            if not ok:
+                raise ValueError(
+                    (
+                        "Invalid or "
+                        "duplicate manual event"
+                    )
+                )
+
+            self._json(
+                {
+                    "status": (
+                        "success"
+                    )
+                }
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                400,
+            )
+
+    def _news_remove(
+        self,
+        data,
+    ):
+        try:
+            if not (
+                news_schedule
+                .remove_event(
+                    int(
+                        data.get(
+                            "index",
+                            -1,
+                        )
+                    )
+                )
+            ):
+                raise ValueError(
+                    "Invalid event index"
+                )
+
+            self._json(
+                {
+                    "status": (
+                        "success"
+                    )
+                }
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                400,
+            )
+
+    def _news_update(
+        self,
+        data,
+    ):
+        try:
+            kwargs = {
+                key: data[
+                    key
+                ]
+                for key
+                in (
+                    "day",
+                    "time_utc",
+                    "name",
+                    "duration_mins",
+                    "currency",
+                    "impact",
+                )
+                if key
+                in data
+            }
+
+            if (
+                "duration_mins"
+                in kwargs
+            ):
+                kwargs[
+                    "duration_mins"
+                ] = int(
+                    kwargs[
+                        "duration_mins"
+                    ]
+                )
+
+            if not (
+                news_schedule
+                .update_event(
+                    int(
+                        data.get(
+                            "index",
+                            -1,
+                        )
+                    ),
+                    **kwargs,
+                )
+            ):
+                raise ValueError(
+                    (
+                        "Manual event "
+                        "update rejected"
+                    )
+                )
+
+            self._json(
+                {
+                    "status": (
+                        "success"
+                    )
+                }
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                400,
+            )
+
+    def _manual_execute(
+        self,
+        data,
+    ):
+        """
+        Legacy dashboard code invented entry,
+        SL and TP.
+
+        That bypass is prohibited.
+        """
+
+        if (
+            self.engine is not None
+            and hasattr(
+                self.engine,
+                (
+                    "execute_validated_"
+                    "dashboard_candidate"
+                ),
+            )
+        ):
+            try:
+                result = (
+                    self.engine
+                    .execute_validated_dashboard_candidate(
+                        data
+                    )
+                )
+
+                self._json(
+                    {
+                        "status": (
+                            "success"
+                        ),
+
+                        "result": (
+                            result
+                        ),
+                    }
+                )
+
+                return
+
+            except Exception as exc:
+                self._json(
+                    {
+                        "error": str(
+                            exc
+                        )
+                    },
+                    400,
+                )
+
+                return
+
+        self._json(
+            {
+                "error": (
+                    "MANUAL_EXECUTION_"
+                    "REQUIRES_VALIDATED_"
+                    "CANDIDATE"
+                ),
+
+                "reason": (
+                    "Dashboard cannot invent "
+                    "entry/SL/TP or bypass "
+                    "SafetyEngine, RiskEngine "
+                    "and ExecutionValidator."
+                ),
+            },
+            409,
+        )
+
+    def _add_symbol(
+        self,
+        data,
+    ):
+        try:
+            raw = str(
+                data.get(
+                    "symbol",
+                    "",
+                )
+            ).strip()
+
+            resolved = (
+                resolve_broker_symbol(
+                    raw,
+                    self.engine,
+                )
+            )
+
+            if (
+                not raw
+                or mt5.symbol_info(
+                    resolved
+                )
+                is None
+            ):
+                raise ValueError(
+                    (
+                        "Symbol not found "
+                        "on broker"
+                    )
+                )
+
+            settings_manager.set(
+                "active_symbol",
+                resolved,
+
+                source=(
+                    "DASHBOARD_API"
+                ),
+
+                reason=(
+                    "User selected "
+                    "broker symbol"
+                ),
+            )
+
+            self._json(
+                {
+                    "status": (
+                        "success"
+                    ),
+
+                    "symbol": (
+                        resolved
+                    ),
+                }
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                400,
+            )
+
+    # ================================================================
+    # BACKGROUND COMMANDS
+    # ================================================================
+
+    def _train(
+        self,
+    ):
+        if getattr(
+            self.engine,
+            "training_in_progress",
+            False,
+        ):
+            self._json(
+                {
+                    "status": (
+                        "already_running"
+                    )
+                },
+                409,
+            )
+
+            return
+
+        threading.Thread(
+            target=(
+                self._training_worker
+            ),
+            daemon=True,
+        ).start()
+
+        self._json(
+            {
+                "status": (
+                    "shadow_training_started"
+                )
+            },
+            202,
+        )
+
+    def _training_worker(
+        self,
+    ):
+        if (
+            self.engine is None
+            or getattr(
+                self.engine,
+                "training_in_progress",
+                False,
+            )
+        ):
+            return
+
+        self.engine.training_in_progress = (
+            True
+        )
+
+        try:
+            trigger = getattr(
+                self.engine,
+                (
+                    "trigger_historical_"
+                    "training"
+                ),
+                None,
+            )
+
+            if trigger:
+                trigger()
+
+        except Exception as exc:
+            LOG.error(
+                (
+                    "Shadow training "
+                    "trigger failed: %s"
+                ),
+                exc,
+            )
+
+        finally:
+            self.engine.training_in_progress = (
+                False
+            )
+
+    def _close_all(
+        self,
+    ):
+        try:
+            trigger = getattr(
+                self.engine,
+                (
+                    "trigger_emergency_"
+                    "panic_close"
+                ),
+                None,
+            )
+
+            if trigger is None:
+                raise RuntimeError(
+                    (
+                        "Emergency close "
+                        "unavailable"
+                    )
+                )
+
+            result = trigger()
+
+            command_id = (
+                result.get(
+                    "command_id"
+                )
+                if isinstance(
+                    result,
+                    Mapping,
+                )
+                else None
+            )
+
+            self._json(
+                {
+                    "status": (
+                        "ACCEPTED"
+                    ),
+
+                    "command_id": (
+                        command_id
+                    ),
+
+                    "message": (
+                        "Emergency close "
+                        "command queued"
+                    ),
+                },
+                202,
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                500,
+            )
+
+    def _run_analysis(
+        self,
+    ):
+        try:
+            analyzer = getattr(
+                self.engine,
+                "daily_analyzer",
+                None,
+            )
+
+            if analyzer is None:
+                raise RuntimeError(
+                    (
+                        "Daily analyzer "
+                        "unavailable"
+                    )
+                )
+
+            def work():
+                from datetime import date
+
+                try:
+                    analyzer.analyze_date(
+                        date.today()
+                    )
+
+                except Exception as exc:
+                    LOG.error(
+                        (
+                            "Daily analysis "
+                            "failed: %s"
+                        ),
+                        exc,
+                    )
+
+            threading.Thread(
+                target=work,
+                daemon=True,
+            ).start()
+
+            self._json(
+                {
+                    "status": (
+                        "analysis_started"
+                    )
+                },
+                202,
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                500,
+            )
+
+    def _run_backtest(
+        self,
+    ):
+        try:
+            backtester = getattr(
+                self.engine,
+                "backtester",
+                None,
+            )
+
+            if backtester is None:
+                raise RuntimeError(
+                    "Backtester unavailable"
+                )
+
+            snap = self._snapshot()
+
+            symbols = list(
+                snap.get(
+                    "symbols",
+                    [],
+                )
+                or []
+            )
+
+            symbol = (
+                symbols[0]
+                if symbols
+                else str(
+                    settings_manager.get(
+                        "active_symbol",
+                        "",
+                    )
+                )
+            )
+
+            mode = str(
+                settings_manager.get(
+                    "trading_mode",
+                    "scalping",
+                )
+            )
+
+            def work():
+                try:
+                    backtester.self_optimize(
+                        symbol,
+                        trading_mode=mode,
+                    )
+
+                except Exception as exc:
+                    LOG.error(
+                        (
+                            "Validation backtest "
+                            "failed: %s"
+                        ),
+                        exc,
+                    )
+
+            threading.Thread(
+                target=work,
+                daemon=True,
+            ).start()
+
+            self._json(
+                {
+                    "status": (
+                        "validation_backtest_"
+                        "started"
+                    ),
+
+                    "symbol": symbol,
+
+                    "mode": mode,
+
+                    "production_mutation": (
+                        False
+                    ),
+                },
+                202,
+            )
+
+        except Exception as exc:
+            self._json(
+                {
+                    "error": str(
+                        exc
+                    )
+                },
+                500,
+            )
+
+
 class WebDashboardServer:
-    def __init__(self, engine, port=8000):
+    def __init__(
+        self,
+        engine,
+        port=8000,
+    ):
         self.engine = engine
-        self.port = port
+        self.port = int(
+            port
+        )
+
         self.server = None
         self.thread = None
-        self.logger = logging.getLogger("PulseViper.WebDashboard")
-        
-    def start(self):
-        handler_factory = lambda *args, **kwargs: DashboardRequestHandler(self.engine, *args, **kwargs)
-        self.server = ThreadingHTTPServer(('127.0.0.1', self.port), handler_factory)
-        self.thread = threading.Thread(target=self._run_server, daemon=True)
+        self.logger = LOG
+
+    def start(
+        self,
+    ):
+        if self.server is not None:
+            return
+
+        factory = (
+            lambda *args, **kwargs:
+            DashboardRequestHandler(
+                self.engine,
+                *args,
+                **kwargs,
+            )
+        )
+
+        self.server = (
+            ThreadingHTTPServer(
+                (
+                    "127.0.0.1",
+                    self.port,
+                ),
+                factory,
+            )
+        )
+
+        self.server.daemon_threads = (
+            True
+        )
+
+        self.thread = (
+            threading.Thread(
+                target=self._run,
+                daemon=True,
+                name=(
+                    "PulseViper-"
+                    "WebDashboard"
+                ),
+            )
+        )
+
         self.thread.start()
-        self.logger.info(f"Glassmorphic Web Control Dashboard running at http://localhost:{self.port}")
-        
-    def _run_server(self):
+
+        self.logger.info(
+            (
+                "Web dashboard listening "
+                "on http://127.0.0.1:%d"
+            ),
+            self.port,
+        )
+
+    def _run(
+        self,
+    ):
         try:
-            if self.server:
-                self.server.serve_forever()
-        except Exception as e:
-            self.logger.error(f"Web Dashboard Server error: {e}")
-            
-    def stop(self):
-        if self.server:
-            self.server.shutdown()
-            self.server.server_close()
-        if self.thread:
-            self.thread.join(timeout=1.0)
+            if self.server is not None:
+                self.server.serve_forever(
+                    poll_interval=0.25
+                )
+
+        except Exception as exc:
+            self.logger.error(
+                (
+                    "Web dashboard "
+                    "server error: %s"
+                ),
+                exc,
+            )
+
+    def stop(
+        self,
+    ):
+        server = self.server
+        self.server = None
+
+        if server is not None:
+            try:
+                server.shutdown()
+
+            finally:
+                server.server_close()
+
+        thread = self.thread
+        self.thread = None
+
+        if (
+            thread is not None
+            and thread.is_alive()
+        ):
+            thread.join(
+                timeout=1.0
+            )

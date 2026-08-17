@@ -1,14 +1,22 @@
 # core/execution_validator.py
+
+from __future__ import annotations
+
 import logging
+import math
 import uuid
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
-from datetime import datetime, timezone, timedelta
-import numpy as np
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
+
+from core.execution_service import canonical_request_hash
+from core.execution_token import (
+    ExecutionValidationToken,
+    validation_token_store,
+)
 from utils.mt5_gateway import mt5_gateway as mt5
 from utils.settings_manager import settings_manager
-from core.execution_token import ExecutionValidationToken, validation_token_store
-from core.execution_service import canonical_request_hash
+
 
 @dataclass(frozen=True)
 class ExecutionValidationResult:
@@ -17,15 +25,35 @@ class ExecutionValidationResult:
     validated_at_utc: datetime
     validation_id: str
     decision_id: str
+
     actual_entry_price: float
     effective_rr: float
     spread_points: float
     quote_age_ms: float
+
     token: Optional[ExecutionValidationToken] = None
 
+    # Exact trade geometry that was validated.
+    validated_request: Optional[Dict[str, Any]] = None
+
+    # Actual broker-estimated capital risk of this final request.
+    estimated_risk_percent: float = 0.0
+
+
 class ExecutionValidator:
+    """
+    Final deterministic validation before a NEW broker position is submitted.
+
+    It does not decide whether a strategy is good.
+    It verifies whether the already-decided trade is safe and internally valid.
+    """
+
     def __init__(self):
-        self.logger = logging.getLogger("PulseViper.ExecutionValidator")
+        self.logger = logging.getLogger(
+            "PulseViper.ExecutionValidator"
+        )
+
+    # ------------------------------------------------------------------
 
     def validate(
         self,
@@ -37,156 +65,662 @@ class ExecutionValidator:
         analysis: Dict[str, Any],
         trade_manager,
         decision_id: str,
-        candidate_id: str = "UNKNOWN"
+        candidate_id: str = "UNKNOWN",
     ) -> ExecutionValidationResult:
-        validated_at_utc = datetime.now(timezone.utc)
-        validation_id = f"PV-VAL-{uuid.uuid4().hex[:4]}"
-        
+        validated_at_utc = datetime.now(
+            timezone.utc
+        )
+
+        validation_id = (
+            f"PV-VAL-{uuid.uuid4().hex[:12]}"
+        )
+
+        def reject(
+            reason: str,
+            entry_price: float = 0.0,
+            effective_rr: float = 0.0,
+            spread_points: float = 0.0,
+            quote_age_ms: float = 0.0,
+            estimated_risk_percent: float = 0.0,
+        ) -> ExecutionValidationResult:
+            return ExecutionValidationResult(
+                allowed=False,
+                reason=reason,
+                validated_at_utc=validated_at_utc,
+                validation_id=validation_id,
+                decision_id=decision_id,
+                actual_entry_price=entry_price,
+                effective_rr=effective_rr,
+                spread_points=spread_points,
+                quote_age_ms=quote_age_ms,
+                token=None,
+                validated_request=None,
+                estimated_risk_percent=(
+                    estimated_risk_percent
+                ),
+            )
+
         try:
-            # 1. Action validation
-            if action not in ("BUY", "SELL"):
-                return ExecutionValidationResult(False, f"INVALID_ACTION_{action}", validated_at_utc, validation_id, decision_id, 0.0, 0.0, 0.0, 0.0)
+            # ----------------------------------------------------------
+            # Basic inputs
+            # ----------------------------------------------------------
 
-            # 2. MT5 connection and tick validity
+            action = str(action).upper().strip()
+            symbol = str(symbol).strip()
+
+            if action not in {"BUY", "SELL"}:
+                return reject(
+                    f"INVALID_ACTION_{action}"
+                )
+
+            if not symbol:
+                return reject(
+                    "SYMBOL_MISSING"
+                )
+
+            sl = self._finite_float(sl)
+            tp = self._finite_float(tp)
+            volume = self._finite_float(volume)
+
+            if volume <= 0.0:
+                return reject(
+                    "INVALID_VOLUME"
+                )
+
+            # ----------------------------------------------------------
+            # Fresh broker data
+            # ----------------------------------------------------------
+
             tick = mt5.symbol_info_tick(symbol)
-            if not tick:
-                return ExecutionValidationResult(False, "NO_TICK", validated_at_utc, validation_id, decision_id, 0.0, 0.0, 0.0, 0.0)
-            
+
+            if tick is None:
+                return reject(
+                    "NO_TICK"
+                )
+
             symbol_info = mt5.symbol_info(symbol)
-            if not symbol_info:
-                return ExecutionValidationResult(False, "NO_SYMBOL_INFO", validated_at_utc, validation_id, decision_id, 0.0, 0.0, 0.0, 0.0)
 
-            # 3. Quote freshness check (age < 5000ms)
-            now_ms = validated_at_utc.timestamp() * 1000.0
-            t_msc = getattr(tick, 'time_msc', None)
-            t_sec = getattr(tick, 'time', None)
-            
-            if t_msc is not None and type(t_msc).__name__ != "MagicMock":
-                tick_time_ms = float(t_msc)
-            elif t_sec is not None and type(t_sec).__name__ != "MagicMock":
-                tick_time_ms = float(t_sec) * 1000.0
+            if symbol_info is None:
+                return reject(
+                    "NO_SYMBOL_INFO"
+                )
+
+            point = self._finite_float(
+                getattr(
+                    symbol_info,
+                    "point",
+                    0.0,
+                )
+            )
+
+            if point <= 0.0:
+                return reject(
+                    "INVALID_POINT_SIZE"
+                )
+
+            bid = self._finite_float(
+                getattr(
+                    tick,
+                    "bid",
+                    0.0,
+                )
+            )
+
+            ask = self._finite_float(
+                getattr(
+                    tick,
+                    "ask",
+                    0.0,
+                )
+            )
+
+            if (
+                bid <= 0.0
+                or ask <= 0.0
+                or ask < bid
+            ):
+                return reject(
+                    "INVALID_BID_ASK"
+                )
+
+            quote_age_ms = self._quote_age_ms(
+                tick
+            )
+
+            max_quote_age_ms = self._finite_float(
+                settings_manager.get(
+                    "max_validation_token_age_ms",
+                    5000.0,
+                ),
+                5000.0,
+            )
+
+            max_quote_age_ms = max(
+                100.0,
+                max_quote_age_ms,
+            )
+
+            if quote_age_ms > max_quote_age_ms:
+                return reject(
+                    (
+                        f"STALE_QUOTE_{quote_age_ms:.0f}MS_"
+                        f"MAX_{max_quote_age_ms:.0f}MS"
+                    ),
+                    quote_age_ms=quote_age_ms,
+                )
+
+            # BUY executes ASK. SELL executes BID.
+            entry_price = (
+                ask
+                if action == "BUY"
+                else bid
+            )
+
+            # ----------------------------------------------------------
+            # Spread
+            # ----------------------------------------------------------
+
+            spread_points = (
+                ask - bid
+            ) / point
+
+            max_spread_points = self._finite_float(
+                settings_manager.get(
+                    "max_spread_points",
+                    350.0,
+                ),
+                350.0,
+            )
+
+            if (
+                spread_points
+                > max_spread_points
+            ):
+                return reject(
+                    (
+                        f"SPREAD_TOO_HIGH_"
+                        f"{spread_points:.1f}_"
+                        f"MAX_{max_spread_points:.1f}"
+                    ),
+                    entry_price,
+                    spread_points=spread_points,
+                    quote_age_ms=quote_age_ms,
+                )
+
+            # ----------------------------------------------------------
+            # SL / TP direction
+            # ----------------------------------------------------------
+
+            if action == "BUY":
+                if sl != 0.0 and sl >= entry_price:
+                    return reject(
+                        "BUY_SL_MUST_BE_BELOW_ENTRY",
+                        entry_price,
+                        spread_points=spread_points,
+                        quote_age_ms=quote_age_ms,
+                    )
+
+                if tp != 0.0 and tp <= entry_price:
+                    return reject(
+                        "BUY_TP_MUST_BE_ABOVE_ENTRY",
+                        entry_price,
+                        spread_points=spread_points,
+                        quote_age_ms=quote_age_ms,
+                    )
+
             else:
-                tick_time_ms = now_ms
-                
-            quote_age = max(0.0, now_ms - tick_time_ms)
-            if quote_age > 5000.0:  # 5 seconds
-                return ExecutionValidationResult(False, f"STALE_QUOTE_AGE_{quote_age:.0f}MS", validated_at_utc, validation_id, decision_id, 0.0, 0.0, 0.0, quote_age)
+                if sl != 0.0 and sl <= entry_price:
+                    return reject(
+                        "SELL_SL_MUST_BE_ABOVE_ENTRY",
+                        entry_price,
+                        spread_points=spread_points,
+                        quote_age_ms=quote_age_ms,
+                    )
 
-            # 4. Finite price check
-            t_bid = getattr(tick, 'bid', None)
-            t_ask = getattr(tick, 'ask', None)
-            
-            bid = float(t_bid) if (t_bid is not None and type(t_bid).__name__ != "MagicMock") else 1.1200
-            ask = float(t_ask) if (t_ask is not None and type(t_ask).__name__ != "MagicMock") else 1.1205
-            
-            if not np.isfinite(bid) or not np.isfinite(ask) or bid <= 0.0 or ask <= 0.0:
-                return ExecutionValidationResult(False, f"INVALID_FINITE_PRICE_BID_{bid}_ASK_{ask}", validated_at_utc, validation_id, decision_id, 0.0, 0.0, 0.0, quote_age)
+                if tp != 0.0 and tp >= entry_price:
+                    return reject(
+                        "SELL_TP_MUST_BE_BELOW_ENTRY",
+                        entry_price,
+                        spread_points=spread_points,
+                        quote_age_ms=quote_age_ms,
+                    )
 
-            # 5. Point size check
-            s_point = getattr(symbol_info, 'point', None)
-            point = float(s_point) if (s_point is not None and type(s_point).__name__ != "MagicMock") else 0.0001
-            
-            if not point or point <= 0.0:
-                return ExecutionValidationResult(False, "INVALID_POINT_SIZE", validated_at_utc, validation_id, decision_id, 0.0, 0.0, 0.0, quote_age)
+            # New entries must have a real protective stop.
+            if sl == 0.0:
+                return reject(
+                    "STOP_LOSS_REQUIRED",
+                    entry_price,
+                    spread_points=spread_points,
+                    quote_age_ms=quote_age_ms,
+                )
 
-            entry_price = ask if action == "BUY" else bid
+            sl_distance = abs(
+                entry_price - sl
+            )
 
-            # 6. Correct SL and TP directions
-            if sl != 0.0:
-                if action == "BUY" and sl >= entry_price:
-                    return ExecutionValidationResult(False, f"BUY_SL_ABOVE_ENTRY_{sl}_price_{entry_price}", validated_at_utc, validation_id, decision_id, entry_price, 0.0, 0.0, quote_age)
-                if action == "SELL" and sl <= entry_price:
-                    return ExecutionValidationResult(False, f"SELL_SL_BELOW_ENTRY_{sl}_price_{entry_price}", validated_at_utc, validation_id, decision_id, entry_price, 0.0, 0.0, quote_age)
+            if sl_distance <= 0.0:
+                return reject(
+                    "ZERO_RISK_DISTANCE",
+                    entry_price,
+                    spread_points=spread_points,
+                    quote_age_ms=quote_age_ms,
+                )
+
+            # ----------------------------------------------------------
+            # Broker stop distance
+            # ----------------------------------------------------------
+
+            stops_level = self._finite_float(
+                getattr(
+                    symbol_info,
+                    "trade_stops_level",
+                    0.0,
+                )
+            )
+
+            minimum_stop_distance = (
+                stops_level * point
+            )
+
+            if (
+                minimum_stop_distance > 0.0
+                and sl_distance
+                + (point * 0.01)
+                < minimum_stop_distance
+            ):
+                return reject(
+                    (
+                        "SL_BELOW_BROKER_STOPS_LEVEL_"
+                        f"{sl_distance / point:.1f}_"
+                        f"MIN_{stops_level:.1f}"
+                    ),
+                    entry_price,
+                    spread_points=spread_points,
+                    quote_age_ms=quote_age_ms,
+                )
+
+            # ----------------------------------------------------------
+            # Reward/risk
+            # ----------------------------------------------------------
+
+            effective_rr = 0.0
 
             if tp != 0.0:
-                if action == "BUY" and tp <= entry_price:
-                    return ExecutionValidationResult(False, f"BUY_TP_BELOW_ENTRY_{tp}_price_{entry_price}", validated_at_utc, validation_id, decision_id, entry_price, 0.0, 0.0, quote_age)
-                if action == "SELL" and tp >= entry_price:
-                    return ExecutionValidationResult(False, f"SELL_TP_ABOVE_ENTRY_{tp}_price_{entry_price}", validated_at_utc, validation_id, decision_id, entry_price, 0.0, 0.0, quote_age)
+                tp_distance = abs(
+                    tp - entry_price
+                )
 
-            # 7. Non-zero risk distance
-            sl_dist = abs(entry_price - sl) if sl != 0.0 else 0.0
-            if sl != 0.0 and sl_dist <= 0.0:
-                return ExecutionValidationResult(False, "ZERO_RISK_DISTANCE", validated_at_utc, validation_id, decision_id, entry_price, 0.0, 0.0, quote_age)
+                effective_rr = (
+                    tp_distance
+                    / sl_distance
+                )
 
-            # 8. Minimum effective RR check
-            tp_dist = abs(tp - entry_price) if tp != 0.0 else 0.0
-            effective_rr = tp_dist / sl_dist if sl_dist > 0.0 else 0.0
-            min_rr = settings_manager.get("min_rr_ratio", 1.5)
-            if sl != 0.0 and tp != 0.0 and effective_rr < min_rr:
-                return ExecutionValidationResult(False, f"RR_BELOW_MINIMUM_{effective_rr:.2f}_REQUIRED_{min_rr}", validated_at_utc, validation_id, decision_id, entry_price, effective_rr, 0.0, quote_age)
+                minimum_rr = self._finite_float(
+                    settings_manager.get(
+                        "min_rr_ratio",
+                        1.5,
+                    ),
+                    1.5,
+                )
 
-            # 9. Maximum spread check
-            spread = (ask - bid) / point
-            max_spread = settings_manager.get("max_spread_points", 50.0)
-            if spread > max_spread:
-                return ExecutionValidationResult(False, f"SPREAD_TOO_HIGH_{spread:.1f}_MAX_{max_spread}", validated_at_utc, validation_id, decision_id, entry_price, effective_rr, spread, quote_age)
+                if effective_rr < minimum_rr:
+                    return reject(
+                        (
+                            "RR_BELOW_MINIMUM_"
+                            f"{effective_rr:.2f}_"
+                            f"REQUIRED_{minimum_rr:.2f}"
+                        ),
+                        entry_price,
+                        effective_rr,
+                        spread_points,
+                        quote_age_ms,
+                    )
 
-            # 10. Broker Stops Level & Freeze Level check
-            stops_level = getattr(symbol_info, 'trade_stops_level', 0.0)
-            stops_level = float(stops_level) if (stops_level is not None and type(stops_level).__name__ != "MagicMock") else 0.0
-            if stops_level > 0.0:
-                min_dist = stops_level * point
-                if sl != 0.0 and sl_dist < min_dist:
-                    return ExecutionValidationResult(False, f"SL_DIST_{sl_dist/point:.1f}_BELOW_STOPS_LEVEL_{stops_level}", validated_at_utc, validation_id, decision_id, entry_price, effective_rr, spread, quote_age)
-                if tp != 0.0 and tp_dist < min_dist:
-                    return ExecutionValidationResult(False, f"TP_DIST_{tp_dist/point:.1f}_BELOW_STOPS_LEVEL_{stops_level}", validated_at_utc, validation_id, decision_id, entry_price, effective_rr, spread, quote_age)
+                if (
+                    minimum_stop_distance > 0.0
+                    and tp_distance
+                    + (point * 0.01)
+                    < minimum_stop_distance
+                ):
+                    return reject(
+                        "TP_BELOW_BROKER_STOPS_LEVEL",
+                        entry_price,
+                        effective_rr,
+                        spread_points,
+                        quote_age_ms,
+                    )
 
-            # 11. Portfolio Heat
-            max_heat = settings_manager.get("max_portfolio_heat", 3.0)
-            open_heat = sum(p.risk_percent for p in trade_manager.positions.values())
-            if open_heat >= max_heat:
-                return ExecutionValidationResult(False, f"PORTFOLIO_HEAT_EXCEEDED_{open_heat:.2f}%_MAX_{max_heat}%", validated_at_utc, validation_id, decision_id, entry_price, effective_rr, spread, quote_age)
+            # ----------------------------------------------------------
+            # Volume constraints
+            # ----------------------------------------------------------
 
-            # 12. Volume boundary validation
-            vol_min = getattr(symbol_info, 'volume_min', 0.01)
-            vol_max = getattr(symbol_info, 'volume_max', 100.0)
-            if volume < vol_min or volume > vol_max:
-                return ExecutionValidationResult(False, f"VOLUME_OUT_OF_BOUNDS_{volume}_MIN_{vol_min}_MAX_{vol_max}", validated_at_utc, validation_id, decision_id, entry_price, effective_rr, spread, quote_age)
+            volume_min = self._finite_float(
+                getattr(
+                    symbol_info,
+                    "volume_min",
+                    0.0,
+                )
+            )
 
-            has_same_direction = any(p.symbol == symbol and p.action == action for p in trade_manager.positions.values())
-            if has_same_direction and not settings_manager.get("hedging_mode", False):
-                return ExecutionValidationResult(False, "DUPLICATE_POSITION", validated_at_utc, validation_id, decision_id, entry_price, effective_rr, spread, quote_age)
+            volume_max = self._finite_float(
+                getattr(
+                    symbol_info,
+                    "volume_max",
+                    0.0,
+                )
+            )
 
-            # 13. News lock
-            if analysis.get('news_locked', False):
-                return ExecutionValidationResult(False, "NEWS_LOCK_ACTIVE", validated_at_utc, validation_id, decision_id, entry_price, effective_rr, spread, quote_age)
+            volume_step = self._finite_float(
+                getattr(
+                    symbol_info,
+                    "volume_step",
+                    0.0,
+                )
+            )
 
-            # 14. Maximum price drift
-            target_setup = analysis.get('target_setup', {})
-            planned_entry = float(target_setup.get('entry', entry_price))
-            drift = abs(entry_price - planned_entry) / point
-            base_max_drift = settings_manager.get("max_price_drift_points", 50.0)
-            is_gold = "XAU" in str(symbol).upper() or "GOLD" in str(symbol).upper()
-            max_drift = base_max_drift * 10.0 if is_gold else base_max_drift
-            if drift > max_drift:
-                return ExecutionValidationResult(False, f"PRICE_DRIFT_EXCEEDED_{drift:.1f}_MAX_{max_drift}", validated_at_utc, validation_id, decision_id, entry_price, effective_rr, spread, quote_age)
+            if (
+                volume_min > 0.0
+                and volume + 1e-12 < volume_min
+            ):
+                return reject(
+                    (
+                        f"VOLUME_BELOW_MINIMUM_"
+                        f"{volume}_MIN_{volume_min}"
+                    ),
+                    entry_price,
+                    effective_rr,
+                    spread_points,
+                    quote_age_ms,
+                )
 
-            # 15. Setup revalidation status check
-            if not analysis.get('revalidation_status', True):
-                return ExecutionValidationResult(False, "SETUP_REVALIDATION_FAILED", validated_at_utc, validation_id, decision_id, entry_price, effective_rr, spread, quote_age)
+            if (
+                volume_max > 0.0
+                and volume - 1e-12 > volume_max
+            ):
+                return reject(
+                    (
+                        f"VOLUME_ABOVE_MAXIMUM_"
+                        f"{volume}_MAX_{volume_max}"
+                    ),
+                    entry_price,
+                    effective_rr,
+                    spread_points,
+                    quote_age_ms,
+                )
 
-            # --- Success: Issue a one-time validation token ---
-            token_id = f"PV-TOK-{uuid.uuid4().hex[:8]}"
-            expiry_sec = float(settings_manager.get("token_expiry_seconds", 3.0))
-            expires_at_utc = validated_at_utc + timedelta(seconds=expiry_sec)
-            
-            magic = getattr(trade_manager, "magic_number", 99999)
-            order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
-            
-            request_dict = {
-                "symbol": symbol,
+            if (
+                volume_step > 0.0
+                and volume_min >= 0.0
+            ):
+                steps = (
+                    volume - volume_min
+                ) / volume_step
+
+                if abs(
+                    steps - round(steps)
+                ) > 1e-5:
+                    return reject(
+                        (
+                            "VOLUME_NOT_ALIGNED_TO_STEP_"
+                            f"{volume_step}"
+                        ),
+                        entry_price,
+                        effective_rr,
+                        spread_points,
+                        quote_age_ms,
+                    )
+
+            # ----------------------------------------------------------
+            # Duplicate broker/local exposure
+            # ----------------------------------------------------------
+
+            positions = getattr(
+                trade_manager,
+                "positions",
+                {},
+            )
+
+            if not isinstance(
+                positions,
+                dict,
+            ):
+                positions = {}
+
+            if not settings_manager.get(
+                "hedging_mode",
+                False,
+            ):
+                for position in positions.values():
+                    if (
+                        getattr(
+                            position,
+                            "symbol",
+                            None,
+                        )
+                        == symbol
+                        and str(
+                            getattr(
+                                position,
+                                "action",
+                                "",
+                            )
+                        ).upper()
+                        == action
+                    ):
+                        return reject(
+                            "DUPLICATE_POSITION",
+                            entry_price,
+                            effective_rr,
+                            spread_points,
+                            quote_age_ms,
+                        )
+
+            # ----------------------------------------------------------
+            # News / setup status
+            # ----------------------------------------------------------
+
+            if bool(
+                analysis.get(
+                    "news_locked",
+                    False,
+                )
+            ):
+                return reject(
+                    "NEWS_LOCK_ACTIVE",
+                    entry_price,
+                    effective_rr,
+                    spread_points,
+                    quote_age_ms,
+                )
+
+            if not bool(
+                analysis.get(
+                    "revalidation_status",
+                    True,
+                )
+            ):
+                return reject(
+                    "SETUP_REVALIDATION_FAILED",
+                    entry_price,
+                    effective_rr,
+                    spread_points,
+                    quote_age_ms,
+                )
+
+            # ----------------------------------------------------------
+            # Planned price drift
+            # ----------------------------------------------------------
+
+            target_setup = analysis.get(
+                "target_setup",
+                {},
+            )
+
+            if not isinstance(
+                target_setup,
+                dict,
+            ):
+                target_setup = {}
+
+            planned_entry = self._finite_float(
+                target_setup.get(
+                    "entry",
+                    entry_price,
+                ),
+                entry_price,
+            )
+
+            max_price_drift_points = (
+                self._finite_float(
+                    settings_manager.get(
+                        "max_price_drift_points",
+                        50.0,
+                    ),
+                    50.0,
+                )
+            )
+
+            planned_drift_points = (
+                abs(
+                    entry_price
+                    - planned_entry
+                )
+                / point
+            )
+
+            if (
+                planned_drift_points
+                > max_price_drift_points
+            ):
+                return reject(
+                    (
+                        "PRICE_DRIFT_EXCEEDED_"
+                        f"{planned_drift_points:.1f}_"
+                        f"MAX_{max_price_drift_points:.1f}"
+                    ),
+                    entry_price,
+                    effective_rr,
+                    spread_points,
+                    quote_age_ms,
+                )
+
+            # ----------------------------------------------------------
+            # Calculate actual request risk using broker calculator
+            # ----------------------------------------------------------
+
+            order_type = (
+                mt5.ORDER_TYPE_BUY
+                if action == "BUY"
+                else mt5.ORDER_TYPE_SELL
+            )
+
+            estimated_risk_percent = (
+                self._calculate_actual_risk_percent(
+                    symbol=symbol,
+                    order_type=order_type,
+                    volume=volume,
+                    entry_price=entry_price,
+                    stop_price=sl,
+                )
+            )
+
+            max_portfolio_heat = (
+                self._finite_float(
+                    settings_manager.get(
+                        "max_portfolio_heat",
+                        5.0,
+                    ),
+                    5.0,
+                )
+            )
+
+            current_heat = 0.0
+
+            for position in positions.values():
+                position_risk = self._finite_float(
+                    getattr(
+                        position,
+                        "risk_percent",
+                        0.0,
+                    )
+                )
+
+                if position_risk > 0.0:
+                    current_heat += position_risk
+
+            if (
+                estimated_risk_percent > 0.0
+                and (
+                    current_heat
+                    + estimated_risk_percent
+                )
+                > max_portfolio_heat + 1e-9
+            ):
+                return reject(
+                    (
+                        "PORTFOLIO_HEAT_EXCEEDED_"
+                        f"CURRENT_{current_heat:.3f}%_"
+                        f"NEW_{estimated_risk_percent:.3f}%_"
+                        f"MAX_{max_portfolio_heat:.3f}%"
+                    ),
+                    entry_price,
+                    effective_rr,
+                    spread_points,
+                    quote_age_ms,
+                    estimated_risk_percent,
+                )
+
+            # ----------------------------------------------------------
+            # Construct exact validated request geometry
+            # ----------------------------------------------------------
+
+            magic = int(
+                getattr(
+                    trade_manager,
+                    "magic_number",
+                    99999,
+                )
+            )
+
+            validated_request = {
                 "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": float(volume),
                 "type": order_type,
-                "volume": volume,
-                "sl": sl,
-                "tp": tp,
+                "price": float(entry_price),
+                "sl": float(sl),
+                "tp": float(tp),
                 "magic": magic,
-                "price": entry_price
             }
-            
-            fingerprint = canonical_request_hash(request_dict)
-            
+
+            fingerprint = canonical_request_hash(
+                validated_request
+            )
+
+            # ----------------------------------------------------------
+            # One-time token
+            # ----------------------------------------------------------
+
+            token_id = (
+                f"PV-TOK-{uuid.uuid4().hex}"
+            )
+
+            expiry_seconds = self._finite_float(
+                settings_manager.get(
+                    "token_expiry_seconds",
+                    30.0,
+                ),
+                30.0,
+            )
+
+            expiry_seconds = max(
+                1.0,
+                min(
+                    expiry_seconds,
+                    60.0,
+                ),
+            )
+
             token = ExecutionValidationToken(
                 token_id=token_id,
                 decision_id=decision_id,
@@ -195,12 +729,19 @@ class ExecutionValidator:
                 action=action,
                 request_fingerprint=fingerprint,
                 issued_at_utc=validated_at_utc,
-                expires_at_utc=expires_at_utc,
-                validation_id=validation_id
+                expires_at_utc=(
+                    validated_at_utc
+                    + timedelta(
+                        seconds=expiry_seconds
+                    )
+                ),
+                validation_id=validation_id,
             )
-            
-            validation_token_store.store(token)
-            
+
+            validation_token_store.store(
+                token
+            )
+
             return ExecutionValidationResult(
                 allowed=True,
                 reason="VALIDATED",
@@ -209,11 +750,175 @@ class ExecutionValidator:
                 decision_id=decision_id,
                 actual_entry_price=entry_price,
                 effective_rr=effective_rr,
-                spread_points=spread,
-                quote_age_ms=quote_age,
-                token=token
+                spread_points=spread_points,
+                quote_age_ms=quote_age_ms,
+                token=token,
+                validated_request=validated_request,
+                estimated_risk_percent=(
+                    estimated_risk_percent
+                ),
             )
 
-        except Exception as ex:
-            self.logger.error(f"Execution validation error: {ex}")
-            return ExecutionValidationResult(False, f"VALIDATOR_EXCEPTION_{str(ex)}", validated_at_utc, validation_id, decision_id, 0.0, 0.0, 0.0, 0.0)
+        except Exception as exc:
+            self.logger.exception(
+                "Execution validation failed"
+            )
+
+            return reject(
+                "VALIDATOR_EXCEPTION_"
+                f"{type(exc).__name__}"
+            )
+
+    # ------------------------------------------------------------------
+    # Broker-estimated risk
+    # ------------------------------------------------------------------
+
+    def _calculate_actual_risk_percent(
+        self,
+        symbol: str,
+        order_type: int,
+        volume: float,
+        entry_price: float,
+        stop_price: float,
+    ) -> float:
+        if (
+            volume <= 0.0
+            or entry_price <= 0.0
+            or stop_price <= 0.0
+        ):
+            return 0.0
+
+        try:
+            potential_pnl = mt5.order_calc_profit(
+                order_type,
+                symbol,
+                volume,
+                entry_price,
+                stop_price,
+            )
+
+            if potential_pnl is None:
+                return 0.0
+
+            potential_loss = abs(
+                float(potential_pnl)
+            )
+
+            account = mt5.account_info()
+
+            if account is None:
+                return 0.0
+
+            equity = self._finite_float(
+                getattr(
+                    account,
+                    "equity",
+                    0.0,
+                )
+            )
+
+            if equity <= 0.0:
+                equity = self._finite_float(
+                    getattr(
+                        account,
+                        "balance",
+                        0.0,
+                    )
+                )
+
+            if equity <= 0.0:
+                return 0.0
+
+            return (
+                potential_loss
+                / equity
+            ) * 100.0
+
+        except Exception:
+            self.logger.exception(
+                "Failed calculating broker-estimated trade risk"
+            )
+
+            return 0.0
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _finite_float(
+        value: Any,
+        default: float = 0.0,
+    ) -> float:
+        try:
+            number = float(value)
+
+            if not math.isfinite(number):
+                return default
+
+            return number
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return default
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _quote_age_ms(
+        tick: Any,
+    ) -> float:
+        import time
+
+        now_ms = time.time() * 1000.0
+
+        time_msc = getattr(
+            tick,
+            "time_msc",
+            None,
+        )
+
+        try:
+            timestamp = float(time_msc)
+
+            if (
+                math.isfinite(timestamp)
+                and timestamp > 0.0
+            ):
+                return max(
+                    0.0,
+                    now_ms - timestamp,
+                )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            pass
+
+        time_sec = getattr(
+            tick,
+            "time",
+            None,
+        )
+
+        try:
+            timestamp = float(time_sec)
+
+            if (
+                math.isfinite(timestamp)
+                and timestamp > 0.0
+            ):
+                return max(
+                    0.0,
+                    now_ms
+                    - timestamp * 1000.0,
+                )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            pass
+
+        return float("inf")
